@@ -1,0 +1,99 @@
+template: tesla-powerwall3
+products:
+  - brand: Tesla
+    description:
+      generic: Powerwall 3
+capabilities: ["battery-control"]
+requirements:
+  description:
+    de: |
+      Tesla Powerwall 3 nutzt die offizielle Tesla Fleet API.
+
+      Für die Nutzung benötigst du einen [Tesla Developer Account](https://developer.tesla.com/) und erhältst ein monatliches API-Guthaben von 10 €.
+      Das ist für die gängigen evcc-Anwendungsfälle in der Regel ausreichend.
+
+      Die Anleitung von [myteslamate.com](https://www.myteslamate.com/tesla-api-application-registration/) erklärt den Prozess und generiert dir kostenfrei die für evcc benötigten Access- und Refresh-Token.
+      Mit diesem Tokenpaar und deiner im Tesla Developer Account erstellten Client ID kann evcc direkt mit der Tesla Fleet API kommunizieren.
+
+      Die genutzten APIs für Powerwall 3 sind kostenlos und werden nicht auf dein monatliches Guthaben angerechnet.
+    en: |
+      Tesla Powerwall 3 uses the official Tesla Fleet API.
+
+      For usage you need to create a [Tesla Developer Account](https://developer.tesla.com/) and receive a monthly API credit of $10.
+      This is usually sufficient for common evcc use cases.
+
+      The [myteslamate.com](https://www.myteslamate.com/tesla-api-application-registration/) guide explains the process and generates free Access and Refresh Tokens.
+      With this token pair and your Client ID created in the Tesla Developer Account, evcc can directly communicate with the Tesla Fleet API.
+
+      The APIs used for Powerwall 3 are free and do not count against your monthly credit.
+params:
+  - name: usage
+    choice: ["grid", "pv", "battery"]
+  - name: clientId
+    description:
+      generic: Client ID
+    help:
+      en: from [Tesla Developer Dashboard](https://developer.tesla.com/dashboard).
+      de: von [Tesla Developer Dashboard](https://developer.tesla.com/dashboard).
+    required: true
+  - name: accessToken
+    help:
+      en: from [myteslamate.com](https://app.myteslamate.com/).
+      de: von [myteslamate.com](https://app.myteslamate.com/).
+    required: true
+    mask: true
+  - name: refreshToken
+    help:
+      en: from [myteslamate.com](https://app.myteslamate.com/).
+      de: von [myteslamate.com](https://app.myteslamate.com/).
+    required: true
+    mask: true
+  - name: siteid
+    description:
+      generic: Site ID
+    help:
+      en: optional energy site identifier, leave empty for auto-detection
+      de: optionale Energy Site ID, leer lassen für automatische Erkennung
+  - name: minsoc
+    type: int
+    advanced: true
+    help:
+      en: minimum state of charge (%), default 20%
+      de: minimaler Ladezustand (%), Standard 20%
+  - name: maxsoc
+    type: int
+    advanced: true
+    help:
+      en: maximum state of charge (%), default 100%
+      de: maximaler Ladezustand (%), Standard 100%
+  - name: maxchargepower
+    advanced: true
+    help:
+      en: maximum charge power (W), default 5000W
+      de: maximale Ladeleistung (W), Standard 5000W
+  - name: maxdischargepower
+    advanced: true
+    help:
+      en: maximum discharge power (W), default 11500W
+      de: maximale Entladeleistung (W), Standard 11500W
+  - name: cache
+    default: 5s
+    advanced: true
+    help:
+      en: cache duration for live status data
+      de: Cache-Dauer für Live-Statusdaten
+render: |
+  type: teslafleetapi
+  usage: {{ .usage }}
+  credentials:
+    id: {{ .clientId }}
+  tokens:
+    access: {{ .accessToken }}
+    refresh: {{ .refreshToken }}
+  {{ if .siteid }}siteid: {{ .siteid }}{{ end }}
+  {{ if .minsoc }}minsoc: {{ .minsoc }}{{ end }}
+  {{ if .maxsoc }}maxsoc: {{ .maxsoc }}{{ end }}
+  {{ if .maxchargepower }}maxchargepower: {{ .maxchargepower }}{{ end }}
+  {{ if .maxdischargepower }}maxdischargepower: {{ .maxdischargepower }}{{ end }}
+  cache: {{ .cache }}
+

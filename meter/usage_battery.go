@@ -1,6 +1,10 @@
 package meter
 
-import "github.com/evcc-io/evcc/api"
+import (
+	"math"
+
+	"github.com/evcc-io/evcc/api"
+)
 
 type batteryCapacity struct {
 	Capacity float64
@@ -63,7 +67,7 @@ func (m *batterySocLimits) LimitController(socG func() (float64, error), limitSo
 			if err != nil {
 				return err
 			}
-			return limitSocS(min(100, max(soc, m.MinSoc)))
+			return limitSocS(math.Min(100, math.Max(soc, m.MinSoc)))
 
 		case api.BatteryCharge:
 			return limitSocS(m.MaxSoc)
