@@ -1,3 +1,42 @@
+// Package chargepoint implements authentication for the ChargePoint EV charging network.
+//
+// # Authentication overview
+//
+// ChargePoint uses a two-stage session model rather than standard OAuth2:
+//
+//  1. Login (one-time): POST credentials to the mobile app API endpoint with an
+//     iOS device fingerprint. Returns a "sessionId" that encodes the user ID and
+//     region directly in its structure: "<token>#D<userIDhex>#R<region>".
+//
+//  2. Session exchange: POST the sessionId to mobileapi/v5, which returns a
+//     short-lived 32-character hex "coulomb_sess" cookie used for actual API calls.
+//
+// # Token storage
+//
+// The oauth2.Token fields map to ChargePoint's model as follows:
+//   - AccessToken  = coulomb_sess (the active credential for API calls)
+//   - RefreshToken = sessionId    (durable credential used to obtain new coulomb_sess tokens)
+//
+// # Refresh without re-login
+//
+// The mobileapi/v5 endpoint accepts either a sessionId or an existing coulomb_sess
+// as the cp-session-token header and issues a fresh coulomb_sess in response.
+// This means tokens can be refreshed indefinitely without ever calling the login
+// endpoint again:
+//
+//	sessionId → mobileapi/v5 → coulomb_sess₁ → mobileapi/v5 → coulomb_sess₂ → …
+//
+// # CAPTCHA protection
+//
+// Both the SSO endpoint (sso.chargepoint.com) and the mobile app endpoint
+// (account.chargepoint.com) are protected by DataDome bot detection. Repeated
+// login attempts from the same IP will trigger a CAPTCHA challenge and return
+// HTTP 403. The response body contains a captcha-delivery.com redirect URL.
+//
+// To avoid this: Login should be treated as a strictly one-time operation used
+// only to bootstrap tokens via "evcc chargepoint-token". All subsequent credential
+// management must go through Refresh, which only calls mobileapi/v5 and is not
+// subject to the same bot protection.
 package chargepoint
 
 import (
@@ -5,6 +44,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
+	"os"
 	"strconv"
 	"strings"
 
@@ -19,9 +59,22 @@ import (
 const (
 	discoveryAPI = "https://discovery.chargepoint.com/discovery/v3/globalconfig"
 	appVersion   = "5.97.0"
-	loginUA      = "com.coulomb.ChargePoint/" + appVersion + " CFNetwork/1329 Darwin/21.3.0"
-	sessionUA    = "ChargePoint/236 (iPhone; iOS 15.3; Scale/3.00)"
+	// loginUA mimics the ChargePoint iOS app, which is required to avoid bot
+	// detection on the login endpoint.
+	loginUA = "com.coulomb.ChargePoint/" + appVersion + " CFNetwork/1329 Darwin/21.3.0"
+	// sessionUA is used for post-login API calls including mobileapi/v5 refresh.
+	sessionUA = "ChargePoint/236 (iPhone; iOS 15.3; Scale/3.00)"
 )
+
+// deviceUDID returns a stable UUID v5 derived from the machine hostname,
+// mimicking a real iOS device that always presents the same UDID.
+func deviceUDID() string {
+	host, err := os.Hostname()
+	if err != nil {
+		host = "evcc"
+	}
+	return uuid.NewSHA1(uuid.NameSpaceDNS, []byte(host)).String()
+}
 
 func newDeviceData() deviceData {
 	return deviceData{
@@ -31,7 +84,7 @@ func newDeviceData() deviceData {
 		NotificationID:     "",
 		NotificationIDType: "",
 		Type:               "IOS",
-		UDID:               uuid.New().String(),
+		UDID:               deviceUDID(),
 		Version:            appVersion,
 	}
 }
@@ -44,6 +97,10 @@ func newDeviceData() deviceData {
 //
 // The RefreshToken is the "sessionId" returned directly by the login endpoint.
 // It embeds the region and user ID and is used as the credential for refresh calls.
+//
+// WARNING: The login endpoint is protected by DataDome bot detection. Calling
+// Login repeatedly from the same IP will trigger CAPTCHA challenges. Run this
+// once via "evcc chargepoint-token" and store the resulting tokens.
 func Login(log *util.Logger, username, password string) (*oauth2.Token, error) {
 	client := &http.Client{
 		Timeout:   request.Timeout,
@@ -80,7 +137,8 @@ func Login(log *util.Logger, username, password string) (*oauth2.Token, error) {
 func Refresh(log *util.Logger, token *oauth2.Token) (*oauth2.Token, error) {
 	sessionID := token.RefreshToken
 
-	// Discover webservices endpoint (region-specific)
+	// Discover the region-specific webservices endpoint. If discovery fails,
+	// fall back to the default URL to avoid compounding a transient outage.
 	client := &http.Client{
 		Timeout:   request.Timeout,
 		Transport: request.NewTripper(log, transport.Default()),
@@ -89,9 +147,6 @@ func Refresh(log *util.Logger, token *oauth2.Token) (*oauth2.Token, error) {
 
 	cfg, err := discover(helper, newDeviceData(), SessionUserID(sessionID))
 	if err != nil {
-		// Fall back to known-good webservices URL using the region from sessionId
-		// (avoids failure if discovery itself is temporarily unavailable)
-		_ = err
 		cfg = &globalConfig{}
 		cfg.EndPoints.WebServices.Value = "https://webservices.chargepoint.com/backend.php/"
 	}
@@ -185,8 +240,11 @@ func login(c *request.Helper, cfg *globalConfig, dev deviceData, username, passw
 }
 
 // refreshSession exchanges a session token (sessionId or coulomb_sess) for a
-// fresh coulomb_sess cookie by calling the mobileapi/v5 endpoint. The user ID
-// and region are extracted from the sessionId embedded metadata.
+// fresh coulomb_sess by calling the mobileapi/v5 endpoint.
+//
+// The cp-region and user_id required by the endpoint are extracted from the
+// metadata embedded in sessionId. The coulomb_sess is returned as a cookie in
+// the response rather than in the JSON body.
 func refreshSession(log *util.Logger, webservicesURL, sessionID string) (string, error) {
 	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	if err != nil {
@@ -218,9 +276,7 @@ func refreshSession(log *util.Logger, webservicesURL, sessionID string) (string,
 		return "", fmt.Errorf("mobileapi/v5: %w", err)
 	}
 
-	// The response sets coulomb_sess as a cookie
-	u := req.URL
-	for _, c := range jar.Cookies(u) {
+	for _, c := range jar.Cookies(req.URL) {
 		if c.Name == "coulomb_sess" {
 			return c.Value, nil
 		}
