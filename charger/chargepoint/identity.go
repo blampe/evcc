@@ -76,8 +76,9 @@ func deviceUDID() string {
 	return uuid.NewSHA1(uuid.NameSpaceDNS, []byte(host)).String()
 }
 
-func newDeviceData() deviceData {
-	return deviceData{
+// NewDeviceData returns a stable iOS device fingerprint derived from the machine hostname.
+func NewDeviceData() DeviceData {
+	return DeviceData{
 		AppID:              "com.coulomb.ChargePoint",
 		Manufacturer:       "Apple",
 		Model:              "iPhone",
@@ -108,7 +109,7 @@ func Login(log *util.Logger, username, password string) (*oauth2.Token, error) {
 	}
 	helper := &request.Helper{Client: client}
 
-	dev := newDeviceData()
+	dev := NewDeviceData()
 
 	cfg, err := discover(helper, dev, username)
 	if err != nil {
@@ -145,7 +146,7 @@ func Refresh(log *util.Logger, token *oauth2.Token) (*oauth2.Token, error) {
 	}
 	helper := &request.Helper{Client: client}
 
-	cfg, err := discover(helper, newDeviceData(), SessionUserID(sessionID))
+	cfg, err := discover(helper, NewDeviceData(), SessionUserID(sessionID))
 	if err != nil {
 		cfg = &globalConfig{}
 		cfg.EndPoints.WebServices.Value = "https://webservices.chargepoint.com/backend.php/"
@@ -194,9 +195,46 @@ func SessionUserID(sessionID string) string {
 	return strconv.FormatUint(n, 10)
 }
 
-func discover(c *request.Helper, dev deviceData, username string) (*globalConfig, error) {
+// Endpoints holds the discovered ChargePoint service URLs for a specific region.
+type Endpoints struct {
+	Region      string
+	WebServices string
+	Accounts    string
+	InternalAPI string
+	MapCache    string
+}
+
+// Discover performs global config discovery using the user ID embedded in sessionID
+// and returns the region-specific service endpoints. Falls back to US defaults on error.
+func Discover(log *util.Logger, sessionID string) (*Endpoints, error) {
+	client := &http.Client{
+		Timeout:   request.Timeout,
+		Transport: request.NewTripper(log, transport.Default()),
+	}
+	helper := &request.Helper{Client: client}
+
+	cfg, err := discover(helper, NewDeviceData(), SessionUserID(sessionID))
+	if err != nil {
+		return nil, err
+	}
+
+	region := cfg.Region
+	if region == "" {
+		region = SessionRegion(sessionID)
+	}
+
+	return &Endpoints{
+		Region:      region,
+		WebServices: cfg.EndPoints.WebServices.Value,
+		Accounts:    cfg.EndPoints.Accounts.Value,
+		InternalAPI: cfg.EndPoints.InternalAPI.Value,
+		MapCache:    cfg.EndPoints.MapCache.Value,
+	}, nil
+}
+
+func discover(c *request.Helper, dev DeviceData, username string) (*globalConfig, error) {
 	data := struct {
-		DeviceData deviceData `json:"deviceData"`
+		DeviceData DeviceData `json:"deviceData"`
 		Username   string     `json:"username"`
 	}{dev, username}
 
@@ -213,9 +251,9 @@ func discover(c *request.Helper, dev deviceData, username string) (*globalConfig
 	return &cfg, nil
 }
 
-func login(c *request.Helper, cfg *globalConfig, dev deviceData, username, password string) (*loginResponse, error) {
+func login(c *request.Helper, cfg *globalConfig, dev DeviceData, username, password string) (*loginResponse, error) {
 	data := struct {
-		DeviceData deviceData `json:"deviceData"`
+		DeviceData DeviceData `json:"deviceData"`
 		Username   string     `json:"username"`
 		Password   string     `json:"password"`
 	}{dev, username, password}

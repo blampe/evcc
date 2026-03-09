@@ -1,6 +1,7 @@
 package chargepoint
 
-type deviceData struct {
+// DeviceData is the iOS device fingerprint included in ChargePoint API requests.
+type DeviceData struct {
 	AppID              string `json:"appId"`
 	Manufacturer       string `json:"manufacturer"`
 	Model              string `json:"model"`
@@ -17,6 +18,8 @@ type endpointValue struct {
 
 type configEndpoints struct {
 	Accounts    endpointValue `json:"accounts_endpoint"`
+	InternalAPI endpointValue `json:"internal_api_gateway_endpoint"`
+	MapCache    endpointValue `json:"mapcache_endpoint"`
 	WebServices endpointValue `json:"webservices_endpoint"`
 }
 
@@ -31,5 +34,3 @@ type loginResponse struct {
 		UserID int `json:"userId"`
 	} `json:"user"`
 }
-
-
