@@ -31,12 +31,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
-	"strings"
 
 	"github.com/evcc-io/evcc/server/db/settings"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/request"
-	"github.com/evcc-io/evcc/util/transport"
 	"github.com/google/uuid"
 	"golang.org/x/net/publicsuffix"
 )
@@ -118,6 +116,12 @@ func (v *Identity) Login() error {
 		Password   string     `json:"password"`
 	}{v.deviceData, v.Username, v.Password}
 
+	// TODO: We need to look up existing creds with
+	// settings.String(v.settingsKey). v.SSOSessionID represents a JWT, and
+	// only if it is expired (e.g., "exp": 1788677251) should we actually
+	// attempt to login. Otherwise we should just use the persisted DB
+	// credentials.
+
 	uri := v.cfg.EndPoints.Accounts.Value + "v2/driver/profile/account/login"
 	req, _ := request.New(http.MethodPost, uri, request.MarshalJSON(data), request.JSONEncoding)
 	req.Header.Set("User-Agent", userAgent)
@@ -135,21 +139,6 @@ func (v *Identity) Login() error {
 	v.Region = v.cfg.Region
 	v.SessionID = res.SessionID
 	v.SSOSessionID = res.SSOSessionID
-
-	v.Client.Transport = &transport.Decorator{
-		Base: v.Client.Transport,
-		Decorator: func(req *http.Request) error {
-			if strings.HasPrefix(req.URL.String(), v.cfg.EndPoints.InternalAPI.Value) ||
-				strings.HasPrefix(req.URL.String(), v.cfg.EndPoints.Accounts.Value) ||
-				strings.HasPrefix(req.URL.String(), v.cfg.EndPoints.WebServices.Value) {
-				req.Header.Set("cp-session-type", "CP_SESSION_TOKEN")
-				req.Header.Set("cp-session-token", v.SessionID)
-				req.Header.Set("cp-region", v.Region)
-				req.Header.Set("authorization", "Bearer "+v.SSOSessionID)
-			}
-			return nil
-		},
-	}
 
 	err := settings.SetJson(v.settingsKey, v.identityState)
 	if err != nil {
