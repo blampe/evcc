@@ -1,5 +1,19 @@
 package chargepoint
 
+// HomeChargerStatus holds the current status of a home charger.
+type HomeChargerStatus struct {
+	IsPluggedIn    bool
+	IsConnected    bool
+	ChargingStatus string
+	AmpLimit       int
+}
+
+// SessionData holds current charging session metrics.
+type SessionData struct {
+	PowerKW   float64
+	EnergyKWh float64
+}
+
 // DeviceData is the iOS device fingerprint included in ChargePoint API requests.
 type DeviceData struct {
 	AppID              string `json:"appId"`
@@ -20,6 +34,7 @@ type configEndpoints struct {
 	Accounts    endpointValue `json:"accounts_endpoint"`
 	InternalAPI endpointValue `json:"internal_api_gateway_endpoint"`
 	MapCache    endpointValue `json:"mapcache_endpoint"`
+	SSO         endpointValue `json:"sso_endpoint"`
 	WebServices endpointValue `json:"webservices_endpoint"`
 }
 
@@ -28,9 +43,10 @@ type globalConfig struct {
 	EndPoints configEndpoints `json:"endPoints"`
 }
 
-type loginResponse struct {
-	SessionID string `json:"sessionId"`
-	User      struct {
-		UserID int `json:"userId"`
+type accountLoginResponse struct {
+	SessionID    string `json:"sessionId"`
+	SSOSessionID string `json:"ssoSessionId"`
+	User         struct {
+		UserID int32 `json:"userId"`
 	} `json:"user"`
 }
