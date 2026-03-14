@@ -73,7 +73,21 @@ func runChargepointToken(cmd *cobra.Command, args []string) error {
 		if err != nil {
 			return fmt.Errorf("amp limit: %w", err)
 		}
+		err = api.StartSession(id)
+		if err != nil {
+			return fmt.Errorf("start session: %w", err)
+		}
+		//err = api.StopSession(id)
+		//if err != nil {
+		//	return fmt.Errorf("stop session: %w", err)
+		//}
 	}
+
+	userID, err := api.Account()
+	if err != nil {
+		return fmt.Errorf("userid: %w", err)
+	}
+	pretty.Println("User:   ", userID)
 
 	return nil
 }

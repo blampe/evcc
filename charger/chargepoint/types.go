@@ -32,6 +32,7 @@ type endpointValue struct {
 
 type configEndpoints struct {
 	Accounts    endpointValue `json:"accounts_endpoint"`
+	Chargers    endpointValue `json:"hcpo_hcm_endpoint"`
 	InternalAPI endpointValue `json:"internal_api_gateway_endpoint"`
 	MapCache    endpointValue `json:"mapcache_endpoint"`
 	SSO         endpointValue `json:"sso_endpoint"`

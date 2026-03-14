@@ -28,9 +28,13 @@
 package chargepoint
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/cookiejar"
+	"strings"
+	"time"
 
 	"github.com/evcc-io/evcc/server/db/settings"
 	"github.com/evcc-io/evcc/util"
@@ -41,7 +45,7 @@ import (
 
 const (
 	discoveryAPI = "https://discovery.chargepoint.com/discovery/v3/globalconfig"
-	appVersion   = "5.97.0"
+	appVersion   = "6.20.1"
 	userAgent    = "com.coulomb.ChargePoint/" + appVersion + " CFNetwork/3860.400.51 Darwin/25.3.0"
 )
 
@@ -89,7 +93,7 @@ func NewIdentity(log *util.Logger, username, password string) (*Identity, error)
 	})
 	cfg, err := discover(v.Helper, v.deviceData, v.Username)
 	if err != nil {
-		return nil, fmt.Errorf("discovering endpoints: %w")
+		return nil, fmt.Errorf("discovering endpoints: %w", err)
 	}
 	v.cfg = cfg
 
@@ -110,17 +114,23 @@ func NewIdentity(log *util.Logger, username, password string) (*Identity, error)
 // Login repeatedly from the same IP will trigger CAPTCHA challenges. Run this
 // once via "evcc chargepoint-token" and store the resulting tokens.
 func (v *Identity) Login() error {
+	var state identityState
+	if err := settings.Json(v.settingsKey, &state); err == nil &&
+		state.SSOSessionID != "" && !jwtExpired(state.SSOSessionID) {
+		v.log.DEBUG.Println("using persisted ChargePoint credentials")
+		v.UserID = state.UserID
+		v.Region = state.Region
+		v.SessionID = state.SessionID
+		v.SSOSessionID = state.SSOSessionID
+		v.CoulombSess = state.CoulombSess
+		return nil
+	}
+
 	data := struct {
 		DeviceData DeviceData `json:"deviceData"`
 		Username   string     `json:"username"`
 		Password   string     `json:"password"`
 	}{v.deviceData, v.Username, v.Password}
-
-	// TODO: We need to look up existing creds with
-	// settings.String(v.settingsKey). v.SSOSessionID represents a JWT, and
-	// only if it is expired (e.g., "exp": 1788677251) should we actually
-	// attempt to login. Otherwise we should just use the persisted DB
-	// credentials.
 
 	uri := v.cfg.EndPoints.Accounts.Value + "v2/driver/profile/account/login"
 	req, _ := request.New(http.MethodPost, uri, request.MarshalJSON(data), request.JSONEncoding)
@@ -140,12 +150,32 @@ func (v *Identity) Login() error {
 	v.SessionID = res.SessionID
 	v.SSOSessionID = res.SSOSessionID
 
-	err := settings.SetJson(v.settingsKey, v.identityState)
-	if err != nil {
+	v.log.DEBUG.Println("persisting key", v.settingsKey)
+	if err := settings.SetJson(v.settingsKey, v.identityState); err != nil {
 		return fmt.Errorf("persisting chargepoint identity: %w", err)
 	}
 
 	return nil
+}
+
+// jwtExpired returns true if the JWT's exp claim is in the past or the token
+// cannot be parsed. The signature is not verified — we only need the expiry.
+func jwtExpired(tokenStr string) bool {
+	parts := strings.SplitN(tokenStr, ".", 3)
+	if len(parts) != 3 {
+		return true
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return true
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp == 0 {
+		return true
+	}
+	return time.Now().Unix() > claims.Exp
 }
 
 func discover(c *request.Helper, dev DeviceData, username string) (*globalConfig, error) {

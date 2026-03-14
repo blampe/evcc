@@ -1,52 +1,92 @@
 package chargepoint
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"time"
 
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/request"
+	"github.com/evcc-io/evcc/util/transport"
 )
 
-// API is an HTTP client for the ChargePoint API. The shared cookie jar from
-// Identity carries the coulomb_sess cookie to all endpoints automatically,
-// mirroring how python-chargepoint uses requests.Session. Extra headers are
-// only added for the internal API endpoint that requires them.
+// wsUserAgent is the User-Agent for webservices.chargepoint.com calls,
+// matching the iOS app's WKWebView requests.
+const wsUserAgent = "ChargePoint/664 (iPhone; iOS 26.3; Scale/3.00)"
+
+// API is an HTTP client for the ChargePoint API.
 type API struct {
 	identity    *Identity
 	wsURL       string
 	accountsURL string
 	internalURL string
+	chargersURL string
 	mapcacheURL string
 	region      string
 }
 
-// NewAPI creates a ChargePoint API client. It attaches the identity's cookie
-// jar to the underlying http.Client so that Set-Cookie responses are captured
-// and cookies are sent automatically.
+// NewAPI creates a ChargePoint API client.
 func NewAPI(log *util.Logger, identity *Identity) *API {
-	v := &API{
+	api := &API{
 		identity:    identity,
 		wsURL:       identity.cfg.EndPoints.WebServices.Value,
 		accountsURL: identity.cfg.EndPoints.Accounts.Value,
 		internalURL: identity.cfg.EndPoints.InternalAPI.Value,
+		chargersURL: identity.cfg.EndPoints.Chargers.Value,
 		mapcacheURL: identity.cfg.EndPoints.MapCache.Value,
 		region:      identity.Region,
 	}
+	api.identity.Helper.Transport = transport.BrotliCompression(api.identity.Helper.Transport)
+	return api
+}
 
-	return v
+// cpHeaders returns the standard CP headers required by all API endpoints.
+// Cookies are set explicitly because the cookie jar is empty after a settings
+// restore and the app always sends them as static header values.
+func (a *API) cpHeaders() map[string]string {
+	return map[string]string{
+		"User-Agent":       userAgent,
+		"CP-Region":        a.region,
+		"CP-Session-Token": a.identity.SessionID,
+		"CP-Session-Type":  "CP_SESSION_TOKEN",
+		"Cache-Control":    "no-store",
+		"Accept-Language":  "en;q=1",
+		"Accept-Encoding":  "gzip, deflate, br",
+		"Cookie":           "coulomb_sess=" + a.identity.SessionID + "; auth-session=" + a.identity.SSOSessionID,
+	}
+}
+
+// cpWSHeaders returns CP headers for webservices.chargepoint.com calls,
+// which require a different User-Agent from the native app endpoints.
+func (a *API) cpWSHeaders() map[string]string {
+	h := a.cpHeaders()
+	h["User-Agent"] = wsUserAgent
+	return h
+}
+
+// cpInternalHeaders returns CP headers for internal-api calls, which
+// additionally require an Authorization bearer token.
+func (a *API) cpInternalHeaders() map[string]string {
+	h := a.cpHeaders()
+	h["Authorization"] = "Bearer " + a.identity.SSOSessionID
+	return h
 }
 
 // Account fetches the account and returns the user ID.
 func (a *API) Account() (int32, error) {
+	req, err := request.New(http.MethodGet, a.accountsURL+"v1/driver/profile/user", nil,
+		request.JSONEncoding, a.cpHeaders())
+	if err != nil {
+		return 0, err
+	}
+
 	var res struct {
 		User struct {
 			UserID int32 `json:"userId"`
 		} `json:"user"`
 	}
-	if err := a.identity.GetJSON(a.accountsURL+"v1/driver/profile/user", &res); err != nil {
+	if err := a.identity.DoJSON(req, &res); err != nil {
 		return 0, err
 	}
 	return res.User.UserID, nil
@@ -61,7 +101,8 @@ func (a *API) HomeChargerIDs() ([]int, error) {
 		} `json:"get_pandas"`
 	}{UserID: a.identity.UserID}
 
-	req, err := request.New(http.MethodPost, a.wsURL+"mobileapi/v5", request.MarshalJSON(data), request.JSONEncoding)
+	req, err := request.New(http.MethodPost, a.wsURL+"mobileapi/v5",
+		request.MarshalJSON(data), request.JSONEncoding, a.cpWSHeaders())
 	if err != nil {
 		return nil, err
 	}
@@ -78,42 +119,34 @@ func (a *API) HomeChargerIDs() ([]int, error) {
 	return res.GetPandas.DeviceIDs, nil
 }
 
-// HomeChargerStatus returns the current status of a home charger.
+// HomeChargerStatus returns the current status of a home charger via the
+// internal REST API, which returns richer data than the legacy mobileapi.
 func (a *API) HomeChargerStatus(deviceID int) (HomeChargerStatus, error) {
-	data := struct {
-		UserID         int32 `json:"user_id"`
-		GetPandaStatus struct {
-			DeviceID int      `json:"device_id"`
-			MFHS     struct{} `json:"mfhs"`
-		} `json:"get_panda_status"`
-	}{UserID: a.identity.UserID}
-	data.GetPandaStatus.DeviceID = deviceID
+	uri := fmt.Sprintf("%sapi/v1/configuration/users/%d/chargers/%d/status?", a.chargersURL, a.identity.UserID, deviceID)
 
-	req, err := request.New(http.MethodPost, a.wsURL+"mobileapi/v5", request.MarshalJSON(data), request.JSONEncoding)
+	req, err := request.New(http.MethodGet, uri, nil,
+		request.JSONEncoding, a.cpInternalHeaders())
 	if err != nil {
 		return HomeChargerStatus{}, err
 	}
 
 	var res struct {
-		GetPandaStatus struct {
-			IsPluggedIn           bool   `json:"is_plugged_in"`
-			IsConnected           bool   `json:"is_connected"`
-			ChargingStatus        string `json:"charging_status"`
-			ChargeAmperageSetting struct {
-				ChargeLimit int `json:"charge_limit"`
-			} `json:"charge_amperage_setting"`
-		} `json:"get_panda_status"`
+		ChargingStatus         string `json:"chargingStatus"`
+		IsConnected            bool   `json:"isConnected"`
+		IsPluggedIn            bool   `json:"isPluggedIn"`
+		ChargeAmperageSettings struct {
+			ChargeLimit int `json:"chargeLimit"`
+		} `json:"chargeAmperageSettings"`
 	}
 	if err := a.identity.DoJSON(req, &res); err != nil {
 		return HomeChargerStatus{}, err
 	}
 
-	s := res.GetPandaStatus
 	return HomeChargerStatus{
-		IsPluggedIn:    s.IsPluggedIn,
-		IsConnected:    s.IsConnected,
-		ChargingStatus: s.ChargingStatus,
-		AmpLimit:       s.ChargeAmperageSetting.ChargeLimit,
+		IsPluggedIn:    res.IsPluggedIn,
+		IsConnected:    res.IsConnected,
+		ChargingStatus: res.ChargingStatus,
+		AmpLimit:       res.ChargeAmperageSettings.ChargeLimit,
 	}, nil
 }
 
@@ -125,7 +158,8 @@ func (a *API) SessionData() (SessionData, error) {
 		} `json:"user_status"`
 	}{}
 
-	req, err := request.New(http.MethodPost, a.mapcacheURL+"v2", request.MarshalJSON(data), request.JSONEncoding)
+	req, err := request.New(http.MethodPost, a.mapcacheURL+"v2",
+		request.MarshalJSON(data), request.JSONEncoding, a.cpWSHeaders())
 	if err != nil {
 		return SessionData{}, err
 	}
@@ -146,9 +180,22 @@ func (a *API) SessionData() (SessionData, error) {
 	}
 
 	sessionID := statusResp.UserStatus.Charging.SessionID
-	query := url.QueryEscape(fmt.Sprintf(
-		`{"user_id":%s,"charging_status":{"mfhs":{},"session_id":%d}}`,
-		a.identity.UserID, sessionID))
+	chargingData := struct {
+		UserID         int32 `json:"user_id"`
+		ChargingStatus struct {
+			MFHS      struct{} `json:"mfhs"`
+			SessionID int      `json:"session_id"`
+		} `json:"charging_status"`
+	}{
+		UserID: a.identity.UserID,
+	}
+	chargingData.ChargingStatus.SessionID = sessionID
+
+	req, err = request.New(http.MethodPost, a.mapcacheURL+"v2",
+		request.MarshalJSON(chargingData), request.JSONEncoding, a.cpWSHeaders())
+	if err != nil {
+		return SessionData{}, err
+	}
 
 	var chargingResp struct {
 		ChargingStatus *struct {
@@ -156,7 +203,7 @@ func (a *API) SessionData() (SessionData, error) {
 			EnergyKWh float64 `json:"energy_kwh"`
 		} `json:"charging_status"`
 	}
-	if err := a.identity.GetJSON(a.mapcacheURL+"v2?"+query, &chargingResp); err != nil {
+	if err := a.identity.DoJSON(req, &chargingResp); err != nil {
 		return SessionData{}, err
 	}
 
@@ -170,7 +217,7 @@ func (a *API) SessionData() (SessionData, error) {
 	}, nil
 }
 
-// StartSession starts a charging session on the given device and waits for acknowledgement.
+// StartSession starts a charging session on the given device.
 func (a *API) StartSession(deviceID int) error {
 	data := struct {
 		DeviceData DeviceData `json:"deviceData"`
@@ -181,81 +228,57 @@ func (a *API) StartSession(deviceID int) error {
 	}
 
 	req, err := request.New(http.MethodPost, a.accountsURL+"v1/driver/station/startsession",
-		request.MarshalJSON(data), request.JSONEncoding)
+		request.MarshalJSON(data), request.JSONEncoding, a.cpHeaders())
 	if err != nil {
 		return err
 	}
 
 	var res struct {
-		AckID string `json:"ackId"`
+		AckID int `json:"ackId"`
 	}
 	if err := a.identity.DoJSON(req, &res); err != nil {
-		return err
+		var se *request.StatusError
+		if !errors.As(err, &se) || !se.HasStatus(http.StatusUnprocessableEntity) {
+			return err
+		}
 	}
 
 	return a.pollAck(res.AckID, "start_session")
 }
 
-// StopSession stops any active charging session on the given device.
+// StopSession stops the active charging session on the given device.
 func (a *API) StopSession(deviceID int) error {
 	data := struct {
-		UserStatus struct {
-			MFHS struct{} `json:"mfhs"`
-		} `json:"user_status"`
-	}{}
-
-	req, err := request.New(http.MethodPost, a.mapcacheURL+"v2", request.MarshalJSON(data), request.JSONEncoding)
-	if err != nil {
-		return err
-	}
-
-	var statusResp struct {
-		UserStatus *struct {
-			Charging *struct {
-				SessionID int `json:"sessionId"`
-			} `json:"charging"`
-		} `json:"user_status"`
-	}
-	if err := a.identity.DoJSON(req, &statusResp); err != nil {
-		return err
-	}
-
-	if statusResp.UserStatus == nil || statusResp.UserStatus.Charging == nil {
-		return nil
-	}
-
-	stopData := struct {
 		DeviceData DeviceData `json:"deviceData"`
 		DeviceID   int        `json:"deviceId"`
-		PortNumber int        `json:"portNumber"`
-		SessionID  int        `json:"sessionId"`
 	}{
 		DeviceData: a.identity.deviceData,
 		DeviceID:   deviceID,
-		PortNumber: 1,
-		SessionID:  statusResp.UserStatus.Charging.SessionID,
 	}
 
-	req, err = request.New(http.MethodPost, a.accountsURL+"v1/driver/station/stopSession",
-		request.MarshalJSON(stopData), request.JSONEncoding)
+	req, err := request.New(http.MethodPost, a.accountsURL+"v1/driver/station/stopsession",
+		request.MarshalJSON(data), request.JSONEncoding, a.cpHeaders())
 	if err != nil {
 		return err
 	}
 
 	var res struct {
-		AckID string `json:"ackId"`
+		AckID int `json:"ackId"`
 	}
 	if err := a.identity.DoJSON(req, &res); err != nil {
-		return err
+		var se *request.StatusError
+		if !errors.As(err, &se) || !se.HasStatus(http.StatusUnprocessableEntity) {
+			return err
+		}
 	}
 
 	return a.pollAck(res.AckID, "stop_session")
 }
 
-func (a *API) pollAck(ackID, action string) error {
+func (a *API) pollAck(ackID int, action string) error {
 	ackData := struct {
 		DeviceData DeviceData `json:"deviceData"`
-		AckID      string     `json:"ackId"`
+		AckID      int        `json:"ackId"`
 		Action     string     `json:"action"`
 	}{
 		DeviceData: a.identity.deviceData,
@@ -269,7 +292,7 @@ func (a *API) pollAck(ackID, action string) error {
 		}
 
 		req, err := request.New(http.MethodPost, a.accountsURL+"v1/driver/station/session/ack",
-			request.MarshalJSON(ackData), request.JSONEncoding)
+			request.MarshalJSON(ackData), request.JSONEncoding, a.cpHeaders())
 		if err != nil {
 			return err
 		}
@@ -282,33 +305,20 @@ func (a *API) pollAck(ackID, action string) error {
 	return nil
 }
 
-// SetAmperageLimit sets the charge amperage limit on the given device.
-// Per the ChargePoint API, this endpoint requires cp-session-type, cp-session-token,
-// and cp-region headers in addition to the coulomb_sess cookie; these are added
-// by the transport decorator for the internalURL prefix.
+// SetAmperageLimit sets the charge amperage limit on the given device via the
+// internal REST API using PUT, as required by that endpoint.
 func (a *API) SetAmperageLimit(deviceID int, limit int64) error {
-	uri := fmt.Sprintf("%s/driver/charger/%d/config/v1/charge-amperage-limit", a.internalURL, deviceID)
+	uri := fmt.Sprintf("%sapi/v1/configuration/chargers/%d/charge-amperage-limit", a.chargersURL, deviceID)
 
 	data := struct {
 		ChargeAmperageLimit int64 `json:"chargeAmperageLimit"`
 	}{limit}
 
-	req, err := request.New(http.MethodPost, uri, request.MarshalJSON(data), request.JSONEncoding)
+	req, err := request.New(http.MethodPut, uri,
+		request.MarshalJSON(data), request.JSONEncoding, a.cpInternalHeaders())
 	if err != nil {
 		return err
 	}
 
-	var res struct {
-		Status  string `json:"status"`
-		Message string `json:"message"`
-	}
-	if err := a.identity.DoJSON(req, &res); err != nil {
-		return err
-	}
-
-	if res.Status != "success" {
-		return fmt.Errorf("set amperage: %s", res.Message)
-	}
-
-	return nil
+	return a.identity.DoJSON(req, nil)
 }
