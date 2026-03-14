@@ -60,6 +60,11 @@ func NewChargePoint(deviceID int, user, password string, minCurrent, maxCurrent 
 		return nil, fmt.Errorf("identity: %w", err)
 	}
 
+	err = identity.Login()
+	if err != nil {
+		return nil, fmt.Errorf("login: %w", err)
+	}
+
 	api := cpkg.NewAPI(log, identity)
 
 	if deviceID == 0 {
