@@ -118,12 +118,12 @@ func (c *ChargePoint) Status() (api.ChargeStatus, error) {
 	}
 
 	switch {
-	case !res.IsConnected && !res.IsPluggedIn:
-		return api.StatusA, nil
 	case res.ChargingStatus == "CHARGING":
 		return api.StatusC, nil
+	case res.IsPluggedIn:
+		return api.StatusB, nil // Connected
 	default:
-		return api.StatusB, nil
+		return api.StatusA, nil // Disconnected
 	}
 }
 
