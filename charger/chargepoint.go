@@ -2,6 +2,7 @@ package charger
 
 import (
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/evcc-io/evcc/api"
@@ -97,6 +98,15 @@ func NewChargePoint(deviceID int, user, password string, minCurrent, maxCurrent 
 		return cp.API.SessionData()
 	}, cache)
 
+	// Clamp our min/max based on what the device supports.
+	if status, err := cp.statusG.Get(); err == nil {
+		limits := status.ChargeAmperageSettings.PossibleChargeLimit
+		deviceMin := slices.Min(limits)
+		deviceMax := slices.Max(limits)
+		cp.minCurrent = max(cp.minCurrent, deviceMin)
+		cp.maxCurrent = min(cp.maxCurrent, deviceMax)
+	}
+
 	return cp, nil
 }
 
@@ -142,7 +152,7 @@ func (c *ChargePoint) Enable(enable bool) error {
 
 // MaxCurrent implements the api.Charger interface.
 func (c *ChargePoint) MaxCurrent(current int64) error {
-	if current < c.minCurrent {
+	if current < int64(c.minCurrent) {
 		current = c.minCurrent
 	}
 	if current > c.maxCurrent {

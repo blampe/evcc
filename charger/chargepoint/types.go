@@ -2,10 +2,13 @@ package chargepoint
 
 // HomeChargerStatus holds the current status of a home charger.
 type HomeChargerStatus struct {
-	IsPluggedIn    bool
-	IsConnected    bool
-	ChargingStatus string
-	AmpLimit       int
+	ChargingStatus         string `json:"chargingStatus"` // AVAILABLE, CHARGING
+	IsPluggedIn            bool   `json:"isPluggedIn"`    // Vehicle's connection status.
+	IsConnected            bool   `json:"isConnected"`    // ???
+	ChargeAmperageSettings struct {
+		ChargeLimit         int64   `json:"chargeLimit"`         // What the limit is now.
+		PossibleChargeLimit []int64 `json:"possibleChargeLimit"` // Possible limits.
+	} `json:"chargeAmperageSettings"`
 }
 
 // SessionData holds current charging session metrics.

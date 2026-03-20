@@ -130,24 +130,9 @@ func (a *API) HomeChargerStatus(deviceID int) (HomeChargerStatus, error) {
 		return HomeChargerStatus{}, err
 	}
 
-	var res struct {
-		ChargingStatus         string `json:"chargingStatus"`
-		IsConnected            bool   `json:"isConnected"`
-		IsPluggedIn            bool   `json:"isPluggedIn"`
-		ChargeAmperageSettings struct {
-			ChargeLimit int `json:"chargeLimit"`
-		} `json:"chargeAmperageSettings"`
-	}
-	if err := a.identity.DoJSON(req, &res); err != nil {
-		return HomeChargerStatus{}, err
-	}
-
-	return HomeChargerStatus{
-		IsPluggedIn:    res.IsPluggedIn,
-		IsConnected:    res.IsConnected,
-		ChargingStatus: res.ChargingStatus,
-		AmpLimit:       res.ChargeAmperageSettings.ChargeLimit,
-	}, nil
+	var res HomeChargerStatus
+	err = a.identity.DoJSON(req, &res)
+	return res, err
 }
 
 // SessionData returns the current charging session metrics.
