@@ -11,12 +11,6 @@ type HomeChargerStatus struct {
 	} `json:"chargeAmperageSettings"`
 }
 
-// SessionData holds current charging session metrics.
-type SessionData struct {
-	PowerKW   float64
-	EnergyKWh float64
-}
-
 // DeviceData is the iOS device fingerprint included in ChargePoint API requests.
 type DeviceData struct {
 	AppID              string `json:"appId"`

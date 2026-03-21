@@ -23,11 +23,10 @@ type ChargePoint struct {
 	maxCurrent int64
 	enabled    bool
 	statusG    util.Cacheable[cpkg.HomeChargerStatus]
-	sessionG   util.Cacheable[cpkg.SessionData]
 }
 
 // NewChargePointFromConfig creates a ChargePoint charger from generic config.
-func NewChargePointFromConfig(other map[string]interface{}) (api.Charger, error) {
+func NewChargePointFromConfig(other map[string]any) (api.Charger, error) {
 	cc := struct {
 		DeviceID   int
 		User       string
@@ -94,9 +93,6 @@ func NewChargePoint(deviceID int, user, password string, minCurrent, maxCurrent 
 	cp.statusG = util.ResettableCached(func() (cpkg.HomeChargerStatus, error) {
 		return cp.API.HomeChargerStatus(cp.deviceID)
 	}, cache)
-	cp.sessionG = util.ResettableCached(func() (cpkg.SessionData, error) {
-		return cp.API.SessionData()
-	}, cache)
 
 	// Clamp our min/max based on what the device supports.
 	if status, err := cp.statusG.Get(); err == nil {
@@ -146,7 +142,6 @@ func (c *ChargePoint) Enable(enable bool) error {
 
 	c.enabled = enable
 	c.statusG.Reset()
-	c.sessionG.Reset()
 	return nil
 }
 
@@ -166,29 +161,3 @@ func (c *ChargePoint) MaxCurrent(current int64) error {
 	c.statusG.Reset()
 	return nil
 }
-
-//var _ api.Meter = (*ChargePoint)(nil)
-
-/*
-// CurrentPower implements the api.Meter interface.
-func (c *ChargePoint) CurrentPower() (float64, error) {
-	res, err := c.sessionG.Get()
-	return res.PowerKW * 1e3, err
-}
-
-var _ api.ChargeRater = (*ChargePoint)(nil)
-
-// ChargedEnergy implements the api.ChargeRater interface.
-func (c *ChargePoint) ChargedEnergy() (float64, error) {
-	res, err := c.sessionG.Get()
-	return res.EnergyKWh, err
-}
-
-var _ api.CurrentGetter = (*ChargePoint)(nil)
-
-// GetMaxCurrent implements the api.CurrentGetter interface.
-func (c *ChargePoint) GetMaxCurrent() (float64, error) {
-	res, err := c.statusG.Get()
-	return float64(res.AmpLimit), err
-}
-*/
