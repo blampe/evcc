@@ -17,7 +17,6 @@ func init() {
 // ChargePoint implements the api.Charger interface for ChargePoint Home Flex chargers.
 type ChargePoint struct {
 	*cpkg.API
-	log        *util.Logger
 	deviceID   int
 	minCurrent int64
 	maxCurrent int64
@@ -60,11 +59,6 @@ func NewChargePoint(deviceID int, user, password string, minCurrent, maxCurrent 
 		return nil, fmt.Errorf("identity: %w", err)
 	}
 
-	err = identity.Login()
-	if err != nil {
-		return nil, fmt.Errorf("login: %w", err)
-	}
-
 	api := cpkg.NewAPI(log, identity)
 
 	if deviceID == 0 {
@@ -84,7 +78,6 @@ func NewChargePoint(deviceID int, user, password string, minCurrent, maxCurrent 
 
 	cp := &ChargePoint{
 		API:        api,
-		log:        log,
 		deviceID:   deviceID,
 		minCurrent: minCurrent,
 		maxCurrent: maxCurrent,
@@ -96,11 +89,10 @@ func NewChargePoint(deviceID int, user, password string, minCurrent, maxCurrent 
 
 	// Clamp our min/max based on what the device supports.
 	if status, err := cp.statusG.Get(); err == nil {
-		limits := status.ChargeAmperageSettings.PossibleChargeLimit
-		deviceMin := slices.Min(limits)
-		deviceMax := slices.Max(limits)
-		cp.minCurrent = max(cp.minCurrent, deviceMin)
-		cp.maxCurrent = min(cp.maxCurrent, deviceMax)
+		if limits := status.ChargeAmperageSettings.PossibleChargeLimit; len(limits) > 0 {
+			cp.minCurrent = max(cp.minCurrent, slices.Min(limits))
+			cp.maxCurrent = min(cp.maxCurrent, slices.Max(limits))
+		}
 	}
 
 	return cp, nil

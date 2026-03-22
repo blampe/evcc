@@ -40,6 +40,7 @@ import (
 	"github.com/evcc-io/evcc/server/db/settings"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/request"
+	"github.com/evcc-io/evcc/util/transport"
 	"github.com/google/uuid"
 	"golang.org/x/net/publicsuffix"
 )
@@ -56,7 +57,6 @@ type Identity struct {
 	*request.Helper
 	identityState
 
-	log         *util.Logger
 	settingsKey string
 	deviceData  DeviceData
 	cfg         *globalConfig
@@ -69,8 +69,7 @@ type identityState struct {
 	UserID       int32  `json:"user_id"`
 	Region       string `json:"region"`
 	SessionID    string `json:"sessionId"`
-	SSOSessionID string `json:"ssoSessionId"` // This is a JWT returned by login but we don't use it yet. sso.chargepoint.com also returns this token.
-	CoulombSess  string `json:"coulombSess"`
+	SSOSessionID string `json:"ssoSessionId"` // JWT returned by login; sso.chargepoint.com also returns this token.
 }
 
 // NewIdentity creates a ChargePoint Identity backed by a cookie jar. It loads
@@ -79,7 +78,6 @@ type identityState struct {
 func NewIdentity(log *util.Logger, username, password string) (*Identity, error) {
 	v := &Identity{
 		Helper:      request.NewHelper(log),
-		log:         log,
 		settingsKey: "chargepoint." + username,
 		deviceData:  newDeviceData(username),
 
@@ -88,6 +86,10 @@ func NewIdentity(log *util.Logger, username, password string) (*Identity, error)
 			Password: password,
 		},
 	}
+
+	// Wrap transport for brotli decompression; must be done once here so that
+	// all requests through this Identity use brotli. NewAPI must not wrap it again.
+	v.Helper.Transport = transport.BrotliCompression(v.Helper.Transport)
 
 	v.Helper.Jar, _ = cookiejar.New(&cookiejar.Options{
 		PublicSuffixList: publicsuffix.List,
@@ -98,6 +100,10 @@ func NewIdentity(log *util.Logger, username, password string) (*Identity, error)
 	}
 	v.cfg = cfg
 
+	if err := v.Login(); err != nil {
+		return nil, err
+	}
+
 	return v, nil
 }
 
@@ -106,16 +112,13 @@ func (v *Identity) Login() error {
 	var state identityState
 	if err := settings.Json(v.settingsKey, &state); err == nil &&
 		state.SSOSessionID != "" && !jwtExpired(state.SSOSessionID) {
-		v.log.DEBUG.Println("using persisted ChargePoint credentials")
 		v.UserID = state.UserID
 		v.Region = state.Region
 		v.SessionID = state.SessionID
 		v.SSOSessionID = state.SSOSessionID
-		v.CoulombSess = state.CoulombSess
 		if err := v.validate(); err == nil {
 			return nil
 		}
-		v.log.DEBUG.Println("persisted ChargePoint credentials invalid, re-logging in")
 	}
 
 	data := struct {
@@ -142,7 +145,6 @@ func (v *Identity) Login() error {
 	v.SessionID = res.SessionID
 	v.SSOSessionID = res.SSOSessionID
 
-	v.log.DEBUG.Println("persisting key", v.settingsKey)
 	if err := settings.SetJson(v.settingsKey, v.identityState); err != nil {
 		return fmt.Errorf("persisting chargepoint identity: %w", err)
 	}
@@ -160,7 +162,6 @@ func (v *Identity) validate() error {
 		"CP-Session-Type":  "CP_SESSION_TOKEN",
 		"Cache-Control":    "no-store",
 		"Accept-Language":  "en;q=1",
-		"Accept-Encoding":  "gzip, deflate, br",
 		"Cookie":           "coulomb_sess=" + v.SessionID + "; auth-session=" + v.SSOSessionID,
 	}
 	req, err := request.New(http.MethodGet, v.cfg.EndPoints.Accounts.Value+"v1/driver/profile/user", nil,

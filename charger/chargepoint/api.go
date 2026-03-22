@@ -8,7 +8,6 @@ import (
 
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/request"
-	"github.com/evcc-io/evcc/util/transport"
 )
 
 // wsUserAgent is the User-Agent for webservices.chargepoint.com calls,
@@ -22,29 +21,27 @@ type API struct {
 	accountsURL string
 	internalURL string
 	chargersURL string
-	mapcacheURL string
 	region      string
 }
 
 // NewAPI creates a ChargePoint API client.
 func NewAPI(log *util.Logger, identity *Identity) *API {
-	api := &API{
+	return &API{
 		identity:    identity,
 		wsURL:       identity.cfg.EndPoints.WebServices.Value,
 		accountsURL: identity.cfg.EndPoints.Accounts.Value,
 		internalURL: identity.cfg.EndPoints.InternalAPI.Value,
 		chargersURL: identity.cfg.EndPoints.Chargers.Value,
-		mapcacheURL: identity.cfg.EndPoints.MapCache.Value,
 		region:      identity.Region,
 	}
-	api.identity.Helper.Transport = transport.BrotliCompression(api.identity.Helper.Transport)
-	return api
 }
 
 // cpHeaders returns the standard CP headers required by all API endpoints.
 // Cookies are set explicitly because the cookie jar is empty after a settings
 // restore and the app always sends them as static header values.
 func (a *API) cpHeaders() map[string]string {
+	// Accept-Encoding is intentionally omitted here; the BrotliCompression
+	// transport (set in NewIdentity) sets it to "br" on every request.
 	return map[string]string{
 		"User-Agent":       userAgent,
 		"CP-Region":        a.region,
@@ -52,7 +49,6 @@ func (a *API) cpHeaders() map[string]string {
 		"CP-Session-Type":  "CP_SESSION_TOKEN",
 		"Cache-Control":    "no-store",
 		"Accept-Language":  "en;q=1",
-		"Accept-Encoding":  "gzip, deflate, br",
 		"Cookie":           "coulomb_sess=" + a.identity.SessionID + "; auth-session=" + a.identity.SSOSessionID,
 	}
 }
@@ -155,6 +151,9 @@ func (a *API) StartSession(deviceID int) error {
 		AckID int `json:"ackId"`
 	}
 	if err := a.identity.DoJSON(req, &res); err != nil {
+		// 422 means the charger received the command but responds with an ack ID
+		// in the body — decodeJSON still populates res on error, so fall through
+		// to poll. Any other error is fatal.
 		var se *request.StatusError
 		if !errors.As(err, &se) || !se.HasStatus(http.StatusUnprocessableEntity) {
 			return err
@@ -184,6 +183,9 @@ func (a *API) StopSession(deviceID int) error {
 		AckID int `json:"ackId"`
 	}
 	if err := a.identity.DoJSON(req, &res); err != nil {
+		// 422 means the charger received the command but responds with an ack ID
+		// in the body — decodeJSON still populates res on error, so fall through
+		// to poll. Any other error is fatal.
 		var se *request.StatusError
 		if !errors.As(err, &se) || !se.HasStatus(http.StatusUnprocessableEntity) {
 			return err
@@ -220,7 +222,7 @@ func (a *API) pollAck(ackID int, action string) error {
 		}
 	}
 
-	return nil
+	return fmt.Errorf("charger did not acknowledge %s", action)
 }
 
 // SetAmperageLimit sets the charge amperage limit on the given device via the
