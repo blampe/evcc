@@ -147,7 +147,7 @@ func (c *ChargePoint) Enable(enable bool) error {
 
 // MaxCurrent implements the api.Charger interface.
 func (c *ChargePoint) MaxCurrent(current int64) error {
-	if current < int64(c.minCurrent) {
+	if current < c.minCurrent {
 		current = c.minCurrent
 	}
 	if current > c.maxCurrent {

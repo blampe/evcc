@@ -22,8 +22,9 @@
 // All ChargePoint endpoints are protected by DataDome bot detection. Repeated
 // logins from the same IP (~4 per half hour) will trigger a CAPTCHA challenge
 // and return HTTP 403 even for valid credentials. Only after a cooldown of
-// several hours will you be able to login again. It's for this reason that we
-// always prefer persisted DB credentials over new logins.
+// several hours will you be able to login again, however previously generated
+// credentials will continue to work. It's for this reason that we always
+// prefer persisted DB credentials over new logins.
 
 package chargepoint
 
@@ -67,7 +68,7 @@ type identityState struct {
 	Password     string `json:"password"`
 	UserID       int32  `json:"user_id"`
 	Region       string `json:"region"`
-	SessionID    string `json:"sessionId"`    //
+	SessionID    string `json:"sessionId"`
 	SSOSessionID string `json:"ssoSessionId"` // This is a JWT returned by login but we don't use it yet. sso.chargepoint.com also returns this token.
 	CoulombSess  string `json:"coulombSess"`
 }
@@ -101,18 +102,6 @@ func NewIdentity(log *util.Logger, username, password string) (*Identity, error)
 }
 
 // Login performs the ChargePoint mobile app login flow.
-//
-// Sets CoulombSess to a short-lived "coulomb_sess" session cookie obtained by
-// exchanging the sessionId via mobileapi/v5. It can be refreshed without
-// re-authenticating using the Refresh function.
-//
-// Sets SessionID to the "sessionId" returned directly by the login endpoint.
-// It embeds the region and user ID and is used as the credential for refresh
-// calls.
-//
-// WARNING: The login endpoint is protected by DataDome bot detection. Calling
-// Login repeatedly from the same IP will trigger CAPTCHA challenges. Run this
-// once via "evcc chargepoint-token" and store the resulting tokens.
 func (v *Identity) Login() error {
 	var state identityState
 	if err := settings.Json(v.settingsKey, &state); err == nil &&
