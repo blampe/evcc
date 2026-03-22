@@ -112,7 +112,10 @@ func (v *Identity) Login() error {
 		v.SessionID = state.SessionID
 		v.SSOSessionID = state.SSOSessionID
 		v.CoulombSess = state.CoulombSess
-		return nil
+		if err := v.validate(); err == nil {
+			return nil
+		}
+		v.log.DEBUG.Println("persisted ChargePoint credentials invalid, re-logging in")
 	}
 
 	data := struct {
@@ -145,6 +148,27 @@ func (v *Identity) Login() error {
 	}
 
 	return nil
+}
+
+// validate checks whether the current credentials are still valid by fetching
+// the user profile. Returns nil on success.
+func (v *Identity) validate() error {
+	headers := map[string]string{
+		"User-Agent":       userAgent,
+		"CP-Region":        v.Region,
+		"CP-Session-Token": v.SessionID,
+		"CP-Session-Type":  "CP_SESSION_TOKEN",
+		"Cache-Control":    "no-store",
+		"Accept-Language":  "en;q=1",
+		"Accept-Encoding":  "gzip, deflate, br",
+		"Cookie":           "coulomb_sess=" + v.SessionID + "; auth-session=" + v.SSOSessionID,
+	}
+	req, err := request.New(http.MethodGet, v.cfg.EndPoints.Accounts.Value+"v1/driver/profile/user", nil,
+		request.JSONEncoding, headers)
+	if err != nil {
+		return err
+	}
+	return v.Helper.DoJSON(req, nil)
 }
 
 // jwtExpired returns true if the JWT's exp claim is in the past or the token
@@ -185,11 +209,6 @@ func discover(c *request.Helper, dev DeviceData, username string) (*globalConfig
 
 	return &cfg, nil
 }
-
-// cookieBaseURL is the reference URL used for reading coulomb_sess from the jar.
-// ChargePoint sets coulomb_sess with Domain=.chargepoint.com so it is valid
-// for all *.chargepoint.com subdomains once stored.
-const cookieBaseURL = "https://account.chargepoint.com/"
 
 // deviceUDID returns a stable UUID v5 derived from the username,
 // mimicking a real iOS device that always presents the same UDID.
