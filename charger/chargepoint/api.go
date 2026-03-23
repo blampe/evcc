@@ -237,6 +237,11 @@ func (a *API) pollAck(ackID int, action string) error {
 		if err == nil {
 			return nil
 		}
+		// 422 is expected and indicates we should keep waiting.
+		var se *request.StatusError
+		if errors.As(err, &se) && se.HasStatus(http.StatusUnprocessableEntity) {
+			continue
+		}
 		a.log.DEBUG.Printf("pollAck %s attempt %d/5 (ackId=%d): %v", action, i+1, ackID, err)
 	}
 
