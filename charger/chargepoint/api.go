@@ -16,6 +16,7 @@ const wsUserAgent = "ChargePoint/664 (iPhone; iOS 26.3; Scale/3.00)"
 
 // API is an HTTP client for the ChargePoint API.
 type API struct {
+	log         *util.Logger
 	identity    *Identity
 	wsURL       string
 	accountsURL string
@@ -27,6 +28,7 @@ type API struct {
 // NewAPI creates a ChargePoint API client.
 func NewAPI(log *util.Logger, identity *Identity) *API {
 	return &API{
+		log:         log,
 		identity:    identity,
 		wsURL:       identity.cfg.EndPoints.WebServices.Value,
 		accountsURL: identity.cfg.EndPoints.Accounts.Value,
@@ -69,20 +71,45 @@ func (a *API) cpInternalHeaders() map[string]string {
 	return h
 }
 
+// doJSON executes the request produced by makeReq. If the server returns 401,
+// it re-authenticates and retries once with a freshly-built request.
+func (a *API) doJSON(makeReq func() (*http.Request, error), res any) error {
+	req, err := makeReq()
+	if err != nil {
+		return err
+	}
+	err = a.identity.DoJSON(req, res)
+	if err == nil {
+		return nil
+	}
+	var se *request.StatusError
+	if !errors.As(err, &se) || !se.HasStatus(http.StatusUnauthorized) {
+		return err
+	}
+	// Session expired — re-authenticate and retry once.
+	a.log.DEBUG.Println("chargepoint session expired, re-authenticating")
+	if loginErr := a.identity.Login(); loginErr != nil {
+		return fmt.Errorf("re-authentication failed: %w (original: %v)", loginErr, err)
+	}
+	req, err = makeReq()
+	if err != nil {
+		return err
+	}
+	return a.identity.DoJSON(req, res)
+}
+
 // Account fetches the account and returns the user ID.
 func (a *API) Account() (int32, error) {
-	req, err := request.New(http.MethodGet, a.accountsURL+"v1/driver/profile/user", nil,
-		request.JSONEncoding, a.cpHeaders())
-	if err != nil {
-		return 0, err
-	}
-
 	var res struct {
 		User struct {
 			UserID int32 `json:"userId"`
 		} `json:"user"`
 	}
-	if err := a.identity.DoJSON(req, &res); err != nil {
+	err := a.doJSON(func() (*http.Request, error) {
+		return request.New(http.MethodGet, a.accountsURL+"v1/driver/profile/user", nil,
+			request.JSONEncoding, a.cpHeaders())
+	}, &res)
+	if err != nil {
 		return 0, err
 	}
 	return res.User.UserID, nil
@@ -97,18 +124,16 @@ func (a *API) HomeChargerIDs() ([]int, error) {
 		} `json:"get_pandas"`
 	}{UserID: a.identity.UserID}
 
-	req, err := request.New(http.MethodPost, a.wsURL+"mobileapi/v5",
-		request.MarshalJSON(data), request.JSONEncoding, a.cpWSHeaders())
-	if err != nil {
-		return nil, err
-	}
-
 	var res struct {
 		GetPandas struct {
 			DeviceIDs []int `json:"device_ids"`
 		} `json:"get_pandas"`
 	}
-	if err := a.identity.DoJSON(req, &res); err != nil {
+	err := a.doJSON(func() (*http.Request, error) {
+		return request.New(http.MethodPost, a.wsURL+"mobileapi/v5",
+			request.MarshalJSON(data), request.JSONEncoding, a.cpWSHeaders())
+	}, &res)
+	if err != nil {
 		return nil, err
 	}
 
@@ -120,14 +145,11 @@ func (a *API) HomeChargerIDs() ([]int, error) {
 func (a *API) HomeChargerStatus(deviceID int) (HomeChargerStatus, error) {
 	uri := fmt.Sprintf("%sapi/v1/configuration/users/%d/chargers/%d/status?", a.chargersURL, a.identity.UserID, deviceID)
 
-	req, err := request.New(http.MethodGet, uri, nil,
-		request.JSONEncoding, a.cpInternalHeaders())
-	if err != nil {
-		return HomeChargerStatus{}, err
-	}
-
 	var res HomeChargerStatus
-	err = a.identity.DoJSON(req, &res)
+	err := a.doJSON(func() (*http.Request, error) {
+		return request.New(http.MethodGet, uri, nil,
+			request.JSONEncoding, a.cpInternalHeaders())
+	}, &res)
 	return res, err
 }
 
@@ -141,16 +163,13 @@ func (a *API) StartSession(deviceID int) error {
 		DeviceID:   deviceID,
 	}
 
-	req, err := request.New(http.MethodPost, a.accountsURL+"v1/driver/station/startsession",
-		request.MarshalJSON(data), request.JSONEncoding, a.cpHeaders())
-	if err != nil {
-		return err
-	}
-
 	var res struct {
 		AckID int `json:"ackId"`
 	}
-	if err := a.identity.DoJSON(req, &res); err != nil {
+	if err := a.doJSON(func() (*http.Request, error) {
+		return request.New(http.MethodPost, a.accountsURL+"v1/driver/station/startsession",
+			request.MarshalJSON(data), request.JSONEncoding, a.cpHeaders())
+	}, &res); err != nil {
 		// 422 means the charger received the command but responds with an ack ID
 		// in the body — decodeJSON still populates res on error, so fall through
 		// to poll. Any other error is fatal.
@@ -173,16 +192,13 @@ func (a *API) StopSession(deviceID int) error {
 		DeviceID:   deviceID,
 	}
 
-	req, err := request.New(http.MethodPost, a.accountsURL+"v1/driver/station/stopsession",
-		request.MarshalJSON(data), request.JSONEncoding, a.cpHeaders())
-	if err != nil {
-		return err
-	}
-
 	var res struct {
 		AckID int `json:"ackId"`
 	}
-	if err := a.identity.DoJSON(req, &res); err != nil {
+	if err := a.doJSON(func() (*http.Request, error) {
+		return request.New(http.MethodPost, a.accountsURL+"v1/driver/station/stopsession",
+			request.MarshalJSON(data), request.JSONEncoding, a.cpHeaders())
+	}, &res); err != nil {
 		// 422 means the charger received the command but responds with an ack ID
 		// in the body — decodeJSON still populates res on error, so fall through
 		// to poll. Any other error is fatal.
@@ -217,9 +233,11 @@ func (a *API) pollAck(ackID int, action string) error {
 			return err
 		}
 
-		if err := a.identity.DoJSON(req, nil); err == nil {
+		err = a.identity.DoJSON(req, nil)
+		if err == nil {
 			return nil
 		}
+		a.log.DEBUG.Printf("pollAck %s attempt %d/5 (ackId=%d): %v", action, i+1, ackID, err)
 	}
 
 	return fmt.Errorf("charger did not acknowledge %s", action)
@@ -234,11 +252,8 @@ func (a *API) SetAmperageLimit(deviceID int, limit int64) error {
 		ChargeAmperageLimit int64 `json:"chargeAmperageLimit"`
 	}{limit}
 
-	req, err := request.New(http.MethodPut, uri,
-		request.MarshalJSON(data), request.JSONEncoding, a.cpInternalHeaders())
-	if err != nil {
-		return err
-	}
-
-	return a.identity.DoJSON(req, nil)
+	return a.doJSON(func() (*http.Request, error) {
+		return request.New(http.MethodPut, uri,
+			request.MarshalJSON(data), request.JSONEncoding, a.cpInternalHeaders())
+	}, nil)
 }
