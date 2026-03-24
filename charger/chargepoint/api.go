@@ -245,7 +245,9 @@ func (a *API) pollAck(ackID int, action string) error {
 		a.log.DEBUG.Printf("pollAck %s attempt %d/5 (ackId=%d): %v", action, i+1, ackID, err)
 	}
 
-	return fmt.Errorf("charger did not acknowledge %s", action)
+	a.log.WARN.Printf("charger did not acknowledge %s with 5s, assuming it succeeded", action)
+
+	return nil
 }
 
 // SetAmperageLimit sets the charge amperage limit on the given device via the
