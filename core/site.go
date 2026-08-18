@@ -117,6 +117,8 @@ type Site struct {
 	batteryModeExternal      api.BatteryMode             // Battery mode (external, runtime only, not persisted)
 	batteryModeExternalTimer time.Time                   // Battery mode timer for external control
 	suggestions              map[string]types.Suggestion // Optimizer suggestions by device key
+	batterySchedules         map[string][]batterySlot    // per-battery optimizer mode plan, for front-running export transitions
+	batterySpikeSlot         time.Time                   // 15-min slot the export spike was last (re)written for
 	suggestionActions        map[string]string           // last notified actionable optimizer action by device key
 
 	optimizerMu      sync.Mutex // guards optimizer runs
@@ -1110,7 +1112,18 @@ func (site *Site) updateLoadpoints(rates api.Rates) float64 {
 		sum float64
 	)
 
-	for _, lp := range site.activeLoadpoints() {
+	for id, lp := range site.loadpoints {
+		if lp == nil {
+			continue
+		}
+
+		// push the optimizer's current suggestion so lp.Update can act on it
+		// (always-on): synchronous here, read in lp.Update, same goroutine. Both
+		// actions are honored — "stop" pauses the car so surplus is exported (or the
+		// battery is reserved for a higher-value export slot); "charge" is surplus-only
+		// in PV mode but charges at the requested power outside pure PV (MinPV).
+		lp.optimizerAction, lp.optimizerChargePower = site.loadpointOptimizerAction(id)
+
 		wg.Go(func() {
 			power := lp.UpdateChargePowerAndCurrents()
 			site.prioritizer.UpdateChargePowerFlexibility(lp, rates)

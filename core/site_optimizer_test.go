@@ -444,6 +444,57 @@ func TestBlendScale(t *testing.T) {
 	assert.Equal(t, []float64{50, 62.5}, short)
 }
 
+// TestEvChargePriority verifies the EV gets max charge priority (soft early-solar
+// bias) under charge_before_export (the default) and none under other strategies.
+func TestEvChargePriority(t *testing.T) {
+	// default strategy is charge_before_export
+	assert.Equal(t, 2, (&Site{}).evChargePriority())
+
+	assert.Equal(t, 2, (&Site{optimizerChargingStrategy: string(optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport)}).evChargePriority())
+
+	assert.Equal(t, 0, (&Site{optimizerChargingStrategy: string(optimizer.OptimizerStrategyChargingStrategyNone)}).evChargePriority())
+	assert.Equal(t, 0, (&Site{optimizerChargingStrategy: string(optimizer.OptimizerStrategyChargingStrategyAttenuateGridPeaks)}).evChargePriority())
+}
+
+// TestOptimizerChargeFirst verifies the battery-first predicate that gates the EV's
+// early-solar charge-priority bias (evChargePriority).
+func TestOptimizerChargeFirst(t *testing.T) {
+	assert.True(t, (&Site{}).optimizerChargeFirst()) // default is charge_before_export
+	assert.True(t, (&Site{optimizerChargingStrategy: string(optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport)}).optimizerChargeFirst())
+	assert.False(t, (&Site{optimizerChargingStrategy: string(optimizer.OptimizerStrategyChargingStrategyNone)}).optimizerChargeFirst())
+}
+
+// TestLoadpointOptimizerAction verifies both optimizer loadpoint actions reach the
+// loadpoint under charge_before_export (the default) — "stop" is no longer suppressed.
+func TestLoadpointOptimizerAction(t *testing.T) {
+	site := &Site{loadpoints: []*Loadpoint{
+		NewLoadpoint(util.NewLogger("lp0"), nil),
+		NewLoadpoint(util.NewLogger("lp1"), nil),
+	}}
+	require.True(t, site.optimizerChargeFirst()) // default strategy
+
+	site.setSuggestions(map[string]types.Suggestion{
+		loadpointKey(0): {Action: actionStop},
+		loadpointKey(1): {Action: actionCharge, Charge: 7000},
+	})
+
+	// stop is honored (previously dropped under charge_before_export); charge too,
+	// carrying the optimizer's requested power
+	action, power := site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionStop, action)
+	assert.Zero(t, power)
+
+	action, power = site.loadpointOptimizerAction(1)
+	assert.Equal(t, actionCharge, action)
+	assert.Equal(t, 7000.0, power)
+
+	// no suggestion => no action
+	site.setSuggestions(nil)
+	action, power = site.loadpointOptimizerAction(0)
+	assert.Empty(t, action)
+	assert.Zero(t, power)
+}
+
 func TestCurrentSlotSuggestion(t *testing.T) {
 	// slotHours 1 makes the per-slot Wh values map 1:1 to W
 	for _, tc := range []struct {
@@ -451,25 +502,32 @@ func TestCurrentSlotSuggestion(t *testing.T) {
 		typ               batteryType
 		charge, disch     float32
 		importing, export bool
+		noImport          bool
 		want              string
 	}{
-		{"battery grid charge", batteryTypeBattery, 3000, 0, true, false, "charge"},
-		{"battery pv charge (no import)", batteryTypeBattery, 3000, 0, false, true, "normal"},
-		{"battery hold (idle while importing)", batteryTypeBattery, 0, 0, true, false, "hold"},
-		{"battery holdcharge (idle while exporting)", batteryTypeBattery, 0, 0, false, true, "holdcharge"},
-		{"battery discharge (self-consumption while importing)", batteryTypeBattery, 0, 2000, true, false, "normal"},
-		{"battery grid discharge (discharge while exporting)", batteryTypeBattery, 0, 2000, false, true, "discharge"},
-		{"battery idle balanced", batteryTypeBattery, 0, 0, false, false, "normal"},
-		{"loadpoint charge", batteryTypeLoadpoint, 11000, 0, false, false, "charge"},
-		{"loadpoint stop", batteryTypeLoadpoint, 0, 0, false, false, "stop"},
-		{"vehicle below threshold is stop", batteryTypeVehicle, 40, 0, false, false, "stop"},
+		{"battery grid charge", batteryTypeBattery, 3000, 0, true, false, false, "charge"},
+		{"battery pv charge (no import)", batteryTypeBattery, 3000, 0, false, true, false, "normal"},
+		{"battery hold (idle while importing)", batteryTypeBattery, 0, 0, true, false, false, "hold"},
+		{"battery holdcharge (idle while exporting)", batteryTypeBattery, 0, 0, false, true, false, "holdcharge"},
+		{"battery discharge (self-consumption while importing)", batteryTypeBattery, 0, 2000, true, false, false, "normal"},
+		{"battery grid discharge (discharge while exporting)", batteryTypeBattery, 0, 2000, false, true, false, "discharge"},
+		{"battery idle balanced", batteryTypeBattery, 0, 0, false, false, false, "normal"},
+		// self-consumption (no grid import): hold collapses to normal (backup blocks
+		// discharge → import); holdcharge reaches its controller (SoC-dependent
+		// spike-and-hold vs top-off); discharge unaffected
+		{"no-import hold => normal", batteryTypeBattery, 0, 0, true, false, true, "normal"},
+		{"no-import holdcharge stays holdcharge", batteryTypeBattery, 0, 0, false, true, true, "holdcharge"},
+		{"no-import discharge unaffected", batteryTypeBattery, 0, 2000, false, true, true, "discharge"},
+		{"loadpoint charge", batteryTypeLoadpoint, 11000, 0, false, false, false, "charge"},
+		{"loadpoint stop", batteryTypeLoadpoint, 0, 0, false, false, false, "stop"},
+		{"vehicle below threshold is stop", batteryTypeVehicle, 40, 0, false, false, false, "stop"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			res := optimizer.BatteryResult{
 				ChargingPower:    []float32{tc.charge},
 				DischargingPower: []float32{tc.disch},
 			}
-			s := currentSlotSuggestion(batteryDetail{Type: tc.typ}, res, tc.importing, tc.export, 1)
+			s := currentSlotSuggestion(batteryDetail{Type: tc.typ}, res, 0, tc.importing, tc.export, tc.noImport, 1)
 			assert.Equal(t, tc.want, s.Action)
 			assert.InDelta(t, tc.charge, s.Charge, 1e-3)
 			assert.InDelta(t, tc.disch, s.Discharge, 1e-3)
@@ -477,7 +535,66 @@ func TestCurrentSlotSuggestion(t *testing.T) {
 	}
 
 	// no result yields an empty suggestion
-	assert.Empty(t, currentSlotSuggestion(batteryDetail{Type: batteryTypeBattery}, optimizer.BatteryResult{}, true, false, 1))
+	assert.Empty(t, currentSlotSuggestion(batteryDetail{Type: batteryTypeBattery}, optimizer.BatteryResult{}, 0, true, false, false, 1))
+
+	// idx selects the slot: slot 1 discharging while exporting => discharge
+	res := optimizer.BatteryResult{ChargingPower: []float32{0, 0}, DischargingPower: []float32{0, 2000}}
+	assert.Equal(t, "normal", currentSlotSuggestion(batteryDetail{Type: batteryTypeBattery}, res, 0, false, false, false, 1).Action)
+	assert.Equal(t, actionDischarge, currentSlotSuggestion(batteryDetail{Type: batteryTypeBattery}, res, 1, false, true, false, 1).Action)
+	// out-of-range idx => empty
+	assert.Empty(t, currentSlotSuggestion(batteryDetail{Type: batteryTypeBattery}, res, 2, false, true, false, 1))
+}
+
+// TestIsSpikeAction covers the export-mode predicate used for front-running.
+func TestIsSpikeAction(t *testing.T) {
+	assert.True(t, isSpikeAction(api.BatteryHoldCharge.String()))
+	assert.True(t, isSpikeAction(actionDischarge))
+	assert.False(t, isSpikeAction(api.BatteryNormal.String()))
+	assert.False(t, isSpikeAction(api.BatteryCharge.String()))
+	assert.False(t, isSpikeAction(actionStop))
+}
+
+// TestCurrentBatteryAction resolves the current battery-mode action from the
+// plan and front-runs an export-mode transition near a slot boundary,
+// independent of when the optimizer last ran.
+func TestCurrentBatteryAction(t *testing.T) {
+	now := time.Now()
+	slot := tariff.SlotDuration
+
+	// far from the boundary: the current slot's action
+	far := []batterySlot{
+		{until: now.Add(10 * time.Minute), action: api.BatteryNormal.String()},
+		{until: now.Add(10*time.Minute + slot), action: actionDischarge},
+	}
+	assert.Equal(t, api.BatteryNormal.String(), currentBatteryAction(far, now))
+
+	// within the lead and the next slot flips into export: adopt it now
+	near := []batterySlot{
+		{until: now.Add(time.Minute), action: api.BatteryNormal.String()},
+		{until: now.Add(time.Minute + slot), action: actionDischarge},
+	}
+	assert.Equal(t, actionDischarge, currentBatteryAction(near, now))
+
+	// both sides already export (no operating-mode pickup): stay put
+	sameExport := []batterySlot{
+		{until: now.Add(time.Minute), action: api.BatteryHoldCharge.String()},
+		{until: now.Add(time.Minute + slot), action: actionDischarge},
+	}
+	assert.Equal(t, api.BatteryHoldCharge.String(), currentBatteryAction(sameExport, now))
+
+	// no next slot: nothing to front-run
+	single := []batterySlot{{until: now.Add(time.Minute), action: api.BatteryNormal.String()}}
+	assert.Equal(t, api.BatteryNormal.String(), currentBatteryAction(single, now))
+
+	// a boundary already passed: the next slot is now the current one
+	stale := []batterySlot{
+		{until: now.Add(-time.Minute), action: api.BatteryNormal.String()},
+		{until: now.Add(10 * time.Minute), action: actionDischarge},
+	}
+	assert.Equal(t, actionDischarge, currentBatteryAction(stale, now))
+
+	// empty plan: no action
+	assert.Empty(t, currentBatteryAction(nil, now))
 }
 
 // TestSuggestionActionable ensures the actionable flag follows the current state

@@ -126,17 +126,19 @@ type Loadpoint struct {
 	batteryBoost             int      // battery boost state
 	batteryBoostLimit        int      // battery boost soc limit (0-100, 100=disabled)
 
-	mode                api.ChargeMode
-	enabled             bool      // Charger enabled state
-	phases              int       // Charger enabled phases, guarded by mutex
-	measuredPhases      int       // Charger physically measured phases
-	offeredCurrent      float64   // Charger current limit
-	socUpdated          time.Time // Soc updated timestamp (poll: connected)
-	vehicleDetect       time.Time // Vehicle connected timestamp
-	chargerSwitched     time.Time // Charger enabled/disabled timestamp
-	phasesSwitched      time.Time // Phase switch timestamp
-	vehicleDetectTicker *clock.Ticker
-	vehicleIdentifier   string
+	mode                 api.ChargeMode
+	enabled              bool      // Charger enabled state
+	phases               int       // Charger enabled phases, guarded by mutex
+	measuredPhases       int       // Charger physically measured phases
+	offeredCurrent       float64   // Charger current limit
+	socUpdated           time.Time // Soc updated timestamp (poll: connected)
+	vehicleDetect        time.Time // Vehicle connected timestamp
+	chargerSwitched      time.Time // Charger enabled/disabled timestamp
+	optimizerAction      string    // current optimizer suggestion (charge|stop|""), set by the site each cycle
+	optimizerChargePower float64   // optimizer's requested charge power (W) for a "charge" suggestion, set by the site each cycle
+	phasesSwitched       time.Time // Phase switch timestamp
+	vehicleDetectTicker  *clock.Ticker
+	vehicleIdentifier    string
 
 	charger          api.Charger
 	chargeTimer      api.ChargeTimer
@@ -1443,6 +1445,18 @@ func (lp *Loadpoint) minCharging() error {
 	return lp.setLimit(lp.effectiveMinCurrent())
 }
 
+// optimizerChargeCurrent converts the optimizer's requested charge power (W) to a
+// charge current for the active phase count, clamped to the loadpoint's current range.
+// With no requested power it falls back to the maximum (fast charging).
+func (lp *Loadpoint) optimizerChargeCurrent() float64 {
+	maxCurrent := lp.effectiveMaxCurrent()
+	if lp.optimizerChargePower <= 0 {
+		return maxCurrent
+	}
+	current := powerToCurrent(lp.optimizerChargePower, lp.ActivePhases())
+	return min(max(current, lp.effectiveMinCurrent()), maxCurrent)
+}
+
 // pvScalePhases switches phases if necessary and returns number of phases switched to
 func (lp *Loadpoint) pvScalePhases(sitePower, minCurrent, maxCurrent float64) int {
 	phases := lp.GetPhases()
@@ -2278,6 +2292,33 @@ func (lp *Loadpoint) Update(sitePower, batteryPower float64, consumption, feedin
 		err = lp.fastCharging()
 
 	case mode == api.ModeMinPV || mode == api.ModePV:
+		// optimizer suggestions (always-on). "stop" pauses the car so surplus is
+		// exported (or the battery is reserved) instead of self-consumed: PV → off,
+		// MinPV → min (the floor the mode allows). "charge" is mode-dependent — pure
+		// PV only ever charges from surplus, so it falls through to the surplus logic
+		// below (never grid); outside pure PV (MinPV) it charges at the optimizer's
+		// requested power, pulling from the grid as needed.
+		if lp.optimizerAction == actionStop {
+			lp.log.DEBUG.Println("optimizer: stop charging")
+			if mode == api.ModeMinPV {
+				err = lp.minCharging()
+			} else {
+				err = lp.setLimit(0)
+			}
+			lp.resetPhaseTimer()
+			lp.elapsePVTimer() // let PV mode resume immediately when the suggestion clears
+			break
+		}
+
+		if lp.optimizerAction == actionCharge && mode == api.ModeMinPV {
+			current := lp.optimizerChargeCurrent()
+			lp.log.DEBUG.Printf("optimizer: charge %.0fW → %.3gA", lp.optimizerChargePower, current)
+			err = lp.setLimit(current)
+			lp.resetPhaseTimer()
+			lp.elapsePVTimer()
+			break
+		}
+
 		// cheap tariff
 		if smartCostActive {
 			rate, _ := consumption.At(time.Now())

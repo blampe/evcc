@@ -191,6 +191,72 @@ func TestUpdatePowerZero(t *testing.T) {
 	}
 }
 
+func TestOptimizerLoadpointAction(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		mode        api.ChargeMode
+		action      string
+		chargePower float64 // optimizer's requested charge power (W)
+		sitePower   float64 // surplus (<0) or deficit (>0)
+		expect      func(*api.MockCharger)
+	}{
+		// PV + stop: pause the car despite PV surplus (so it exports)
+		{"pv stop pauses despite surplus", api.ModePV, actionStop, 0, -2000, func(c *api.MockCharger) {
+			c.EXPECT().Enable(false).Return(nil)
+		}},
+		// PV + charge: never grid-charges. With surplus the car tracks it (6A offered
+		// + 4A of surplus = 10A), not a fast-charge to max; the requested kW is ignored.
+		{"pv charge tracks surplus", api.ModePV, actionCharge, 9600, -920, func(c *api.MockCharger) {
+			c.EXPECT().MaxCurrent(int64(10)).Return(nil)
+		}},
+		// PV + charge with a grid deficit: no surplus => disable like normal PV
+		// instead of importing from the grid.
+		{"pv charge does not import from grid", api.ModePV, actionCharge, 9600, 2000, func(c *api.MockCharger) {
+			c.EXPECT().Enable(false).Return(nil)
+		}},
+		// MinPV + charge: outside pure PV, honor the optimizer's requested power
+		// (2760W @ 1p = 12A), grid-charging past the deficit — not a blind max.
+		{"minpv charge honors optimizer kW", api.ModeMinPV, actionCharge, 2760, 2000, func(c *api.MockCharger) {
+			c.EXPECT().MaxCurrent(int64(12)).Return(nil)
+		}},
+	} {
+		t.Log(tc.name)
+
+		ctrl := gomock.NewController(t)
+		charger := api.NewMockCharger(ctrl)
+
+		lp := &Loadpoint{
+			log:         util.NewLogger("foo"),
+			bus:         evbus.New(),
+			clock:       clock.NewMock(),
+			charger:     charger,
+			chargeMeter: &Null{},
+			chargeRater: &Null{},
+			chargeTimer: &Null{},
+			wakeUpTimer: NewTimer(),
+			minCurrent:  minA,
+			maxCurrent:  maxA,
+			phases:      1,
+			status:      api.StatusC,
+			mode:        tc.mode,
+		}
+		attachListeners(t, lp)
+
+		lp.enabled = true
+		lp.offeredCurrent = minA
+		lp.optimizerAction = tc.action
+		lp.optimizerChargePower = tc.chargePower
+
+		charger.EXPECT().Status().Return(api.StatusC, nil)
+		charger.EXPECT().Enabled().Return(true, nil)
+		tc.expect(charger)
+
+		lp.Update(tc.sitePower, 0, nil, nil, false, false, 0, nil, nil, nil)
+
+		ctrl.Finish()
+	}
+}
+
 func TestPVHysteresis(t *testing.T) {
 	const dt = time.Minute
 	const phases = 3

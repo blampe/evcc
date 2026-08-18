@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -131,8 +132,8 @@ const (
 	actionCharge = "charge"
 )
 
-// actionDischarge is the battery-to-grid discharge advisory. It has no matching
-// api.BatteryMode, so it always reads as actionable.
+// actionDischarge is the battery-to-grid discharge advisory. It maps to
+// api.BatteryDischarge, which control applies to actively export the battery.
 const actionDischarge = "discharge"
 
 // evSuggestion notifies when the optimizer's advisory action for a device changes
@@ -163,18 +164,30 @@ func suggestionEvent(detail batteryDetail, s types.Suggestion) messenger.Event {
 	return ev
 }
 
-// currentSlotSuggestion maps the optimizer's first-slot corner result onto an advisory action.
-// Because the optimization is linear, the first slot is at an operating-range extreme, so it
-// maps cleanly onto the discrete battery mode / loadpoint intent that control would later apply.
+// optimizerFrontRunLead is how early we may switch the home battery into an export
+// mode before the next slot boundary, to cover the Powerwall's ~2min autonomous-mode
+// TOU pickup — otherwise the pickup eats the start of the export slot.
+const optimizerFrontRunLead = 2 * time.Minute
+
+// isSpikeAction reports whether a battery action switches the Powerwall to
+// autonomous mode + the export spike (the transition with the ~2min pickup lag).
+func isSpikeAction(action string) bool {
+	return action == api.BatteryHoldCharge.String() || action == actionDischarge
+}
+
+// currentSlotSuggestion maps the optimizer's slot-idx corner result onto an advisory action.
+// Because the optimization is linear, the slot is at an operating-range extreme, so it maps
+// cleanly onto the discrete battery mode / loadpoint intent that control would later apply.
 // An idle battery is interpreted from the grid flow: importing means discharge is withheld
-// (hold), exporting means charging is withheld (holdcharge).
-func currentSlotSuggestion(detail batteryDetail, res optimizer.BatteryResult, gridImporting, gridExporting bool, slotHours float64) types.Suggestion {
-	if slotHours <= 0 || len(res.ChargingPower) == 0 || len(res.DischargingPower) == 0 {
+// (hold), exporting means charging is withheld (holdcharge). idx selects the slot (0 = current,
+// 1 = next, for front-running the export-mode transition).
+func currentSlotSuggestion(detail batteryDetail, res optimizer.BatteryResult, idx int, gridImporting, gridExporting, noGridImport bool, slotHours float64) types.Suggestion {
+	if slotHours <= 0 || idx < 0 || idx >= len(res.ChargingPower) || idx >= len(res.DischargingPower) {
 		return types.Suggestion{}
 	}
 
-	charge := float64(res.ChargingPower[0]) / slotHours
-	discharge := float64(res.DischargingPower[0]) / slotHours
+	charge := float64(res.ChargingPower[idx]) / slotHours
+	discharge := float64(res.DischargingPower[idx]) / slotHours
 
 	s := types.Suggestion{Charge: charge, Discharge: discharge}
 
@@ -194,6 +207,14 @@ func currentSlotSuggestion(detail batteryDetail, res optimizer.BatteryResult, gr
 			// discharging while exporting means battery-to-grid discharge
 			s.Action = actionDischarge
 		default:
+			s.Action = api.BatteryNormal.String()
+		}
+
+		// self-consumption (no grid import allowed): don't HOLD — backup mode blocks
+		// discharge and forces grid import when solar dips. holdcharge is NOT
+		// remapped; its controller decides by SoC whether to spike-and-hold (prevent
+		// charging below 100%) or fall through to normal (top off at high SoC).
+		if noGridImport && s.Action == api.BatteryHold.String() {
 			s.Action = api.BatteryNormal.String()
 		}
 	} else if charge > suggestionThreshold {
@@ -245,6 +266,58 @@ func (site *Site) suggestion(key, currentAction string) *types.Suggestion {
 	return &s
 }
 
+// optimizerBatteryMode returns the battery mode the optimizer suggests for the
+// site's controllable batteries, or api.BatteryUnknown when there is no
+// suggestion. The optimizer is always-on: whenever it produces a suggestion,
+// that suggestion drives battery control (taking precedence over the static
+// grid-charge / discharge-control heuristics, but not over an external/manual
+// mode). If controllable batteries disagree it returns Unknown, since the site
+// applies a single mode.
+func (site *Site) optimizerBatteryMode() api.BatteryMode {
+	now := time.Now()
+
+	site.RLock()
+	schedules := site.batterySchedules
+	site.RUnlock()
+
+	res := api.BatteryUnknown
+	for _, dev := range site.batteryMeters {
+		if dev == nil {
+			continue
+		}
+		action := currentBatteryAction(schedules[batteryKey(dev.Config().Name)], now)
+		if action == "" {
+			continue
+		}
+		m, err := api.BatteryModeString(action)
+		if err != nil {
+			continue
+		}
+		if res != api.BatteryUnknown && res != m {
+			return api.BatteryUnknown
+		}
+		res = m
+	}
+	return res
+}
+
+// loadpointOptimizerAction returns the optimizer's advisory action for the loadpoint
+// ("charge"/"stop"/"") and its requested charge power (W, for a "charge" action). Both
+// actions are honored (always-on): "stop" pauses the car so surplus is exported / the
+// battery is reserved for a higher-value export slot. "charge" is surplus-only in PV
+// mode (lp.Update never grid-charges), but outside pure PV (MinPV) it charges at the
+// requested power.
+func (site *Site) loadpointOptimizerAction(id int) (string, float64) {
+	lp := site.loadpoints[id]
+	if lp == nil {
+		return "", 0
+	}
+	if s := site.suggestion(loadpointKey(id), loadpointCurrentAction(lp)); s != nil {
+		return s.Action, s.Charge
+	}
+	return "", 0
+}
+
 // publishSuggestions publishes the loadpoints' suggestions
 func (site *Site) publishSuggestions() {
 	for id, lp := range site.loadpoints {
@@ -271,6 +344,7 @@ func (site *Site) clearSuggestions() {
 
 	site.Lock()
 	site.suggestionActions = nil
+	site.batterySchedules = nil
 	site.Unlock()
 }
 
@@ -346,6 +420,47 @@ const slotsPerHour = float64(time.Hour / tariff.SlotDuration)
 // errOptimizerNotReady means battery measurements aren't available yet (e.g. at
 // startup); the slot gate is left open so the next cycle retries.
 var errOptimizerNotReady = errors.New("battery measurements not ready")
+
+// frontRunScheduleSlots caps how many upcoming plan slots are retained per
+// battery for front-running. The optimizer re-runs at least every tariff slot
+// (plus on vehicle/setting changes), so a handful covers the current slot plus
+// lookahead across a boundary.
+const frontRunScheduleSlots = 4
+
+// batterySlot is one slot of the optimizer's battery-mode plan: the action to
+// apply until `until`, the slot's end boundary.
+type batterySlot struct {
+	until  time.Time
+	action string
+}
+
+// currentBatteryAction resolves the battery-mode action for `now` from the plan.
+// Resolving by slot end time keeps the current slot correct even when a boundary
+// passes between optimizer runs. It front-runs an export-mode transition: within
+// optimizerFrontRunLead of the upcoming boundary, if the next slot flips
+// export-ness, adopt it now to cover the Powerwall's ~2min autonomous pickup.
+func currentBatteryAction(plan []batterySlot, now time.Time) string {
+	i := slices.IndexFunc(plan, func(s batterySlot) bool { return s.until.After(now) })
+	if i < 0 {
+		return ""
+	}
+
+	cur := plan[i]
+	if i+1 < len(plan) {
+		next := plan[i+1]
+		if cur.until.Sub(now) <= optimizerFrontRunLead && isSpikeAction(cur.action) != isSpikeAction(next.action) {
+			return next.action
+		}
+	}
+	return cur.action
+}
+
+// setBatterySchedules replaces the per-battery mode plans used for front-running
+func (site *Site) setBatterySchedules(schedules map[string][]batterySlot) {
+	site.Lock()
+	defer site.Unlock()
+	site.batterySchedules = schedules
+}
 
 // optimizerUpdateAsync runs the optimizer unless the last run is younger than
 // minAge. Pass 0 to force a run, e.g. when a changed setting should take effect
@@ -496,6 +611,21 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 		}
 	}
 
+	// no-grid-import cap (self-consumption): cap import at ~0 W and DON'T set
+	// PrcPExcImp. The service then applies its built-in per-Wh import-exceedance
+	// penalty (prc_e_grid_imp_pen ≈ 0.01 scaled ≈ 10/kWh, optimizer.py:89,273),
+	// far above any price — so on TRUE prices the optimizer covers the home from
+	// solar+battery (keeping the overnight reserve) and dumps only the surplus,
+	// instead of dumping the battery and reimporting. It's SOFT: if import is
+	// genuinely unavoidable it still imports (paying the penalty) and reports
+	// grid_import_limit_exceeded rather than going infeasible. Setting PrcPExcImp
+	// here would instead select the weak peak-power "demand rate" mode, so don't.
+	// Lift via OPTIMIZER_ALLOW_GRID_IMPORT=true (winter EV, or full export
+	// arbitrage during a price spike).
+	if allowGridImport, _ := strconv.ParseBool(os.Getenv("OPTIMIZER_ALLOW_GRID_IMPORT")); !allowGridImport {
+		req.Grid.PMaxImp = 1 // W (~0); omitempty needs non-zero, no PrcPExcImp = built-in per-Wh penalty
+	}
+
 	// static grid export limit configured in the UI: export is capped at this
 	// power, excess PV is curtailed instead of exported
 	if limit := site.GetGridExportLimit(); limit > 0 {
@@ -633,12 +763,48 @@ func (site *Site) optimizerUpdate(battery []types.Measurement) error {
 // applyOptimizerResult maps the optimizer response onto suggestions, battery
 // forecast and notifications
 func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details []batteryDetail, res optimizer.OptimizationResult) {
-	slotHours := (time.Duration(req.TimeSeries.Dt[0]) * time.Second).Hours()
+	dt := req.TimeSeries.Dt
+	slotHours := (time.Duration(dt[0]) * time.Second).Hours()
 	gridImporting := len(res.GridImport) > 0 && res.GridImport[0] > 0
 	gridExporting := len(res.GridExport) > 0 && res.GridExport[0] > 0
 
+	// self-consumption (no grid import) mirrors the request-side cap; it remaps a
+	// HOLD suggestion to normal (see currentSlotSuggestion)
+	allowGridImport, _ := strconv.ParseBool(os.Getenv("OPTIMIZER_ALLOW_GRID_IMPORT"))
+	noGridImport := !allowGridImport
+
+	// export that exceeds solar in a slot must come from the battery (barely any
+	// from pass-through import): the direct "battery dumped to grid" signal. If
+	// this is ~0, the battery is only serving the home and all export is solar.
+	var battToGrid float32
+	for i, e := range res.GridExport {
+		if i < len(req.TimeSeries.Ft) && e > req.TimeSeries.Ft[i] {
+			battToGrid += e - req.TimeSeries.Ft[i]
+		}
+	}
+
+	// visibility into the planned grid flows. Ft = solar forecast, Gt = home load.
+	// battToGrid = export exceeding solar = battery discharged to grid.
+	site.log.DEBUG.Printf("optimizer grid: slot=%d solar=%.0fWh load=%.0fWh import=%.0fWh export=%.0fWh battToGrid=%.0fWh",
+		len(req.TimeSeries.Gt),
+		lo.Sum(req.TimeSeries.Ft), lo.Sum(req.TimeSeries.Gt),
+		lo.Sum(res.GridImport), lo.Sum(res.GridExport), battToGrid)
+
+	// raw prices the optimizer sees (undo the internal ×0.001 scaling). If export
+	// (PE) shows near the import (PN) range, the feed-in tariff is misconfigured —
+	// which would (wrongly) make dumping the battery look profitable.
+	site.log.DEBUG.Printf("optimizer prices: import=%.3g..%.3g export=%.3g..%.3g",
+		lo.Min(req.TimeSeries.PN)*1000, lo.Max(req.TimeSeries.PN)*1000,
+		lo.Min(req.TimeSeries.PE)*1000, lo.Max(req.TimeSeries.PE)*1000)
+
+	// first slot boundary; battery-mode plan slots are keyed by their end time so
+	// the control loop can front-run an export-mode transition near the boundary
+	// regardless of when the optimizer last ran.
+	firstBoundary := time.Now().Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+
 	var batteries []batteryResult
 	suggestions := make(map[string]types.Suggestion, len(req.Batteries))
+	schedules := make(map[string][]batterySlot)
 
 	for i, batReq := range req.Batteries {
 		batRes := res.Batteries[i]
@@ -654,20 +820,35 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 			}),
 		})
 
-		suggestion := currentSlotSuggestion(detail, batRes, gridImporting, gridExporting, slotHours)
-		if suggestion.Action == "" {
+		key := detail.key()
+		if key == "" || !detail.controllable {
+			// uncontrollable devices can't act on a suggestion
 			continue
 		}
 
-		// uncontrollable devices can't act on a suggestion
-		if key := detail.key(); key != "" && detail.controllable {
-			suggestions[key] = suggestion
+		// current-slot advisory, for the UI and notifications
+		if s := currentSlotSuggestion(detail, batRes, 0, gridImporting, gridExporting, noGridImport, slotHours); s.Action != "" {
+			suggestions[key] = s
+		}
+
+		// battery-mode plan (slot end + action) so the control loop front-runs
+		// export-mode transitions independent of the optimizer cadence. Home
+		// battery only (the ~2min autonomous pickup is PW3-specific).
+		if detail.Type == batteryTypeBattery {
+			schedules[key] = batteryModePlan(detail, batRes, res, dt, firstBoundary, noGridImport)
 		}
 	}
 
 	site.publish("evopt-batteries", batteries)
 
+	// log the current-slot suggestions so it's visible what the optimizer wants
+	site.log.DEBUG.Printf("optimizer suggestions: gridImport=%t gridExport=%t", gridImporting, gridExporting)
+	for key, s := range suggestions {
+		site.log.DEBUG.Printf("optimizer %q: %s (charge %.0fW discharge %.0fW)", key, s.Action, s.Charge, s.Discharge)
+	}
+
 	site.setSuggestions(suggestions)
+	site.setBatterySchedules(schedules)
 	site.battery.Forecast = site.addBatteryForecastTotals(req.Batteries, res.Batteries)
 
 	site.publishBattery()
@@ -679,6 +860,24 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 	for _, ev := range site.diffSuggestions(site.pendingSuggestions(details)) {
 		site.pushEvent(ev)
 	}
+}
+
+// batteryModePlan builds the per-slot battery-mode plan (slot end time + mode
+// action) that the control loop resolves each cycle to front-run export-mode
+// transitions. Slot j spans [firstBoundary+(j-1)·slot, firstBoundary+j·slot];
+// slot 0 is the current partial slot ending at firstBoundary.
+func batteryModePlan(detail batteryDetail, batRes optimizer.BatteryResult, res optimizer.OptimizationResult, dt []int, firstBoundary time.Time, noGridImport bool) []batterySlot {
+	n := min(len(batRes.ChargingPower), len(dt), frontRunScheduleSlots)
+	plan := make([]batterySlot, 0, n)
+	for j := 0; j < n; j++ {
+		importing := len(res.GridImport) > j && res.GridImport[j] > 0
+		exporting := len(res.GridExport) > j && res.GridExport[j] > 0
+		slotHours := (time.Duration(dt[j]) * time.Second).Hours()
+		action := currentSlotSuggestion(detail, batRes, j, importing, exporting, noGridImport, slotHours).Action
+		until := firstBoundary.Add(time.Duration(j) * tariff.SlotDuration)
+		plan = append(plan, batterySlot{until: until, action: action})
+	}
+	return plan
 }
 
 func (site *Site) addBatteryForecastTotals(req []optimizer.BatteryConfig, resp []optimizer.BatteryResult) *types.BatteryForecast {
@@ -853,6 +1052,8 @@ func (site *Site) loadpointRequest(lp loadpoint.API, minLen int, firstSlotDurati
 		bat.PDemand = clearDemandWhenFull(prorate(demand, firstSlotDuration), bat.SMax-bat.SInitial)
 	}
 
+	bat.CPriority = site.evChargePriority()
+
 	return bat, detail
 }
 
@@ -878,6 +1079,27 @@ func clearDemandWhenFull(demand []float32, headroom float32) []float32 {
 	return res
 }
 
+// evChargePriority returns the optimizer charge priority for the EV. Under
+// charge_before_export it is the maximum (2) so the optimizer's (T-t)-weighted
+// early-charge reward (optimizer.py:304) biases the EV to charge from solar
+// sooner rather than deferring across the multi-day horizon — PA (stored-energy
+// value) is realized only at horizon end, so charging is otherwise
+// timing-neutral. It is a soft nudge: the reward is far below the grid price, so
+// it never forces grid charging, only tips otherwise-cost-neutral surplus
+// charging earlier.
+func (site *Site) evChargePriority() int {
+	if site.optimizerChargeFirst() {
+		return 2
+	}
+	return 0
+}
+
+// optimizerChargeFirst reports whether the charge-before-export ("battery first")
+// strategy is active.
+func (site *Site) optimizerChargeFirst() bool {
+	return site.GetOptimizerChargingStrategy() == string(optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport)
+}
+
 func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measurement, grid api.Rates, minLen int, firstSlotDuration time.Duration) (optimizer.BatteryConfig, batteryDetail) {
 	bat := optimizer.BatteryConfig{
 		CMax:      batteryPower,
@@ -891,8 +1113,14 @@ func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measureme
 
 	controllable := api.HasCap[api.BatteryController](instance)
 	if controllable {
+		// Full grid flexibility: the PW3 may charge from and discharge to grid.
+		// The no-grid-import cap (see optimizerRequest) is what keeps enough battery
+		// for the home, so with DischargeToGrid on the optimizer dumps only the
+		// SURPLUS at the export peak — dumping the reserve would force a penalized
+		// reimport, so it won't. Lift the cap (OPTIMIZER_ALLOW_GRID_IMPORT) for
+		// full dump-and-reimport arbitrage during an export-price spike.
 		bat.ChargeFromGrid = true
-		bat.DischargeToGrid = site.GetBatteryGridDischarge()
+		bat.DischargeToGrid = true
 	}
 
 	if m, ok := api.Cap[api.BatteryPowerLimiter](instance); ok {

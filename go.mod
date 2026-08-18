@@ -266,6 +266,8 @@ replace github.com/grid-x/modbus => github.com/evcc-io/modbus v0.0.0-20250501165
 
 replace github.com/lorenzodonini/ocpp-go => github.com/evcc-io/ocpp-go v0.0.0-20260812074841-a8aa5fef8a9e
 
+replace github.com/evcc-io/tesla-proxy-client => ../tesla-proxy-client
+
 replace github.com/enbility/spine-go => github.com/andig/spine-go v0.7.1-0.20260804073026-f9a8d8e8fd18
 
 replace github.com/enbility/eebus-go => github.com/andig/eebus-go v0.0.0-20260725155950-e735091ff165

@@ -1,0 +1,52 @@
+template: tesla-powerwall3
+products:
+  - brand: Tesla
+    description:
+      generic: Powerwall 3
+group: price
+requirements:
+  evcc: ["skiptest"]
+params:
+  - name: clientId
+    description:
+      generic: Client ID
+    help:
+      en: from [Tesla Developer Dashboard](https://developer.tesla.com/dashboard).
+      de: von [Tesla Developer Dashboard](https://developer.tesla.com/dashboard).
+    required: true
+  - name: accessToken
+    help:
+      en: from [myteslamate.com](https://app.myteslamate.com/).
+      de: von [myteslamate.com](https://app.myteslamate.com/).
+    required: true
+    mask: true
+  - name: refreshToken
+    help:
+      en: from [myteslamate.com](https://app.myteslamate.com/).
+      de: von [myteslamate.com](https://app.myteslamate.com/).
+    required: true
+    mask: true
+  - name: tariffDirection
+    type: choice
+    choice: ["import", "export"]
+    required: true
+    description:
+      generic: Tariff Direction
+    help:
+      en: Whether this tariff is for import (grid buy) or export (feed-in sell).
+      de: Ob dieser Tarif für Import (Netzbezug) oder Export (Einspeisung) ist.
+  - name: siteid
+    description:
+      generic: Site ID
+    help:
+      en: optional energy site identifier, leave empty for auto-detection
+      de: optionale Energy Site ID, leer lassen für automatische Erkennung
+render: |
+  type: teslafleetapi
+  tariffDirection: {{ .tariffDirection }}
+  credentials:
+    id: {{ .clientId }}
+  tokens:
+    access: {{ .accessToken }}
+    refresh: {{ .refreshToken }}
+  {{ if .siteid }}siteid: {{ .siteid }}{{ end }}

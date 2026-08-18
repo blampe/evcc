@@ -8,6 +8,7 @@ import (
 	"github.com/evcc-io/evcc/core/keys"
 	"github.com/evcc-io/evcc/core/loadpoint"
 	"github.com/evcc-io/evcc/hems/hems"
+	"github.com/evcc-io/evcc/tariff"
 	"github.com/evcc-io/evcc/util/config"
 )
 
@@ -63,9 +64,22 @@ func (site *Site) updateBatteryMode(batteryGridChargeActive bool, rate api.Rate)
 		batteryMode = api.BatteryHold
 	}
 
+	// refresh the export spike as the 15-min slot advances: it targets only the
+	// current slot, so re-apply the (unchanged) spike mode when we cross into a new
+	// slot, otherwise the spike written on mode-entry goes stale and the pack
+	// resumes charging while the old synthetic tariff still lingers on the pack.
+	slot := time.Now().Truncate(tariff.SlotDuration)
+	if batteryMode == api.BatteryUnknown && !slot.Equal(site.batterySpikeSlot) &&
+		(site.batteryMode == api.BatteryDischarge || site.batteryMode == api.BatteryHoldCharge) {
+		batteryMode = site.batteryMode
+	}
+
 	// NOTE: applyBatteryMode is always called when charge mode is active to validate max soc
 	if modeChanged := batteryMode != api.BatteryUnknown; modeChanged || site.batteryMode == api.BatteryCharge {
 		if err := site.applyBatteryMode(batteryMode); err == nil {
+			if batteryMode == api.BatteryDischarge || batteryMode == api.BatteryHoldCharge {
+				site.batterySpikeSlot = slot
+			}
 			if modeChanged {
 				site.SetBatteryMode(batteryMode)
 			}
@@ -73,6 +87,17 @@ func (site *Site) updateBatteryMode(batteryGridChargeActive bool, rate api.Rate)
 			site.log.ERROR.Println("battery mode:", err)
 		}
 	}
+}
+
+// batteryBoostActive reports whether any loadpoint is boosting, i.e. draining
+// the home battery into the vehicle
+func (site *Site) batteryBoostActive() bool {
+	for _, lp := range site.loadpoints {
+		if lp.GetBatteryBoost() != boostDisabled {
+			return true
+		}
+	}
+	return false
 }
 
 // requiredBatteryMode determines required battery mode based on grid charge and rate
@@ -92,6 +117,10 @@ func (site *Site) requiredBatteryMode(batteryGridChargeActive bool, rate api.Rat
 		return map[bool]api.BatteryMode{false: s, true: api.BatteryUnknown}[batMode == s]
 	}
 
+	// optimizer suggestion (always-on): drives battery control whenever present,
+	// e.g. discharge-to-grid during export-price peaks
+	optMode := site.optimizerBatteryMode()
+
 	switch {
 	case !site.batteryConfigured():
 		res = api.BatteryUnknown
@@ -103,6 +132,16 @@ func (site *Site) requiredBatteryMode(batteryGridChargeActive bool, rate api.Rat
 		if extMode != batMode {
 			res = extMode
 		}
+	case site.batteryBoostActive():
+		// battery boost drains the home battery into the vehicle, so the battery
+		// must be allowed to discharge — override the optimizer's hold/holdcharge
+		// (otherwise the boost pulls from the grid instead)
+		res = keepUnlessModified(api.BatteryNormal)
+	case optMode != api.BatteryUnknown:
+		// optimizer takes precedence over the static grid-charge / discharge
+		// heuristics; it reverts to normal (via batteryModeModified below) once
+		// it stops suggesting an action
+		res = keepUnlessModified(optMode)
 	case batteryGridChargeActive:
 		res = keepUnlessModified(api.BatteryCharge)
 	case site.dischargeControlActive(rate):

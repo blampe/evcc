@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/core/types"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/config"
 	"github.com/stretchr/testify/assert"
@@ -252,4 +253,91 @@ func TestForcedBatteryChargeLimits(t *testing.T) {
 
 		ctrl.Finish()
 	}
+}
+
+func optimizerSite(internal api.BatteryMode, suggestions map[string]types.Suggestion, names ...string) *Site {
+	var meters []config.Device[api.Meter]
+	for _, n := range names {
+		meters = append(meters, config.NewStaticDevice(config.Named{Name: n}, api.Meter(nil)))
+	}
+	// one far-future plan slot per battery: currentBatteryAction resolves it as the
+	// current slot with no next slot, so no front-run — just the mapped action
+	until := time.Now().Add(time.Hour)
+	schedules := make(map[string][]batterySlot, len(suggestions))
+	for name, s := range suggestions {
+		schedules[batteryKey(name)] = []batterySlot{{until: until, action: s.Action}}
+	}
+	return &Site{
+		log:              util.NewLogger("foo"),
+		batteryMeters:    meters,
+		batteryMode:      internal,
+		batterySchedules: schedules,
+	}
+}
+
+// TestOptimizerBatteryMode verifies the optimizer's per-battery suggestion is
+// mapped to a battery mode, including the new discharge action.
+func TestOptimizerBatteryMode(t *testing.T) {
+	// each suggestion action maps to its battery mode
+	for action, want := range map[string]api.BatteryMode{
+		"normal":     api.BatteryNormal,
+		"hold":       api.BatteryHold,
+		"charge":     api.BatteryCharge,
+		"holdcharge": api.BatteryHoldCharge,
+		"discharge":  api.BatteryDischarge,
+	} {
+		s := optimizerSite(api.BatteryUnknown, map[string]types.Suggestion{"bat1": {Action: action}}, "bat1")
+		assert.Equal(t, want, s.optimizerBatteryMode(), action)
+	}
+
+	// no suggestion => Unknown (existing behaviour preserved)
+	assert.Equal(t, api.BatteryUnknown, optimizerSite(api.BatteryUnknown, nil, "bat1").optimizerBatteryMode())
+
+	// agreeing batteries => that mode
+	agree := map[string]types.Suggestion{"bat1": {Action: "discharge"}, "bat2": {Action: "discharge"}}
+	assert.Equal(t, api.BatteryDischarge, optimizerSite(api.BatteryUnknown, agree, "bat1", "bat2").optimizerBatteryMode())
+
+	// disagreeing batteries => Unknown (a single site-wide mode can't represent both)
+	disagree := map[string]types.Suggestion{"bat1": {Action: "discharge"}, "bat2": {Action: "charge"}}
+	assert.Equal(t, api.BatteryUnknown, optimizerSite(api.BatteryUnknown, disagree, "bat1", "bat2").optimizerBatteryMode())
+}
+
+// TestRequiredBatteryModeOptimizer verifies the always-on optimizer suggestion
+// drives requiredBatteryMode: it applies the suggested mode, doesn't re-apply
+// once reached, reverts to normal when the suggestion stops, takes precedence
+// over the static grid-charge heuristic, but yields to an external/manual mode.
+func TestRequiredBatteryModeOptimizer(t *testing.T) {
+	discharge := map[string]types.Suggestion{"bat1": {Action: "discharge"}}
+
+	// suggests discharge from normal => discharge
+	s := optimizerSite(api.BatteryNormal, discharge, "bat1")
+	assert.Equal(t, api.BatteryDischarge, s.requiredBatteryMode(false, api.Rate{}))
+
+	// already discharging => Unknown (no re-apply, mode persists)
+	s = optimizerSite(api.BatteryDischarge, discharge, "bat1")
+	assert.Equal(t, api.BatteryUnknown, s.requiredBatteryMode(false, api.Rate{}))
+
+	// suggestion gone while in a modified mode => revert to normal
+	s = optimizerSite(api.BatteryDischarge, nil, "bat1")
+	assert.Equal(t, api.BatteryNormal, s.requiredBatteryMode(false, api.Rate{}))
+
+	// optimizer wins over the static grid-charge heuristic
+	s = optimizerSite(api.BatteryNormal, discharge, "bat1")
+	assert.Equal(t, api.BatteryDischarge, s.requiredBatteryMode(true, api.Rate{}))
+
+	// an external/manual mode still wins over the optimizer
+	s = optimizerSite(api.BatteryNormal, discharge, "bat1")
+	s.batteryModeExternal = api.BatteryHold
+	assert.Equal(t, api.BatteryHold, s.requiredBatteryMode(false, api.Rate{}))
+
+	// battery boost overrides the optimizer: force normal so the home battery
+	// discharges into the vehicle instead of the boost pulling from the grid
+	s = optimizerSite(api.BatteryHoldCharge, discharge, "bat1")
+	s.loadpoints = []*Loadpoint{{batteryBoost: boostStart}}
+	assert.Equal(t, api.BatteryNormal, s.requiredBatteryMode(false, api.Rate{}))
+
+	// boost with the battery already normal => no change needed
+	s = optimizerSite(api.BatteryNormal, discharge, "bat1")
+	s.loadpoints = []*Loadpoint{{batteryBoost: boostStart}}
+	assert.Equal(t, api.BatteryUnknown, s.requiredBatteryMode(false, api.Rate{}))
 }
