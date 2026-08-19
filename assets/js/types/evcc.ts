@@ -1152,6 +1152,8 @@ export interface LoadpointSuggestion {
   charge?: number;
   /** Recommended discharge power in W. */
   discharge?: number;
+  /** Where a charge is sourced from in the plan: PV surplus or grid-sourced fast charge. */
+  source?: "surplus" | "grid";
   /** Suggestion differs from the current operating mode. */
   actionable?: boolean;
 }

@@ -1121,8 +1121,9 @@ func (site *Site) updateLoadpoints(rates api.Rates) float64 {
 		// (always-on): synchronous here, read in lp.Update, same goroutine. Both
 		// actions are honored — "stop" pauses the car so surplus is exported (or the
 		// battery is reserved for a higher-value export slot); "charge" is surplus-only
-		// in PV mode but charges at the requested power outside pure PV (MinPV).
-		lp.optimizerAction, lp.optimizerChargePower = site.loadpointOptimizerAction(id)
+		// in PV mode unless the source is "grid" (fast charge), and always charges at
+		// the requested power outside pure PV (MinPV).
+		lp.optimizerAction, lp.optimizerChargePower, lp.optimizerChargeSource = site.loadpointOptimizerAction(id)
 
 		wg.Go(func() {
 			power := lp.UpdateChargePowerAndCurrents()

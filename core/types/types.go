@@ -30,6 +30,11 @@ type Suggestion struct {
 	Action    string  `json:"action"`
 	Charge    float64 `json:"charge"`    // recommended charge power, W
 	Discharge float64 `json:"discharge"` // recommended discharge power, W
+	// Source classifies where a loadpoint's charge is sourced from in the plan:
+	// "surplus" (PV only) or "grid" (grid-sourced fast charge). Empty for
+	// non-charge actions and batteries. In PV mode a "grid" source charges at the
+	// requested power instead of deferring to real-time surplus.
+	Source string `json:"source,omitempty"`
 	// Actionable indicates the suggestion differs from the current operating mode.
 	Actionable bool `json:"actionable"`
 }

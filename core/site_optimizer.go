@@ -136,6 +136,15 @@ const (
 // api.BatteryDischarge, which control applies to actively export the battery.
 const actionDischarge = "discharge"
 
+// charge sources classify where a loadpoint's charge comes from in the
+// optimizer's plan (see types.Suggestion.Source). A non-surplus source charges
+// the car at the requested power in PV mode instead of deferring to real-time
+// surplus.
+const (
+	sourceSurplus = "surplus"
+	sourceGrid    = "grid"
+)
+
 // evSuggestion notifies when the optimizer's advisory action for a device changes
 const evSuggestion = "suggestion"
 
@@ -219,6 +228,15 @@ func currentSlotSuggestion(detail batteryDetail, res optimizer.BatteryResult, id
 		}
 	} else if charge > suggestionThreshold {
 		s.Action = actionCharge
+		// classify the charge source so PV mode can honor a grid-sourced fast
+		// charge instead of only ever charging from surplus. In the default
+		// no-import config gridImporting is ~always false, so this stays "surplus"
+		// unless the user allows import and the optimizer chose to import.
+		if gridImporting {
+			s.Source = sourceGrid
+		} else {
+			s.Source = sourceSurplus
+		}
 	} else {
 		s.Action = actionStop
 	}
@@ -302,20 +320,21 @@ func (site *Site) optimizerBatteryMode() api.BatteryMode {
 }
 
 // loadpointOptimizerAction returns the optimizer's advisory action for the loadpoint
-// ("charge"/"stop"/"") and its requested charge power (W, for a "charge" action). Both
-// actions are honored (always-on): "stop" pauses the car so surplus is exported / the
-// battery is reserved for a higher-value export slot. "charge" is surplus-only in PV
-// mode (lp.Update never grid-charges), but outside pure PV (MinPV) it charges at the
-// requested power.
-func (site *Site) loadpointOptimizerAction(id int) (string, float64) {
+// ("charge"/"stop"/""), its requested charge power (W, for a "charge" action), and the
+// charge source ("surplus"/"grid"). Both actions are honored (always-on): "stop" pauses
+// the car so surplus is exported / the battery is reserved for a higher-value export
+// slot. A "charge" is surplus-only in PV mode unless the source is "grid" (a grid-sourced
+// fast charge), in which case PV mode charges at the requested power; MinPV always
+// charges at the requested power.
+func (site *Site) loadpointOptimizerAction(id int) (string, float64, string) {
 	lp := site.loadpoints[id]
 	if lp == nil {
-		return "", 0
+		return "", 0, ""
 	}
 	if s := site.suggestion(loadpointKey(id), loadpointCurrentAction(lp)); s != nil {
-		return s.Action, s.Charge
+		return s.Action, s.Charge, s.Source
 	}
-	return "", 0
+	return "", 0, ""
 }
 
 // publishSuggestions publishes the loadpoints' suggestions

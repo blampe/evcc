@@ -475,24 +475,49 @@ func TestLoadpointOptimizerAction(t *testing.T) {
 
 	site.setSuggestions(map[string]types.Suggestion{
 		loadpointKey(0): {Action: actionStop},
-		loadpointKey(1): {Action: actionCharge, Charge: 7000},
+		loadpointKey(1): {Action: actionCharge, Charge: 7000, Source: sourceGrid},
 	})
 
 	// stop is honored (previously dropped under charge_before_export); charge too,
-	// carrying the optimizer's requested power
-	action, power := site.loadpointOptimizerAction(0)
+	// carrying the optimizer's requested power and source
+	action, power, source := site.loadpointOptimizerAction(0)
 	assert.Equal(t, actionStop, action)
 	assert.Zero(t, power)
+	assert.Empty(t, source)
 
-	action, power = site.loadpointOptimizerAction(1)
+	action, power, source = site.loadpointOptimizerAction(1)
 	assert.Equal(t, actionCharge, action)
 	assert.Equal(t, 7000.0, power)
+	assert.Equal(t, sourceGrid, source)
 
 	// no suggestion => no action
 	site.setSuggestions(nil)
-	action, power = site.loadpointOptimizerAction(0)
+	action, power, source = site.loadpointOptimizerAction(0)
 	assert.Empty(t, action)
 	assert.Zero(t, power)
+	assert.Empty(t, source)
+}
+
+// TestLoadpointChargeSource classifies a loadpoint charge as grid-sourced when
+// the plan imports, else surplus; a non-charge action carries no source.
+func TestLoadpointChargeSource(t *testing.T) {
+	charging := optimizer.BatteryResult{ChargingPower: []float32{11000}, DischargingPower: []float32{0}}
+
+	// charging while the plan imports => grid-sourced fast charge
+	grid := currentSlotSuggestion(batteryDetail{Type: batteryTypeVehicle}, charging, 0, true, false, false, 1)
+	assert.Equal(t, actionCharge, grid.Action)
+	assert.Equal(t, sourceGrid, grid.Source)
+
+	// charging without import => surplus
+	surplus := currentSlotSuggestion(batteryDetail{Type: batteryTypeVehicle}, charging, 0, false, true, false, 1)
+	assert.Equal(t, actionCharge, surplus.Action)
+	assert.Equal(t, sourceSurplus, surplus.Source)
+
+	// stop carries no source
+	idle := optimizer.BatteryResult{ChargingPower: []float32{0}, DischargingPower: []float32{0}}
+	stop := currentSlotSuggestion(batteryDetail{Type: batteryTypeVehicle}, idle, 0, true, false, false, 1)
+	assert.Equal(t, actionStop, stop.Action)
+	assert.Empty(t, stop.Source)
 }
 
 func TestCurrentSlotSuggestion(t *testing.T) {
