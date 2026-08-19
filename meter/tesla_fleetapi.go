@@ -522,6 +522,19 @@ func dischargeReserve(targetSoc, minSoc float64) float64 {
 	return max(targetSoc, minSoc)
 }
 
+// holdChargeReserveMargin is how far (percent) below the current SoC the
+// hold-charge reserve sits, so the pack can still cover the home through a brief
+// PV dip (self-consumption) instead of forcing a grid import, while staying high
+// enough that it neither grid-charges nor dumps to grid.
+const holdChargeReserveMargin = 5
+
+// holdChargeReserve is the backup reserve for hold-charge below 100%: a small
+// margin under the current SoC so a PV dip is covered from the battery rather
+// than the grid, never below min soc.
+func holdChargeReserve(soc, minSoc float64) float64 {
+	return max(soc-holdChargeReserveMargin, minSoc)
+}
+
 // SetBatteryModeSoc maps an evcc battery mode to Tesla Fleet API commands,
 // pinning the reserve to the optimizer's target SoC where it matters (see
 // dischargeReserve). It implements api.BatteryModeController; SetBatteryMode
@@ -537,8 +550,9 @@ func dischargeReserve(targetSoc, minSoc float64) float64 {
 //   - BatteryHold:     backup mode, reserve at current SOC (prevents discharge)
 //   - BatteryHoldCharge: prevent charging. SoC 100: nothing to prevent → plain
 //     self_consumption + 80% backup (no spike/TOU). SoC < 100: autonomous + export
-//     spike + pv_only, reserve pinned at the current SoC — held in place at/below
-//     80, drained to 80% in the PW3-rejected (80,100) band.
+//     spike + pv_only, reserve a small margin below the current SoC so a PV dip is
+//     still covered from the battery (never below MinSoc; the 80 floor applies in
+//     the PW3-rejected (80,100) band).
 //   - BatteryCharge:   self_consumption mode, reserve at MaxSoc, grid charging enabled
 //   - BatteryDischarge: autonomous (TOU) mode + battery_ok export + a synthetic
 //     tariff that spikes the real buy/sell price for the current window, driving
@@ -609,17 +623,18 @@ func (m *FleetAPI) SetBatteryModeSoc(mode api.BatteryMode, targetSoc float64) er
 			return m.apiWrite("battery reserve → 80%", func() error { return site.SetBatteryReserve(clampReserve(80)) })
 		}
 
-		// Below 100%: pin the reserve at the current SoC (autonomous + the
-		// sell-only spike so the Powerwall exports surplus instead of storing it;
-		// pv_only so the battery itself isn't dumped to grid; buy stays real so it
-		// still covers the home). The PW3 rejects a reserve in (80,100): at SoC <=
-		// 80 the pack is held exactly in place; above 80 the reserve clamps to 80,
-		// so the spike DRAINS it to 80% (into the home to free solar for export)
-		// rather than topping off. Flip to top-off (previous commit) if unwanted.
-		reserve := clampReserve(max(soc, limits.MinSoc))
+		// Below 100%: hold the pack roughly in place (autonomous + the sell-only
+		// spike so the Powerwall exports surplus instead of storing it; pv_only so
+		// the battery itself isn't dumped to grid; buy stays real so it still covers
+		// the home). Sit the reserve a small margin BELOW the current SoC so a brief
+		// PV dip is covered from the battery instead of forcing a grid import — the
+		// pack refusing to discharge below a reserve pinned at the SoC was the cause
+		// of morning grid pulls. Never below MinSoc; the PW3 rejects a reserve in
+		// (80,100), so above ~80 the margin widens to the 80 floor.
+		reserve := clampReserve(holdChargeReserve(soc, limits.MinSoc))
 		held := "holding in place"
 		if float64(reserve) < soc {
-			held = fmt.Sprintf("draining to %d%%", reserve)
+			held = fmt.Sprintf("covering dips down to %d%%", reserve)
 		}
 		m.provider.log.DEBUG.Printf("holdcharge: soc %.0f%% → autonomous + sell spike + pv_only, reserve %d%% (%s)", soc, reserve, held)
 		m.snapshotTariff()

@@ -499,6 +499,20 @@ func TestDischargeReserve(t *testing.T) {
 	assert.Equal(t, 20.0, dischargeReserve(-5, 20), "negative target falls back to min soc")
 }
 
+// TestHoldChargeReserve verifies hold-charge sits the reserve a small margin
+// below the current SoC (so a PV dip is covered from the battery, not the grid),
+// never below min soc. With clampReserve, an SoC in the PW3-rejected (80,100)
+// band widens the margin to the 80 floor.
+func TestHoldChargeReserve(t *testing.T) {
+	assert.Equal(t, 55.0, holdChargeReserve(60, 20), "a margin below the current soc")
+	assert.Equal(t, 20.0, holdChargeReserve(22, 20), "clamped to min soc when within the margin")
+	assert.Equal(t, 20.0, holdChargeReserve(20, 20), "never below min soc")
+
+	// combined with clampReserve: an soc in (80,100) snaps the reserve to 80
+	assert.Equal(t, uint64(80), clampReserve(holdChargeReserve(90, 20)))
+	assert.Equal(t, uint64(55), clampReserve(holdChargeReserve(60, 20)))
+}
+
 func TestFleetAPITariffType(t *testing.T) {
 	tests := []struct {
 		name     string
