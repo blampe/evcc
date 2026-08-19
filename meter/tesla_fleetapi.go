@@ -46,9 +46,12 @@ type fleetAPIProvider struct {
 // Multiple FleetAPI instances for the same site share a single provider.
 type FleetAPI struct {
 	implement.Caps
-	usage    string
-	provider *fleetAPIProvider
+	usage     string
+	provider  *fleetAPIProvider
+	socLimits batterySocLimits
 }
+
+var _ api.BatteryModeController = (*FleetAPI)(nil)
 
 func init() {
 	registry.Add("teslafleetapi", NewFleetAPIFromConfig)
@@ -195,16 +198,17 @@ func NewFleetAPI(usage, clientID, clientSecret string, token *oauth2.Token, ener
 	}
 
 	m := &FleetAPI{
-		Caps:     implement.New(),
-		usage:    strings.ToLower(usage),
-		provider: provider,
+		Caps:      implement.New(),
+		usage:     strings.ToLower(usage),
+		provider:  provider,
+		socLimits: socLimits,
 	}
 
 	if usage == "battery" {
 		implement.Has(m, implement.Battery(m.batterySoc))
 		implement.May(m, implement.BatterySocLimiter(socLimits.Decorator()))
 		implement.May(m, implement.BatteryPowerLimiter(powerLimits.Decorator()))
-		implement.Has(m, implement.BatteryController(m.newBatteryController(socLimits)))
+		implement.Has(m, implement.BatteryController(m.newBatteryController()))
 
 		// total_pack_energy is no longer returned by the API so use nominal value.
 		// https://github.com/teslamotors/vehicle-command/issues/215
@@ -499,8 +503,29 @@ func clampReserve(pct float64) uint64 {
 	return uint64(pct)
 }
 
-// newBatteryController returns a BatteryController func that maps evcc battery
-// modes to Tesla Fleet API commands.
+// newBatteryController returns a BatteryController func that applies the mode
+// with no optimizer SoC target (the static min/current-soc reserve defaults).
+func (m *FleetAPI) newBatteryController() func(api.BatteryMode) error {
+	return func(mode api.BatteryMode) error {
+		return m.SetBatteryModeSoc(mode, 0)
+	}
+}
+
+// dischargeReserve is the backup reserve (percent) for a grid discharge: the
+// optimizer's target SoC, so the pack stops there instead of draining to min
+// soc during the ~2min pickup lag, but never below min soc. A target <= 0 falls
+// back to min soc (the previous, target-unaware behavior).
+func dischargeReserve(targetSoc, minSoc float64) float64 {
+	if targetSoc <= 0 {
+		return minSoc
+	}
+	return max(targetSoc, minSoc)
+}
+
+// SetBatteryModeSoc maps an evcc battery mode to Tesla Fleet API commands,
+// pinning the reserve to the optimizer's target SoC where it matters (see
+// dischargeReserve). It implements api.BatteryModeController; SetBatteryMode
+// (via newBatteryController) calls it with targetSoc 0.
 //
 // Tesla Powerwall modes:
 //   - self_consumption: battery charges from solar, discharges to home (default)
@@ -517,130 +542,132 @@ func clampReserve(pct float64) uint64 {
 //   - BatteryCharge:   self_consumption mode, reserve at MaxSoc, grid charging enabled
 //   - BatteryDischarge: autonomous (TOU) mode + battery_ok export + a synthetic
 //     tariff that spikes the real buy/sell price for the current window, driving
-//     the Powerwall to export stored energy to grid. The user's real tariff is
+//     the Powerwall to export stored energy to grid. The reserve is pinned at the
+//     optimizer's target SoC so it stops there. The user's real tariff is
 //     snapshotted first and restored when leaving.
-func (m *FleetAPI) newBatteryController(limits batterySocLimits) func(api.BatteryMode) error {
-	return func(mode api.BatteryMode) error {
-		site := m.provider.site
+func (m *FleetAPI) SetBatteryModeSoc(mode api.BatteryMode, targetSoc float64) error {
+	limits := m.socLimits
+	site := m.provider.site
 
-		switch mode {
-		case api.BatteryNormal:
-			if err := m.restoreTariff(); err != nil {
-				return err
-			}
-			reserve := clampReserve(limits.MinSoc)
-			m.provider.log.DEBUG.Printf("normal: → self_consumption, reserve %d%%", reserve)
-			if err := m.apiWrite("operating mode → self_consumption", func() error { return site.SetOperatingMode("self_consumption") }); err != nil {
-				return err
-			}
-			if err := m.apiWrite("grid charging → off", func() error { return site.SetGridCharging(false) }); err != nil {
-				return err
-			}
-			return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
-
-		case api.BatteryHold:
-			// idle while importing: withhold discharge. Backup mode + reserve at
-			// the current SoC keeps the pack from discharging below where it is.
-			if err := m.restoreTariff(); err != nil {
-				return err
-			}
-			soc, err := m.batterySoc()
-			if err != nil {
-				return err
-			}
-			reserve := clampReserve(max(soc, limits.MinSoc))
-			m.provider.log.DEBUG.Printf("hold: soc %.0f%% → backup, holding reserve at %d%%", soc, reserve)
-			if err := m.apiWrite("operating mode → backup", func() error { return site.SetOperatingMode("backup") }); err != nil {
-				return err
-			}
-			if err := m.apiWrite("grid charging → off", func() error { return site.SetGridCharging(false) }); err != nil {
-				return err
-			}
-			return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
-
-		case api.BatteryHoldCharge:
-			// idle while exporting: prevent the pack from charging further.
-			soc, err := m.batterySoc()
-			if err != nil {
-				return err
-			}
-
-			// At 100% there's nothing to prevent — the pack can't charge, so surplus
-			// exports naturally. Use plain self_consumption (self-powered, no spike or
-			// TOU) with an 80% backup so it stays high and covers the home from the
-			// battery if solar dips.
-			if soc >= 100 {
-				m.provider.log.DEBUG.Printf("holdcharge: soc %.0f%% (full) → self_consumption, reserve 80%% (nothing to prevent, surplus exports)", soc)
-				if err := m.restoreTariff(); err != nil {
-					return err
-				}
-				if err := m.apiWrite("operating mode → self_consumption", func() error { return site.SetOperatingMode("self_consumption") }); err != nil {
-					return err
-				}
-				if err := m.apiWrite("grid charging → off", func() error { return site.SetGridCharging(false) }); err != nil {
-					return err
-				}
-				return m.apiWrite("battery reserve → 80%", func() error { return site.SetBatteryReserve(clampReserve(80)) })
-			}
-
-			// Below 100%: pin the reserve at the current SoC (autonomous + the
-			// sell-only spike so the Powerwall exports surplus instead of storing it;
-			// pv_only so the battery itself isn't dumped to grid; buy stays real so it
-			// still covers the home). The PW3 rejects a reserve in (80,100): at SoC <=
-			// 80 the pack is held exactly in place; above 80 the reserve clamps to 80,
-			// so the spike DRAINS it to 80% (into the home to free solar for export)
-			// rather than topping off. Flip to top-off (previous commit) if unwanted.
-			reserve := clampReserve(max(soc, limits.MinSoc))
-			held := "holding in place"
-			if float64(reserve) < soc {
-				held = fmt.Sprintf("draining to %d%%", reserve)
-			}
-			m.provider.log.DEBUG.Printf("holdcharge: soc %.0f%% → autonomous + sell spike + pv_only, reserve %d%% (%s)", soc, reserve, held)
-			m.snapshotTariff()
-			if err := m.apiWrite("operating mode → autonomous", func() error { return site.SetOperatingMode("autonomous") }); err != nil {
-				return err
-			}
-			if err := m.apiWrite("grid export → pv_only", func() error { return site.SetGridExport("pv_only") }); err != nil {
-				return err
-			}
-			if err := m.setDischargeTariff(); err != nil {
-				return err
-			}
-			return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
-
-		case api.BatteryCharge:
-			if err := m.restoreTariff(); err != nil {
-				return err
-			}
-			reserve := clampReserve(limits.MaxSoc)
-			m.provider.log.DEBUG.Printf("charge: → self_consumption + grid charging, reserve %d%%", reserve)
-			if err := m.apiWrite("operating mode → self_consumption", func() error { return site.SetOperatingMode("self_consumption") }); err != nil {
-				return err
-			}
-			if err := m.apiWrite("grid charging → on", func() error { return site.SetGridCharging(true) }); err != nil {
-				return err
-			}
-			return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
-
-		case api.BatteryDischarge:
-			reserve := clampReserve(limits.MinSoc)
-			m.provider.log.DEBUG.Printf("discharge: → autonomous + sell spike + battery_ok, reserve %d%% (dump to grid)", reserve)
-			// snapshot the user's real tariff before we overwrite it
-			m.snapshotTariff()
-			if err := m.apiWrite("operating mode → autonomous", func() error { return site.SetOperatingMode("autonomous") }); err != nil {
-				return err
-			}
-			if err := m.apiWrite("grid export → battery_ok", func() error { return site.SetGridExport("battery_ok") }); err != nil {
-				return err
-			}
-			if err := m.setDischargeTariff(); err != nil {
-				return err
-			}
-			return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
-
-		default:
-			return api.ErrNotAvailable
+	switch mode {
+	case api.BatteryNormal:
+		if err := m.restoreTariff(); err != nil {
+			return err
 		}
+		reserve := clampReserve(limits.MinSoc)
+		m.provider.log.DEBUG.Printf("normal: → self_consumption, reserve %d%%", reserve)
+		if err := m.apiWrite("operating mode → self_consumption", func() error { return site.SetOperatingMode("self_consumption") }); err != nil {
+			return err
+		}
+		if err := m.apiWrite("grid charging → off", func() error { return site.SetGridCharging(false) }); err != nil {
+			return err
+		}
+		return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
+
+	case api.BatteryHold:
+		// idle while importing: withhold discharge. Backup mode + reserve at
+		// the current SoC keeps the pack from discharging below where it is.
+		if err := m.restoreTariff(); err != nil {
+			return err
+		}
+		soc, err := m.batterySoc()
+		if err != nil {
+			return err
+		}
+		reserve := clampReserve(max(soc, limits.MinSoc))
+		m.provider.log.DEBUG.Printf("hold: soc %.0f%% → backup, holding reserve at %d%%", soc, reserve)
+		if err := m.apiWrite("operating mode → backup", func() error { return site.SetOperatingMode("backup") }); err != nil {
+			return err
+		}
+		if err := m.apiWrite("grid charging → off", func() error { return site.SetGridCharging(false) }); err != nil {
+			return err
+		}
+		return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
+
+	case api.BatteryHoldCharge:
+		// idle while exporting: prevent the pack from charging further.
+		soc, err := m.batterySoc()
+		if err != nil {
+			return err
+		}
+
+		// At 100% there's nothing to prevent — the pack can't charge, so surplus
+		// exports naturally. Use plain self_consumption (self-powered, no spike or
+		// TOU) with an 80% backup so it stays high and covers the home from the
+		// battery if solar dips.
+		if soc >= 100 {
+			m.provider.log.DEBUG.Printf("holdcharge: soc %.0f%% (full) → self_consumption, reserve 80%% (nothing to prevent, surplus exports)", soc)
+			if err := m.restoreTariff(); err != nil {
+				return err
+			}
+			if err := m.apiWrite("operating mode → self_consumption", func() error { return site.SetOperatingMode("self_consumption") }); err != nil {
+				return err
+			}
+			if err := m.apiWrite("grid charging → off", func() error { return site.SetGridCharging(false) }); err != nil {
+				return err
+			}
+			return m.apiWrite("battery reserve → 80%", func() error { return site.SetBatteryReserve(clampReserve(80)) })
+		}
+
+		// Below 100%: pin the reserve at the current SoC (autonomous + the
+		// sell-only spike so the Powerwall exports surplus instead of storing it;
+		// pv_only so the battery itself isn't dumped to grid; buy stays real so it
+		// still covers the home). The PW3 rejects a reserve in (80,100): at SoC <=
+		// 80 the pack is held exactly in place; above 80 the reserve clamps to 80,
+		// so the spike DRAINS it to 80% (into the home to free solar for export)
+		// rather than topping off. Flip to top-off (previous commit) if unwanted.
+		reserve := clampReserve(max(soc, limits.MinSoc))
+		held := "holding in place"
+		if float64(reserve) < soc {
+			held = fmt.Sprintf("draining to %d%%", reserve)
+		}
+		m.provider.log.DEBUG.Printf("holdcharge: soc %.0f%% → autonomous + sell spike + pv_only, reserve %d%% (%s)", soc, reserve, held)
+		m.snapshotTariff()
+		if err := m.apiWrite("operating mode → autonomous", func() error { return site.SetOperatingMode("autonomous") }); err != nil {
+			return err
+		}
+		if err := m.apiWrite("grid export → pv_only", func() error { return site.SetGridExport("pv_only") }); err != nil {
+			return err
+		}
+		if err := m.setDischargeTariff(); err != nil {
+			return err
+		}
+		return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
+
+	case api.BatteryCharge:
+		if err := m.restoreTariff(); err != nil {
+			return err
+		}
+		reserve := clampReserve(limits.MaxSoc)
+		m.provider.log.DEBUG.Printf("charge: → self_consumption + grid charging, reserve %d%%", reserve)
+		if err := m.apiWrite("operating mode → self_consumption", func() error { return site.SetOperatingMode("self_consumption") }); err != nil {
+			return err
+		}
+		if err := m.apiWrite("grid charging → on", func() error { return site.SetGridCharging(true) }); err != nil {
+			return err
+		}
+		return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
+
+	case api.BatteryDischarge:
+		// pin the reserve at the optimizer's target SoC so the pack stops there
+		// instead of draining to min soc through the ~2min pickup lag + slot.
+		reserve := clampReserve(dischargeReserve(targetSoc, limits.MinSoc))
+		m.provider.log.DEBUG.Printf("discharge: → autonomous + sell spike + battery_ok, reserve %d%% (target %.0f%%, dump to grid)", reserve, targetSoc)
+		// snapshot the user's real tariff before we overwrite it
+		m.snapshotTariff()
+		if err := m.apiWrite("operating mode → autonomous", func() error { return site.SetOperatingMode("autonomous") }); err != nil {
+			return err
+		}
+		if err := m.apiWrite("grid export → battery_ok", func() error { return site.SetGridExport("battery_ok") }); err != nil {
+			return err
+		}
+		if err := m.setDischargeTariff(); err != nil {
+			return err
+		}
+		return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
+
+	default:
+		return api.ErrNotAvailable
 	}
 }
 

@@ -478,15 +478,25 @@ func TestFleetAPIBatteryController(t *testing.T) {
 
 func TestFleetAPIBatteryControllerUnsupported(t *testing.T) {
 	m := &FleetAPI{
-		usage: "battery",
+		usage:     "battery",
+		socLimits: batterySocLimits{MinSoc: 20, MaxSoc: 100},
 		provider: &fleetAPIProvider{
 			site: &teslaclient.EnergySite{},
 		},
 	}
 
-	controller := m.newBatteryController(batterySocLimits{MinSoc: 20, MaxSoc: 100})
+	controller := m.newBatteryController()
 	err := controller(api.BatteryMode(99))
 	assert.ErrorIs(t, err, api.ErrNotAvailable)
+}
+
+// TestDischargeReserve verifies the grid-discharge reserve tracks the optimizer's
+// target SoC (never below min soc), falling back to min soc without a target.
+func TestDischargeReserve(t *testing.T) {
+	assert.Equal(t, 55.0, dischargeReserve(55, 20), "target above min soc is honored")
+	assert.Equal(t, 20.0, dischargeReserve(10, 20), "target below min soc clamps to min soc")
+	assert.Equal(t, 20.0, dischargeReserve(0, 20), "no target falls back to min soc")
+	assert.Equal(t, 20.0, dischargeReserve(-5, 20), "negative target falls back to min soc")
 }
 
 func TestFleetAPITariffType(t *testing.T) {

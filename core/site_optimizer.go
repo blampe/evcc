@@ -428,31 +428,58 @@ var errOptimizerNotReady = errors.New("battery measurements not ready")
 const frontRunScheduleSlots = 4
 
 // batterySlot is one slot of the optimizer's battery-mode plan: the action to
-// apply until `until`, the slot's end boundary.
+// apply until `until` (the slot's end boundary) and the planned end-of-slot SoC
+// (percent), which the controller uses e.g. as the grid-discharge reserve floor.
 type batterySlot struct {
 	until  time.Time
 	action string
+	soc    float64 // optimizer's planned end-of-slot SoC (percent), 0 if unknown
 }
 
-// currentBatteryAction resolves the battery-mode action for `now` from the plan.
-// Resolving by slot end time keeps the current slot correct even when a boundary
-// passes between optimizer runs. It front-runs an export-mode transition: within
+// currentBatterySlot resolves the plan slot in effect at `now`. Resolving by slot
+// end time keeps the current slot correct even when a boundary passes between
+// optimizer runs. It front-runs an export-mode transition: within
 // optimizerFrontRunLead of the upcoming boundary, if the next slot flips
-// export-ness, adopt it now to cover the Powerwall's ~2min autonomous pickup.
-func currentBatteryAction(plan []batterySlot, now time.Time) string {
+// export-ness, it returns the next slot to cover the Powerwall's ~2min
+// autonomous pickup.
+func currentBatterySlot(plan []batterySlot, now time.Time) (batterySlot, bool) {
 	i := slices.IndexFunc(plan, func(s batterySlot) bool { return s.until.After(now) })
 	if i < 0 {
-		return ""
+		return batterySlot{}, false
 	}
 
 	cur := plan[i]
 	if i+1 < len(plan) {
 		next := plan[i+1]
 		if cur.until.Sub(now) <= optimizerFrontRunLead && isSpikeAction(cur.action) != isSpikeAction(next.action) {
-			return next.action
+			return next, true
 		}
 	}
-	return cur.action
+	return cur, true
+}
+
+// currentBatteryAction resolves the battery-mode action for `now` from the plan.
+func currentBatteryAction(plan []batterySlot, now time.Time) string {
+	if s, ok := currentBatterySlot(plan, now); ok {
+		return s.action
+	}
+	return ""
+}
+
+// optimizerBatteryTargetSoc returns the optimizer's planned SoC (percent) for the
+// battery's current plan slot, or 0 when there is no plan. Control passes it to a
+// BatteryModeController so e.g. a grid discharge stops at the target.
+func (site *Site) optimizerBatteryTargetSoc(name string) float64 {
+	now := time.Now()
+
+	site.RLock()
+	plan := site.batterySchedules[batteryKey(name)]
+	site.RUnlock()
+
+	if s, ok := currentBatterySlot(plan, now); ok {
+		return s.soc
+	}
+	return 0
 }
 
 // setBatterySchedules replaces the per-battery mode plans used for front-running
@@ -835,7 +862,7 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 		// export-mode transitions independent of the optimizer cadence. Home
 		// battery only (the ~2min autonomous pickup is PW3-specific).
 		if detail.Type == batteryTypeBattery {
-			schedules[key] = batteryModePlan(detail, batRes, res, dt, firstBoundary, noGridImport)
+			schedules[key] = batteryModePlan(detail, batReq, batRes, res, dt, firstBoundary, noGridImport)
 		}
 	}
 
@@ -866,7 +893,7 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 // action) that the control loop resolves each cycle to front-run export-mode
 // transitions. Slot j spans [firstBoundary+(j-1)·slot, firstBoundary+j·slot];
 // slot 0 is the current partial slot ending at firstBoundary.
-func batteryModePlan(detail batteryDetail, batRes optimizer.BatteryResult, res optimizer.OptimizationResult, dt []int, firstBoundary time.Time, noGridImport bool) []batterySlot {
+func batteryModePlan(detail batteryDetail, batReq optimizer.BatteryConfig, batRes optimizer.BatteryResult, res optimizer.OptimizationResult, dt []int, firstBoundary time.Time, noGridImport bool) []batterySlot {
 	n := min(len(batRes.ChargingPower), len(dt), frontRunScheduleSlots)
 	plan := make([]batterySlot, 0, n)
 	for j := 0; j < n; j++ {
@@ -875,9 +902,18 @@ func batteryModePlan(detail batteryDetail, batRes optimizer.BatteryResult, res o
 		slotHours := (time.Duration(dt[j]) * time.Second).Hours()
 		action := currentSlotSuggestion(detail, batRes, j, importing, exporting, noGridImport, slotHours).Action
 		until := firstBoundary.Add(time.Duration(j) * tariff.SlotDuration)
-		plan = append(plan, batterySlot{until: until, action: action})
+		plan = append(plan, batterySlot{until: until, action: action, soc: slotSocPercent(batReq, batRes, j)})
 	}
 	return plan
+}
+
+// slotSocPercent converts the optimizer's planned end-of-slot SoC (Wh) for slot j
+// to a percentage of the battery capacity, 0 when capacity or the slot is unknown.
+func slotSocPercent(batReq optimizer.BatteryConfig, batRes optimizer.BatteryResult, j int) float64 {
+	if batReq.SCapacity <= 0 || j < 0 || j >= len(batRes.StateOfCharge) {
+		return 0
+	}
+	return float64(batRes.StateOfCharge[j]) / float64(batReq.SCapacity) * 100
 }
 
 func (site *Site) addBatteryForecastTotals(req []optimizer.BatteryConfig, resp []optimizer.BatteryResult) *types.BatteryForecast {

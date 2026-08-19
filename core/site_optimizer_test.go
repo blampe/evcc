@@ -597,6 +597,66 @@ func TestCurrentBatteryAction(t *testing.T) {
 	assert.Empty(t, currentBatteryAction(nil, now))
 }
 
+// TestSlotSocPercent converts the optimizer's planned end-of-slot SoC (Wh) to a
+// percentage of capacity, 0 for unknown capacity or an out-of-range slot.
+func TestSlotSocPercent(t *testing.T) {
+	res := optimizer.BatteryResult{StateOfCharge: []float32{6750, 5400}}
+	req := optimizer.BatteryConfig{SCapacity: 13500}
+
+	assert.InDelta(t, 50.0, slotSocPercent(req, res, 0), 1e-6)
+	assert.InDelta(t, 40.0, slotSocPercent(req, res, 1), 1e-6)
+	assert.Zero(t, slotSocPercent(optimizer.BatteryConfig{}, res, 0), "unknown capacity => 0")
+	assert.Zero(t, slotSocPercent(req, res, 5), "out-of-range slot => 0")
+}
+
+// TestBatteryModePlanSoc verifies the plan carries the optimizer's planned
+// end-of-slot SoC alongside the action.
+func TestBatteryModePlanSoc(t *testing.T) {
+	now := time.Now()
+	firstBoundary := now.Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+	dt := []int{900, 900}
+
+	req := optimizer.BatteryConfig{SCapacity: 13500}
+	batRes := optimizer.BatteryResult{
+		ChargingPower:    []float32{0, 0},
+		DischargingPower: []float32{2000, 2000},
+		StateOfCharge:    []float32{6750, 5400},
+	}
+	res := optimizer.OptimizationResult{GridExport: []float32{2000, 2000}}
+
+	plan := batteryModePlan(batteryDetail{Type: batteryTypeBattery}, req, batRes, res, dt, firstBoundary, false)
+	require.Len(t, plan, 2)
+	assert.Equal(t, actionDischarge, plan[0].action)
+	assert.InDelta(t, 50.0, plan[0].soc, 1e-6)
+	assert.InDelta(t, 40.0, plan[1].soc, 1e-6)
+}
+
+// TestOptimizerBatteryTargetSoc resolves the current plan slot's planned SoC,
+// including front-running the export transition to the next slot's SoC.
+func TestOptimizerBatteryTargetSoc(t *testing.T) {
+	now := time.Now()
+	slot := tariff.SlotDuration
+
+	site := &Site{batterySchedules: map[string][]batterySlot{
+		batteryKey("home"): {
+			{until: now.Add(10 * time.Minute), action: actionDischarge, soc: 55},
+			{until: now.Add(10*time.Minute + slot), action: actionDischarge, soc: 40},
+		},
+	}}
+
+	assert.Equal(t, 55.0, site.optimizerBatteryTargetSoc("home"), "current slot's planned soc")
+	assert.Zero(t, site.optimizerBatteryTargetSoc("missing"), "no schedule => 0")
+
+	// front-run: within the lead the next export slot is adopted, incl. its soc
+	site.batterySchedules = map[string][]batterySlot{
+		batteryKey("home"): {
+			{until: now.Add(time.Minute), action: api.BatteryNormal.String(), soc: 80},
+			{until: now.Add(time.Minute + slot), action: actionDischarge, soc: 45},
+		},
+	}
+	assert.Equal(t, 45.0, site.optimizerBatteryTargetSoc("home"))
+}
+
 // TestSuggestionActionable ensures the actionable flag follows the current state
 // instead of the state at optimizer run time
 func TestSuggestionActionable(t *testing.T) {

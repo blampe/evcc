@@ -212,7 +212,16 @@ func (site *Site) applyBatteryMode(mode api.BatteryMode) error {
 		}
 
 		if mode != api.BatteryUnknown {
-			if err := batCtrl.SetBatteryMode(mode); err == nil {
+			var err error
+			if ctrl, ok := api.Cap[api.BatteryModeController](meter); ok {
+				// target-aware controllers pin the reserve to the optimizer's
+				// planned SoC (e.g. stop a grid discharge at the target instead
+				// of draining to min soc)
+				err = ctrl.SetBatteryModeSoc(mode, site.optimizerBatteryTargetSoc(dev.Config().Name))
+			} else {
+				err = batCtrl.SetBatteryMode(mode)
+			}
+			if err == nil {
 				site.log.DEBUG.Printf("set battery %s mode: %s", deviceTitleOrName(dev), mode)
 			} else if !errors.Is(err, api.ErrNotAvailable) {
 				return err

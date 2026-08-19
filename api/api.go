@@ -88,6 +88,14 @@ type BatteryController interface {
 	SetBatteryMode(BatteryMode) error
 }
 
+// BatteryModeController optionally accepts the optimizer's target SoC (percent)
+// alongside the mode, so a controller can e.g. pin the grid-discharge reserve to
+// that target instead of draining to the static min soc. A target <= 0 means
+// "no target"; the controller then behaves like SetBatteryMode.
+type BatteryModeController interface {
+	SetBatteryModeSoc(BatteryMode, float64) error
+}
+
 // Charger provides current charging status and enable/disable charging
 type Charger interface {
 	ChargeState
