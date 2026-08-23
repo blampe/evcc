@@ -13,7 +13,7 @@ import (
 // TestPollAckZeroIsNoop verifies that an ackId of 0 short-circuits to success
 // instead of polling for an acknowledgement that never arrives. This is the
 // case when stopping with no active session (or starting when already
-// charging); previously it spun for 10s and returned errAckTimeout, which made
+// charging); previously it spun for 10s and returned ErrAckTimeout, which made
 // evcc retry Enable(false) forever.
 func TestPollAckZeroIsNoop(t *testing.T) {
 	api := NewAPI(util.NewLogger("test"), nil)
@@ -77,7 +77,7 @@ func TestSessionDetailsParsing(t *testing.T) {
 }
 
 func TestPollAckTimeoutReturnsError(t *testing.T) {
-	assert.True(t, errors.Is(errAckTimeout, errAckTimeout))
+	assert.True(t, errors.Is(ErrAckTimeout, ErrAckTimeout))
 }
 
 func TestDeviceUDID(t *testing.T) {

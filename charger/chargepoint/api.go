@@ -187,7 +187,11 @@ func (a *API) StopCharging(deviceID, sessionID, portNumber int) error {
 	return a.pollAck(res.AckID, "stop_session")
 }
 
-var errAckTimeout = errors.New("charger did not acknowledge command within timeout")
+// ErrAckTimeout is returned when the charger does not acknowledge a queued
+// command within the poll window. A wedged charger (stuck in a phantom terminal
+// session it will not leave) exhibits this on StartCharging, so callers can key
+// off it to trigger a reboot — see the ChargePoint charger's Enable.
+var ErrAckTimeout = errors.New("charger did not acknowledge command within timeout")
 
 func (a *API) pollAck(ackID int, action string) error {
 	// An ackId of 0 means the charger did not queue a command: the device was
@@ -230,7 +234,7 @@ func (a *API) pollAck(ackID int, action string) error {
 		a.log.DEBUG.Printf("pollAck %s attempt %d/10 (ackId=%d): %v", action, i+1, ackID, err)
 	}
 
-	return fmt.Errorf("%w: %s (ackId=%d)", errAckTimeout, action, ackID)
+	return fmt.Errorf("%w: %s (ackId=%d)", ErrAckTimeout, action, ackID)
 }
 
 // UserChargingStatus returns the active session state from the mapcache API.

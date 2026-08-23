@@ -1,9 +1,9 @@
 package charger
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/evcc-io/evcc/api"
@@ -16,12 +16,9 @@ const (
 	chargingStatusCharging = "CHARGING"
 	chargingStatusFault    = "FAULT"
 
-	// UserChargingStatus.State value for a session the charger has faulted out
-	// of. ChargePoint keeps the session record open (non-zero ID) after a fault.
-	sessionStateFault = "fault"
-
-	// faultRestartCooldown bounds how often we reboot a faulted charger, so one
-	// stuck in FAULT isn't hammered with restart requests while it reboots.
+	// faultRestartCooldown bounds how often we reboot a charger (whether stuck in
+	// FAULT or wedged in a phantom session), so one that won't recover isn't
+	// hammered with restart requests while it reboots.
 	faultRestartCooldown = 5 * time.Minute
 )
 
@@ -41,8 +38,9 @@ type ChargePoint struct {
 	*cpkg.API
 	deviceID     int
 	enabled      bool
-	sessionID    int // 0 = no active session
+	sessionID    int       // 0 = no active session
 	faultRestart time.Time // last time we rebooted the charger to clear a FAULT
+	wedgeRestart time.Time // last time we rebooted the charger to clear a wedged session
 	statusG      util.Cacheable[cpkg.HomeChargerStatus]
 	sessionG     util.Cacheable[cpkg.SessionDetails]
 }
@@ -118,23 +116,24 @@ func (c *ChargePoint) recoverSession() {
 	if err != nil || status.SessionID == 0 {
 		return
 	}
-	c.sessionID = status.SessionID
-	c.sessionG = util.ResettableCached(func() (cpkg.SessionDetails, error) {
-		return c.API.SessionDetails(c.sessionID)
-	}, 30*time.Second)
+	c.trackSession(status)
 
-	res, err := c.statusG.Get()
-	if err == nil && res.ChargingStatus == chargingStatusCharging {
+	// Only measured power tells us the session is really charging (ChargePoint's
+	// label fields are unreliable — see chargePointStatus).
+	if c.sessionPowerKW() > 0 {
 		c.enabled = true
 	}
 }
 
 // Status implements the api.Charger interface.
 //
-// The ChargePoint API reports isPluggedIn and chargingStatus separately, and
-// there is a delay between when the vehicle plugs in and when a charging
-// session starts. We use session awareness to distinguish "plugged in but no
-// session started yet" (StatusB) from "plugged in and charging" (StatusC).
+// ChargePoint's status labels are unreliable in BOTH directions: it reports
+// chargingStatus=NOT_CHARGING / AVAILABLE, isPluggedIn=false and session
+// state="fully_charged" while the charger is actually delivering several kW, and
+// it also leaves a "fully_charged" session open at 0 kW on a car that never
+// finished. The one field that tracks reality is the session's measured power,
+// so we look at the current session's power alongside the status and treat
+// power > 0 as authoritative for "charging".
 func (c *ChargePoint) Status() (api.ChargeStatus, error) {
 	res, err := c.statusG.Get()
 	if err != nil {
@@ -145,40 +144,33 @@ func (c *ChargePoint) Status() (api.ChargeStatus, error) {
 	// recover it; reboot the charger (rate-limited) to get it back.
 	c.maybeRestartOnFault(res)
 
-	// The mapcache session is authoritative for an active charging session.
-	// HomeChargerStatus is unreliable: during ChargePoint cloud incidents it can
-	// report AVAILABLE / isPluggedIn=false while the charger is actively
-	// delivering power. Trusting it alone makes evcc believe the car is
-	// disconnected and leaves an externally-started session running with no way
-	// to stop it for PV, so let a live session override it. On a mapcache error
-	// we fall back to HomeChargerStatus (no worse than before).
+	// On a mapcache error we fall back to HomeChargerStatus (no worse than before).
 	var session cpkg.UserChargingStatus
 	if st, serr := c.API.UserChargingStatus(); serr == nil {
 		session = st
 	}
 
-	activeSession := sessionActive(session)
+	// Read the live session power; it is the only trustworthy "is charging"
+	// signal (see the method comment).
+	var power float64
+	if session.SessionID != 0 {
+		c.trackSession(session)
+		power = c.sessionPowerKW()
+	}
 
-	switch chargePointStatus(res, activeSession) {
+	switch chargePointStatus(res, session, power) {
 	case api.StatusC:
-		if session.SessionID != 0 && c.sessionID != session.SessionID {
-			c.sessionID = session.SessionID
-			c.sessionG = util.ResettableCached(func() (cpkg.SessionDetails, error) {
-				return c.API.SessionDetails(c.sessionID)
-			}, 30*time.Second)
-		} else if c.sessionG == nil {
-			c.recoverSession()
-		}
 		c.enabled = true
 		return api.StatusC, nil
 
 	case api.StatusB:
-		// Plugged in but no active session. If we still believe we're enabled,
-		// the session ended externally (car finished / stopped) or the charger
-		// faulted — reflect disabled so evcc re-issues StartCharging when it
-		// wants to charge, rather than waiting forever for the vehicle.
-		if c.enabled && !activeSession {
-			c.log.DEBUG.Println("charging session ended or faulted; marking disabled")
+		// Connected but not charging (0 kW). If we still believe we're enabled,
+		// the session stopped (car finished / paused) or the charger wedged in a
+		// phantom terminal session it won't leave — reflect disabled so evcc
+		// re-issues StartCharging (which reboots a wedged charger, see Enable)
+		// rather than waiting forever on a session delivering nothing.
+		if c.enabled {
+			c.log.DEBUG.Println("connected but not charging (0 kW); marking disabled")
 			c.clearSession()
 		}
 		return api.StatusB, nil
@@ -189,35 +181,51 @@ func (c *ChargePoint) Status() (api.ChargeStatus, error) {
 	}
 }
 
-// sessionActive reports whether a mapcache session represents a genuinely
-// active charging session. After the charger faults, ChargePoint keeps the
-// session record open with a non-zero ID and state "fault" while delivering
-// 0 kW; that lingering session must not be treated as active, otherwise evcc
-// believes the car is charging with no way to recover.
-func sessionActive(session cpkg.UserChargingStatus) bool {
-	return session.SessionID != 0 && !strings.EqualFold(session.State, sessionStateFault)
-}
-
-// chargePointStatus maps the charger's reported status plus mapcache session
-// state to an evcc charge status. An active (non-faulted) mapcache session
-// forces StatusC even when HomeChargerStatus wrongly reports AVAILABLE/unplugged.
-// A charger-reported FAULT always wins over a lingering session: the charger is
-// not delivering power, so report plugged-in-not-charging (or disconnected) and
-// let evcc re-issue StartCharging.
-func chargePointStatus(res cpkg.HomeChargerStatus, activeSession bool) api.ChargeStatus {
+// chargePointStatus derives an evcc charge status from the charger status, the
+// mapcache session, and the session's measured power. ChargePoint's label
+// fields lie in both directions (see Status), so measured power is authoritative
+// for whether the car is charging. A charger-reported FAULT (which never carries
+// power) reports plugged-in-not-charging so evcc re-issues StartCharging; a
+// lingering 0 kW session still means the car is connected.
+func chargePointStatus(res cpkg.HomeChargerStatus, session cpkg.UserChargingStatus, power float64) api.ChargeStatus {
 	switch {
+	case power > 0 || res.ChargingStatus == chargingStatusCharging:
+		return api.StatusC
 	case res.ChargingStatus == chargingStatusFault:
 		if res.IsPluggedIn {
 			return api.StatusB
 		}
 		return api.StatusA
-	case res.ChargingStatus == chargingStatusCharging || activeSession:
-		return api.StatusC
-	case res.IsPluggedIn:
+	case session.SessionID != 0 || res.IsPluggedIn:
 		return api.StatusB
 	default:
 		return api.StatusA
 	}
+}
+
+// trackSession points sessionG at the given mapcache session so the session
+// power/energy metrics reflect it.
+func (c *ChargePoint) trackSession(session cpkg.UserChargingStatus) {
+	if session.SessionID == c.sessionID && c.sessionG != nil {
+		return
+	}
+	c.sessionID = session.SessionID
+	c.sessionG = util.ResettableCached(func() (cpkg.SessionDetails, error) {
+		return c.API.SessionDetails(c.sessionID)
+	}, 30*time.Second)
+}
+
+// sessionPowerKW returns the tracked session's measured charge power in kW, or 0
+// when there is no session or the read fails.
+func (c *ChargePoint) sessionPowerKW() float64 {
+	if c.sessionG == nil {
+		return 0
+	}
+	res, err := c.sessionG.Get()
+	if err != nil {
+		return 0
+	}
+	return res.PowerKW
 }
 
 // maybeRestartOnFault reboots the charger when it reports a FAULT, at most once
@@ -252,7 +260,33 @@ func shouldRestartOnFault(res cpkg.HomeChargerStatus, lastRestart, now time.Time
 	if res.ChargingStatus != chargingStatusFault {
 		return false
 	}
+	return rebootDue(lastRestart, now)
+}
+
+// rebootDue reports whether a charger is due for another reboot given the last
+// reboot attempt: never rebooted, or at least faultRestartCooldown ago.
+func rebootDue(lastRestart, now time.Time) bool {
 	return lastRestart.IsZero() || now.Sub(lastRestart) >= faultRestartCooldown
+}
+
+// maybeRestartWedged reboots a charger that is wedged in a phantom session it
+// refuses to leave — StartCharging is not acknowledged and the charger never
+// energizes, exactly like a FAULT (see Enable). Rate-limited to at most once per
+// faultRestartCooldown via its own timestamp. Returns true when a restart was
+// issued (so the caller can ask evcc to retry once the charger is back).
+func (c *ChargePoint) maybeRestartWedged() bool {
+	if !rebootDue(c.wedgeRestart, time.Now()) {
+		return false
+	}
+
+	// Stamp first so a failing restart still honors the cooldown.
+	c.wedgeRestart = time.Now()
+	c.log.WARN.Println("charger did not acknowledge start (wedged); issuing restart")
+	if err := c.API.RestartCharger(c.deviceID); err != nil {
+		c.log.ERROR.Printf("charger restart failed: %v", err)
+		return false
+	}
+	return true
 }
 
 // clearSession resets local charging-session state.
@@ -271,6 +305,14 @@ func (c *ChargePoint) Enabled() (bool, error) {
 func (c *ChargePoint) Enable(enable bool) error {
 	if enable {
 		if err := c.API.StartCharging(c.deviceID); err != nil {
+			// A charger wedged in a phantom terminal session (e.g. "fully_charged"
+			// at 0 kW on a car that never finished) does not acknowledge the start
+			// command — it times out and the charger never energizes. Like a
+			// FAULT, only a reboot recovers it, so reboot (rate-limited) and let
+			// the control loop retry once the charger is back (~1–2 min).
+			if errors.Is(err, cpkg.ErrAckTimeout) && c.maybeRestartWedged() {
+				return api.ErrMustRetry
+			}
 			return err
 		}
 		for range 5 {
@@ -279,10 +321,7 @@ func (c *ChargePoint) Enable(enable bool) error {
 				return err
 			}
 			if status.SessionID != 0 {
-				c.sessionID = status.SessionID
-				c.sessionG = util.ResettableCached(func() (cpkg.SessionDetails, error) {
-					return c.API.SessionDetails(c.sessionID)
-				}, 30*time.Second)
+				c.trackSession(status)
 				break
 			}
 			time.Sleep(time.Second)

@@ -36,60 +36,68 @@ func TestChargePointGetMaxCurrent(t *testing.T) {
 	assert.ErrorIs(t, err, api.ErrNotAvailable)
 }
 
-// TestChargePointStatus verifies that an active mapcache session forces StatusC
-// even when the (unreliable) HomeChargerStatus reports AVAILABLE/unplugged —
-// otherwise evcc goes blind to an externally-started session and can't stop it.
+// TestChargePointStatus verifies that measured session power — not ChargePoint's
+// unreliable status/session labels — decides the charge status. ChargePoint has
+// been observed reporting AVAILABLE / unplugged / state "fully_charged" while
+// delivering several kW, and leaving a "fully_charged" session open at 0 kW on a
+// car that never finished; both must resolve correctly off power.
 func TestChargePointStatus(t *testing.T) {
-	status := func(chargingStatus string, pluggedIn bool) cpkg.HomeChargerStatus {
+	res := func(chargingStatus string, pluggedIn bool) cpkg.HomeChargerStatus {
 		var s cpkg.HomeChargerStatus
 		s.ChargingStatus = chargingStatus
 		s.IsPluggedIn = pluggedIn
 		return s
 	}
+	// A lingering "fully_charged" session (the unreliable label observed live).
+	sess := cpkg.UserChargingStatus{SessionID: 5451583781, State: "fully_charged"}
+	none := cpkg.UserChargingStatus{}
 
 	tests := []struct {
-		name          string
-		res           cpkg.HomeChargerStatus
-		activeSession bool
-		want          api.ChargeStatus
+		name    string
+		res     cpkg.HomeChargerStatus
+		session cpkg.UserChargingStatus
+		power   float64
+		want    api.ChargeStatus
 	}{
-		{"charging flag", status("CHARGING", true), false, api.StatusC},
-		{"active session overrides AVAILABLE/unplugged", status("AVAILABLE", false), true, api.StatusC},
-		{"plugged in, no session", status("AVAILABLE", true), false, api.StatusB},
-		{"available, unplugged, no session", status("AVAILABLE", false), false, api.StatusA},
-		// A faulted charger must not read as charging even while ChargePoint
-		// keeps the session record open (state "fault") — that lingering session
-		// no longer counts as active (see activeSession in Status).
-		{"fault, plugged in, no active session", status("FAULT", true), false, api.StatusB},
-		{"fault, unplugged", status("FAULT", false), false, api.StatusA},
+		{"charging flag, no session yet", res("CHARGING", true), none, 0, api.StatusC},
+		// Measured power is authoritative even when every label lies: AVAILABLE,
+		// isPluggedIn=false and state "fully_charged" while delivering 2 kW.
+		{"power overrides AVAILABLE/unplugged/fully_charged", res("AVAILABLE", false), sess, 2.04, api.StatusC},
+		// Phantom wedge: "fully_charged" session left open at 0 kW is not charging.
+		{"fully_charged session at 0 kW is not charging", res("NOT_CHARGING", true), sess, 0, api.StatusB},
+		// A lingering 0 kW session still means connected, even if the plug flag lies.
+		{"idle 0 kW session, unplugged flag unreliable", res("AVAILABLE", false), sess, 0, api.StatusB},
+		{"plugged in, no session", res("AVAILABLE", true), none, 0, api.StatusB},
+		{"available, unplugged, no session", res("AVAILABLE", false), none, 0, api.StatusA},
+		// A faulted charger delivers no power → plugged-in-not-charging / disconnected.
+		{"fault, plugged in", res("FAULT", true), none, 0, api.StatusB},
+		{"fault, unplugged", res("FAULT", false), none, 0, api.StatusA},
+		// Real power flow wins even over a FAULT label.
+		{"power overrides fault label", res("FAULT", true), sess, 7.0, api.StatusC},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, chargePointStatus(tc.res, tc.activeSession))
+			assert.Equal(t, tc.want, chargePointStatus(tc.res, tc.session, tc.power))
 		})
 	}
 }
 
-// TestChargePointSessionActive verifies that a mapcache session the charger has
-// faulted out of is not treated as an active charging session — ChargePoint
-// keeps the session record open with a non-zero ID and state "fault", and
-// counting it as active made evcc report StatusC (charging) at 0 kW.
-func TestChargePointSessionActive(t *testing.T) {
-	tests := []struct {
-		name    string
-		session cpkg.UserChargingStatus
-		want    bool
-	}{
-		{"no session", cpkg.UserChargingStatus{}, false},
-		{"charging session", cpkg.UserChargingStatus{SessionID: 5431758691, State: "in_use"}, true},
-		{"faulted session", cpkg.UserChargingStatus{SessionID: 5431758691, State: "fault"}, false},
-		{"faulted session, mixed case", cpkg.UserChargingStatus{SessionID: 5431758691, State: "FAULT"}, false},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, sessionActive(tc.session))
-		})
-	}
+// TestChargePointRebootDue verifies the shared reboot cooldown gate used for both
+// FAULT and wedged-charger restarts: due when never rebooted or after the cooldown.
+func TestChargePointRebootDue(t *testing.T) {
+	now := time.Now()
+	assert.True(t, rebootDue(time.Time{}, now), "never rebooted → due")
+	assert.False(t, rebootDue(now.Add(-faultRestartCooldown/2), now), "within cooldown → not due")
+	assert.True(t, rebootDue(now.Add(-faultRestartCooldown-time.Second), now), "cooldown elapsed → due")
+}
+
+// TestChargePointMaybeRestartWedged verifies a wedged restart within the cooldown
+// does not touch the API (a nil API would panic) or issue a reboot.
+func TestChargePointMaybeRestartWedged(t *testing.T) {
+	c := &ChargePoint{log: util.NewLogger("test")}
+	c.wedgeRestart = time.Now().Add(-faultRestartCooldown / 2)
+	assert.False(t, c.maybeRestartWedged(), "within cooldown must not restart")
+	assert.Equal(t, c.wedgeRestart, c.wedgeRestart, "timestamp unchanged within cooldown")
 }
 
 // TestChargePointShouldRestartOnFault verifies the reboot gate: a FAULT triggers
