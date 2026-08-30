@@ -1473,31 +1473,47 @@ func scaleAndPrune(rates api.Rates, scale float64, maxLen int) []float32 {
 
 func (site *Site) applyPlanGoal(lp loadpoint.API, bat *optimizer.BatteryConfig, minLen int) {
 	goal, socBased := lp.GetPlanGoal()
-	if goal <= 0 {
+
+	if goal > 0 {
+		// Convert to Wh
+		if vehicle := lp.GetVehicle(); socBased && vehicle != nil {
+			goal *= vehicle.Capacity() * 10
+		} else {
+			goal *= 1000 // Wh
+		}
+
+		if ts := lp.EffectivePlanTime(); !ts.IsZero() {
+			// TODO precise slot placement
+			slot := int(time.Until(ts) / tariff.SlotDuration)
+			if slot >= 0 && slot < minLen {
+				// a real in-horizon plan goal: honor it exactly, no horizon-end fallback
+				bat.SGoal = make([]float32, minLen)
+				bat.SGoal[slot] = float32(goal)
+				bat.SMax = max(bat.SMax, float32(goal))
+				return
+			}
+			site.log.DEBUG.Printf("plan beyond forecast range or overrun: %.1f at %v slot %d", goal, ts.Round(time.Minute), slot)
+		}
+	}
+
+	// No in-horizon plan goal was set (no goal, no plan time, or the deadline
+	// falls outside [0, minLen)). Fall back to a goal at the vehicle's effective
+	// ceiling on the last slot of the horizon so a connected EV is a real
+	// in-horizon energy sink: battery surplus is routed into the car instead of
+	// being dumped to grid at a low price, rather than the optimizer treating the
+	// car as having zero demand.
+	//
+	// The ceiling is bat.SMax, already set by loadpointRequest to the configured
+	// limit SoC (or the session energy limit, or 100% capacity when no limit is
+	// set). It is in the request's state frame - absolute soc, or charged session
+	// energy when soc is unavailable - so the goal is frame-consistent and never
+	// exceeds, hence never overrides, the user's limit. Nothing to target if there
+	// is no vehicle (EV-only fallback) or no ceiling.
+	if lp.GetVehicle() == nil || bat.SMax <= 0 {
 		return
 	}
-
-	// Convert to Wh
-	if vehicle := lp.GetVehicle(); socBased && vehicle != nil {
-		goal *= vehicle.Capacity() * 10
-	} else {
-		goal *= 1000 // Wh
-	}
-
-	ts := lp.EffectivePlanTime()
-	if ts.IsZero() {
-		return
-	}
-
-	// TODO precise slot placement
-	slot := int(time.Until(ts) / tariff.SlotDuration)
-	if slot >= 0 && slot < minLen {
-		bat.SGoal = make([]float32, minLen)
-		bat.SGoal[slot] = float32(goal)
-		bat.SMax = max(bat.SMax, float32(goal))
-	} else {
-		site.log.DEBUG.Printf("plan beyond forecast range or overrun: %.1f at %v slot %d", goal, ts.Round(time.Minute), slot)
-	}
+	bat.SGoal = make([]float32, minLen)
+	bat.SGoal[minLen-1] = bat.SMax
 }
 
 // TODO remove once smart cost limit usage becomes obsolete
