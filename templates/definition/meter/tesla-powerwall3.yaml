@@ -81,6 +81,16 @@ params:
     help:
       en: maximum discharge power (W), default 11500W
       de: maximale Entladeleistung (W), Standard 11500W
+  - name: allowGridImport
+    type: bool
+    advanced: true
+    usages: ["battery"]
+    description:
+      en: Allow grid charging
+      de: Netzladen erlauben
+    help:
+      en: allow charging the battery from the grid (default off); when off the optimizer never plans to grid-charge the pack and it charges from solar only
+      de: Laden der Batterie aus dem Netz erlauben (Standard aus); wenn aus, plant der Optimizer kein Netzladen der Batterie und sie lädt nur aus Solar
   - name: cache
     default: 5s
     advanced: true
@@ -100,4 +110,5 @@ render: |
   {{ if .maxsoc }}maxsoc: {{ .maxsoc }}{{ end }}
   {{ if .maxchargepower }}maxchargepower: {{ .maxchargepower }}{{ end }}
   {{ if .maxdischargepower }}maxdischargepower: {{ .maxdischargepower }}{{ end }}
+  {{ if .allowGridImport }}allowGridImport: {{ .allowGridImport }}{{ end }}
   cache: {{ .cache }}

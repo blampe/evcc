@@ -383,12 +383,13 @@ func (s *mockEnergySite) SetGridCharging(enabled bool) error {
 
 func TestFleetAPIBatteryController(t *testing.T) {
 	tests := []struct {
-		name        string
-		mode        api.BatteryMode
-		soc         float64
-		wantMode    string
-		wantReserve uint64
-		wantGridChg bool
+		name            string
+		mode            api.BatteryMode
+		soc             float64
+		allowGridImport bool
+		wantMode        string
+		wantReserve     uint64
+		wantGridChg     bool
 	}{
 		{
 			name:        "normal sets self_consumption and min reserve",
@@ -414,11 +415,19 @@ func TestFleetAPIBatteryController(t *testing.T) {
 			wantGridChg: false,
 		},
 		{
-			name:        "charge sets self_consumption with grid charging and max reserve",
+			name:        "charge without allowGridImport keeps grid charging off",
 			mode:        api.BatteryCharge,
 			wantMode:    "self_consumption",
 			wantReserve: 100,
-			wantGridChg: true,
+			wantGridChg: false,
+		},
+		{
+			name:            "charge with allowGridImport enables grid charging",
+			mode:            api.BatteryCharge,
+			allowGridImport: true,
+			wantMode:        "self_consumption",
+			wantReserve:     100,
+			wantGridChg:     true,
 		},
 	}
 
@@ -427,7 +436,8 @@ func TestFleetAPIBatteryController(t *testing.T) {
 			mock := &mockEnergySite{}
 
 			m := &FleetAPI{
-				usage: "battery",
+				usage:           "battery",
+				allowGridImport: tc.allowGridImport,
 				provider: &fleetAPIProvider{
 					site: &teslaclient.EnergySite{},
 					liveStatusG: func() (*teslaclient.EnergySiteLiveStatus, error) {
@@ -467,7 +477,8 @@ func TestFleetAPIBatteryController(t *testing.T) {
 					if err := mock.SetOperatingMode("self_consumption"); err != nil {
 						return err
 					}
-					if err := mock.SetGridCharging(true); err != nil {
+					// grid charging is opt-in via allowGridImport
+					if err := mock.SetGridCharging(m.allowGridImport); err != nil {
 						return err
 					}
 					return mock.SetBatteryReserve(uint64(limits.MaxSoc))

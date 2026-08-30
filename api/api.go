@@ -96,6 +96,15 @@ type BatteryModeController interface {
 	SetBatteryModeSoc(BatteryMode, float64) error
 }
 
+// GridChargeController optionally reports whether a controllable battery may
+// charge from the grid. When AllowGridImport returns false, the optimizer models
+// the pack with charge_from_grid disabled (it may still charge from solar) and
+// control never enables grid charging. Absent this capability, grid charging is
+// allowed as before.
+type GridChargeController interface {
+	AllowGridImport() bool
+}
+
 // Charger provides current charging status and enable/disable charging
 type Charger interface {
 	ChargeState

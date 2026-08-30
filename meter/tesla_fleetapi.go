@@ -46,12 +46,23 @@ type fleetAPIProvider struct {
 // Multiple FleetAPI instances for the same site share a single provider.
 type FleetAPI struct {
 	implement.Caps
-	usage     string
-	provider  *fleetAPIProvider
-	socLimits batterySocLimits
+	usage           string
+	provider        *fleetAPIProvider
+	socLimits       batterySocLimits
+	allowGridImport bool // permit charging the pack from the grid (default off)
 }
 
-var _ api.BatteryModeController = (*FleetAPI)(nil)
+var (
+	_ api.BatteryModeController = (*FleetAPI)(nil)
+	_ api.GridChargeController  = (*FleetAPI)(nil)
+)
+
+// AllowGridImport reports whether the Powerwall may charge from the grid.
+// It implements api.GridChargeController so the optimizer can model the pack
+// with charge_from_grid disabled when off.
+func (m *FleetAPI) AllowGridImport() bool {
+	return m.allowGridImport
+}
 
 func init() {
 	registry.Add("teslafleetapi", NewFleetAPIFromConfig)
@@ -65,6 +76,7 @@ func NewFleetAPIFromConfig(other map[string]any) (api.Meter, error) {
 		Tokens             oauth.Tokens
 		EnergySiteID       int64 `mapstructure:"siteid"`
 		Cache              time.Duration
+		AllowGridImport    bool // permit charging the pack from the grid (default off)
 		batterySocLimits   `mapstructure:",squash"`
 		batteryPowerLimits `mapstructure:",squash"`
 	}{
@@ -103,7 +115,7 @@ func NewFleetAPIFromConfig(other map[string]any) (api.Meter, error) {
 		cc.Usage = "solar"
 	}
 
-	return NewFleetAPI(cc.Usage, cc.Credentials.ID, cc.Credentials.Secret, token, cc.EnergySiteID, cc.Cache, cc.batterySocLimits, cc.batteryPowerLimits)
+	return NewFleetAPI(cc.Usage, cc.Credentials.ID, cc.Credentials.Secret, token, cc.EnergySiteID, cc.Cache, cc.batterySocLimits, cc.batteryPowerLimits, cc.AllowGridImport)
 }
 
 var fleetAPIProviders = utilcache.New[*fleetAPIProvider]()
@@ -191,17 +203,18 @@ func newFleetClient(log *util.Logger, oc *oauth2.Config, token *oauth2.Token) (*
 }
 
 // NewFleetAPI creates a Tesla Fleet API Meter for Powerwall 3.
-func NewFleetAPI(usage, clientID, clientSecret string, token *oauth2.Token, energySiteID int64, cacheDur time.Duration, socLimits batterySocLimits, powerLimits batteryPowerLimits) (api.Meter, error) {
+func NewFleetAPI(usage, clientID, clientSecret string, token *oauth2.Token, energySiteID int64, cacheDur time.Duration, socLimits batterySocLimits, powerLimits batteryPowerLimits, allowGridImport bool) (api.Meter, error) {
 	provider, err := getOrCreateProvider(clientID, clientSecret, token, energySiteID, cacheDur)
 	if err != nil {
 		return nil, err
 	}
 
 	m := &FleetAPI{
-		Caps:      implement.New(),
-		usage:     strings.ToLower(usage),
-		provider:  provider,
-		socLimits: socLimits,
+		Caps:            implement.New(),
+		usage:           strings.ToLower(usage),
+		provider:        provider,
+		socLimits:       socLimits,
+		allowGridImport: allowGridImport,
 	}
 
 	if usage == "battery" {
@@ -503,6 +516,14 @@ func clampReserve(pct float64) uint64 {
 	return uint64(pct)
 }
 
+// onOff renders a boolean as an on/off label for API operation logs.
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
 // normalReserve is the self_consumption reserve: MinSoc normally, or the battery-
 // boost target SoC (never below MinSoc) when the optimizer is draining the pack
 // into a car and passes targetSoc > 0, so the discharge stops at the plan's
@@ -566,7 +587,9 @@ func holdChargeReserve(soc, minSoc float64) float64 {
 //     spike + pv_only, reserve a small margin below the current SoC so a PV dip is
 //     still covered from the battery (never below MinSoc; the 80 floor applies in
 //     the PW3-rejected (80,100) band).
-//   - BatteryCharge:   self_consumption mode, reserve at MaxSoc, grid charging enabled
+//   - BatteryCharge:   self_consumption mode, reserve at MaxSoc. Grid charging is
+//     enabled only when the allowGridImport config option is set; otherwise it is
+//     forced off, so BatteryCharge charges from solar/surplus only.
 //   - BatteryDischarge: autonomous (TOU) mode + battery_ok export + a synthetic
 //     tariff that spikes the real buy/sell price for the current window, driving
 //     the Powerwall to export stored energy to grid. The reserve is pinned at the
@@ -667,11 +690,16 @@ func (m *FleetAPI) SetBatteryModeSoc(mode api.BatteryMode, targetSoc float64) er
 			return err
 		}
 		reserve := clampReserve(limits.MaxSoc)
-		m.provider.log.DEBUG.Printf("charge: → self_consumption + grid charging, reserve %d%%", reserve)
+		// grid charging is opt-in via the allowGridImport config option. When off,
+		// BatteryCharge degrades to plain self_consumption (charges from solar/surplus
+		// only), never pulling the pack up from the grid.
+		gridCharging := m.allowGridImport
+		label := onOff(gridCharging)
+		m.provider.log.DEBUG.Printf("charge: → self_consumption, grid charging %s, reserve %d%%", label, reserve)
 		if err := m.apiWrite("operating mode → self_consumption", func() error { return site.SetOperatingMode("self_consumption") }); err != nil {
 			return err
 		}
-		if err := m.apiWrite("grid charging → on", func() error { return site.SetGridCharging(true) }); err != nil {
+		if err := m.apiWrite("grid charging → "+label, func() error { return site.SetGridCharging(gridCharging) }); err != nil {
 			return err
 		}
 		return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })

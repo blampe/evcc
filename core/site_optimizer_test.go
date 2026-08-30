@@ -345,6 +345,49 @@ func TestBatteryRequestSocLimitsClamp(t *testing.T) {
 	})
 }
 
+// gridChargeStub / batteryControllerStub implement the minimal capabilities
+// batteryRequest inspects, so tests can vary GridChargeController without gomock.
+type gridChargeStub bool
+
+func (g gridChargeStub) AllowGridImport() bool { return bool(g) }
+
+type batteryControllerStub struct{}
+
+func (batteryControllerStub) SetBatteryMode(api.BatteryMode) error { return nil }
+
+// TestBatteryRequestGridCharge verifies a controllable battery that forbids grid
+// import is modelled with charge_from_grid off (solar charging and discharge-to-
+// grid unaffected), while one that allows it - or lacks the capability - keeps
+// grid charging.
+func TestBatteryRequestGridCharge(t *testing.T) {
+	site := &Site{log: util.NewLogger("foo")}
+	capacity, soc := 10.0, 50.0
+	m := types.Measurement{Capacity: &capacity, Soc: &soc}
+
+	withGridCharge := func(allow bool) config.Device[api.Meter] {
+		return config.NewStaticDevice(config.Named{}, api.Meter(&struct {
+			api.Meter
+			batteryControllerStub
+			gridChargeStub
+		}{gridChargeStub: gridChargeStub(allow)}))
+	}
+
+	req, _ := site.batteryRequest(withGridCharge(false), m, nil, 8, 15*time.Minute)
+	assert.False(t, req.ChargeFromGrid, "allowGridImport=false -> no grid charging")
+	assert.True(t, req.DischargeToGrid, "discharge-to-grid is unaffected")
+
+	req, _ = site.batteryRequest(withGridCharge(true), m, nil, 8, 15*time.Minute)
+	assert.True(t, req.ChargeFromGrid, "allowGridImport=true -> grid charging")
+
+	// no GridChargeController capability -> grid charging as before
+	plain := config.NewStaticDevice(config.Named{}, api.Meter(&struct {
+		api.Meter
+		batteryControllerStub
+	}{}))
+	req, _ = site.batteryRequest(plain, m, nil, 8, 15*time.Minute)
+	assert.True(t, req.ChargeFromGrid, "no capability -> grid charging unchanged")
+}
+
 // charge goal for vehicles with and without known capacity/soc, see #32890
 func TestLoadpointRequestChargeGoal(t *testing.T) {
 	site := &Site{log: util.NewLogger("foo")}

@@ -1242,6 +1242,14 @@ func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measureme
 		bat.DischargeToGrid = true
 	}
 
+	// a battery that forbids grid import (allowGridImport=false) is modelled with
+	// charge_from_grid off, so the optimizer never plans to charge it from the grid
+	// - it may still charge from solar surplus, and other batteries (e.g. the EV)
+	// keep their own grid-charge flag
+	if c, ok := api.Cap[api.GridChargeController](instance); ok && !c.AllowGridImport() {
+		bat.ChargeFromGrid = false
+	}
+
 	if m, ok := api.Cap[api.BatteryPowerLimiter](instance); ok {
 		charge, discharge := m.GetPowerLimits()
 		bat.CMax = float32(charge)
