@@ -136,7 +136,7 @@ type Loadpoint struct {
 	chargerSwitched       time.Time // Charger enabled/disabled timestamp
 	optimizerAction       string    // current optimizer suggestion (charge|stop|""), set by the site each cycle
 	optimizerChargePower  float64   // optimizer's requested charge power (W) for a "charge" suggestion, set by the site each cycle
-	optimizerChargeSource string    // optimizer's charge source (surplus|grid|""), set by the site each cycle
+	optimizerChargeSource string    // optimizer's charge source (surplus|grid|battery|""), set by the site each cycle
 	phasesSwitched        time.Time // Phase switch timestamp
 	vehicleDetectTicker   *clock.Ticker
 	vehicleIdentifier     string

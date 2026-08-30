@@ -503,6 +503,17 @@ func clampReserve(pct float64) uint64 {
 	return uint64(pct)
 }
 
+// normalReserve is the self_consumption reserve: MinSoc normally, or the battery-
+// boost target SoC (never below MinSoc) when the optimizer is draining the pack
+// into a car and passes targetSoc > 0, so the discharge stops at the plan's
+// target instead of at MinSoc.
+func normalReserve(minSoc, targetSoc float64) uint64 {
+	if targetSoc > 0 {
+		return clampReserve(max(targetSoc, minSoc))
+	}
+	return clampReserve(minSoc)
+}
+
 // newBatteryController returns a BatteryController func that applies the mode
 // with no optimizer SoC target (the static min/current-soc reserve defaults).
 func (m *FleetAPI) newBatteryController() func(api.BatteryMode) error {
@@ -546,7 +557,9 @@ func holdChargeReserve(soc, minSoc float64) float64 {
 //   - backup: battery holds charge for backup, only charges from solar
 //
 // Mapping to evcc BatteryMode:
-//   - BatteryNormal:   self_consumption mode, reserve at MinSoc
+//   - BatteryNormal:   self_consumption mode, reserve at MinSoc - or, during a
+//     battery boost (targetSoc > 0), at the plan's target SoC so the pack stops
+//     feeding the car there instead of draining to MinSoc
 //   - BatteryHold:     backup mode, reserve at current SOC (prevents discharge)
 //   - BatteryHoldCharge: prevent charging. SoC 100: nothing to prevent → plain
 //     self_consumption + 80% backup (no spike/TOU). SoC < 100: autonomous + export
@@ -568,7 +581,7 @@ func (m *FleetAPI) SetBatteryModeSoc(mode api.BatteryMode, targetSoc float64) er
 		if err := m.restoreTariff(); err != nil {
 			return err
 		}
-		reserve := clampReserve(limits.MinSoc)
+		reserve := normalReserve(limits.MinSoc, targetSoc)
 		m.provider.log.DEBUG.Printf("normal: → self_consumption, reserve %d%%", reserve)
 		if err := m.apiWrite("operating mode → self_consumption", func() error { return site.SetOperatingMode("self_consumption") }); err != nil {
 			return err

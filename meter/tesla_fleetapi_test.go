@@ -34,6 +34,16 @@ func TestClampReserve(t *testing.T) {
 	assert.Equal(t, uint64(0), clampReserve(-5))    // clamped low
 }
 
+// TestNormalReserve verifies self_consumption keeps the pack available down to
+// MinSoc normally, but pins the reserve to the battery-boost target (never below
+// MinSoc) when the optimizer passes a target SoC.
+func TestNormalReserve(t *testing.T) {
+	assert.Equal(t, uint64(20), normalReserve(20, 0), "no boost -> MinSoc")
+	assert.Equal(t, uint64(50), normalReserve(20, 50), "boost -> plan target above MinSoc")
+	assert.Equal(t, uint64(20), normalReserve(20, 10), "boost target below MinSoc -> floored at MinSoc")
+	assert.Equal(t, uint64(80), normalReserve(20, 90), "boost target in the PW3-rejected band -> 80")
+}
+
 // TestSpikeTariff verifies the discharge tariff bumps the real SELL price (only)
 // by dischargeSpikeBump for the current 15-min slot plus the next one, leaves buy
 // and every other slot at the real rate, tags the result EVCC, and doesn't mutate

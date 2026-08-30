@@ -341,3 +341,74 @@ func TestRequiredBatteryModeOptimizer(t *testing.T) {
 	s.loadpoints = []*Loadpoint{{batteryBoost: boostStart}}
 	assert.Equal(t, api.BatteryUnknown, s.requiredBatteryMode(false, api.Rate{}))
 }
+
+func TestOptimizerBatteryBoostActive(t *testing.T) {
+	s := &Site{}
+	assert.False(t, s.optimizerBatteryBoostActive(), "no loadpoints")
+
+	s.loadpoints = []*Loadpoint{{optimizerChargeSource: sourceSurplus}, {optimizerChargeSource: sourceGrid}}
+	assert.False(t, s.optimizerBatteryBoostActive(), "surplus/grid are not a battery boost")
+
+	s.loadpoints = []*Loadpoint{{optimizerChargeSource: sourceSurplus}, {optimizerChargeSource: sourceBattery}}
+	assert.True(t, s.optimizerBatteryBoostActive(), "any loadpoint sourcing from the battery is a boost")
+}
+
+// recordingBatteryController implements Meter + BatteryController +
+// BatteryModeController, recording the last SetBatteryModeSoc so tests can assert
+// the reserve target passed during a battery boost.
+type recordingBatteryController struct {
+	mode api.BatteryMode
+	soc  float64
+}
+
+func (c *recordingBatteryController) CurrentPower() (float64, error) { return 0, nil }
+func (c *recordingBatteryController) SetBatteryMode(m api.BatteryMode) error {
+	c.mode, c.soc = m, 0
+	return nil
+}
+func (c *recordingBatteryController) SetBatteryModeSoc(m api.BatteryMode, soc float64) error {
+	c.mode, c.soc = m, soc
+	return nil
+}
+
+// TestBatteryBoostReservePin verifies normal mode pins the pack's reserve to the
+// plan's target SoC while boosting (so it stops there instead of draining to
+// MinSoc), and restores the MinSoc reserve (target 0) once the boost ends -
+// including when the pack stays in normal mode across the transition.
+func TestBatteryBoostReservePin(t *testing.T) {
+	ctrl := &recordingBatteryController{}
+	newSite := func() *Site {
+		return &Site{
+			log:           util.NewLogger("foo"),
+			batteryMeters: []config.Device[api.Meter]{config.NewStaticDevice(config.Named{Name: "home"}, api.Meter(ctrl))},
+			batteryMode:   api.BatteryNormal, // self-consumption default
+			batterySchedules: map[string][]batterySlot{
+				batteryKey("home"): {{until: time.Now().Add(time.Hour), action: "normal", soc: 55}},
+			},
+		}
+	}
+
+	// applyBatteryMode: no boost keeps the pack available to MinSoc (target 0)
+	site := newSite()
+	assert.NoError(t, site.applyBatteryMode(api.BatteryNormal, false))
+	assert.Zero(t, ctrl.soc, "no boost -> reserve stays at MinSoc")
+
+	// applyBatteryMode: boost pins the reserve to the plan's target SoC
+	assert.NoError(t, site.applyBatteryMode(api.BatteryNormal, true))
+	assert.Equal(t, 55.0, ctrl.soc, "boost -> reserve pinned to plan target")
+
+	// updateBatteryMode: a boost starting while already in normal pins the reserve
+	// without a mode change, and records the slot
+	site = newSite()
+	site.loadpoints = []*Loadpoint{{optimizerChargeSource: sourceBattery}}
+	site.updateBatteryMode(false, api.Rate{})
+	assert.Equal(t, 55.0, ctrl.soc, "boost start pins the reserve in normal mode")
+	assert.False(t, site.batteryBoostSlot.IsZero(), "boost slot recorded")
+
+	// updateBatteryMode: the boost ending restores the MinSoc reserve and clears
+	// the slot, again without a mode change
+	site.loadpoints = []*Loadpoint{{optimizerChargeSource: sourceSurplus}}
+	site.updateBatteryMode(false, api.Rate{})
+	assert.Zero(t, ctrl.soc, "boost end restores the MinSoc reserve")
+	assert.True(t, site.batteryBoostSlot.IsZero(), "boost slot cleared")
+}

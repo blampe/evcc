@@ -74,12 +74,34 @@ func (site *Site) updateBatteryMode(batteryGridChargeActive bool, rate api.Rate)
 		batteryMode = site.batteryMode
 	}
 
+	// battery boost: while a car charges from the home battery, normal mode pins
+	// the pack's reserve to the plan's per-slot target SoC (see applyBatteryMode)
+	// so it stops there instead of draining to MinSoc. Re-apply the (unchanged)
+	// normal mode when the boost starts or the slot advances so the pin tracks the
+	// plan, and once when it ends to restore the MinSoc reserve.
+	boostActive := site.optimizerBatteryBoostActive()
+	site.RLock()
+	boostSlot := site.batteryBoostSlot
+	site.RUnlock()
+	if batteryMode == api.BatteryUnknown && site.batteryMode == api.BatteryNormal &&
+		((boostActive && !slot.Equal(boostSlot)) || (!boostActive && !boostSlot.IsZero())) {
+		batteryMode = site.batteryMode
+	}
+
 	// NOTE: applyBatteryMode is always called when charge mode is active to validate max soc
 	if modeChanged := batteryMode != api.BatteryUnknown; modeChanged || site.batteryMode == api.BatteryCharge {
-		if err := site.applyBatteryMode(batteryMode); err == nil {
+		if err := site.applyBatteryMode(batteryMode, boostActive); err == nil {
 			if batteryMode == api.BatteryDischarge || batteryMode == api.BatteryHoldCharge {
 				site.batterySpikeSlot = slot
 			}
+			// track the slot the boost reserve was pinned for (zero when not boosting)
+			newBoostSlot := time.Time{}
+			if boostActive {
+				newBoostSlot = slot
+			}
+			site.Lock()
+			site.batteryBoostSlot = newBoostSlot
+			site.Unlock()
 			if modeChanged {
 				site.SetBatteryMode(batteryMode)
 			}
@@ -87,6 +109,19 @@ func (site *Site) updateBatteryMode(batteryGridChargeActive bool, rate api.Rate)
 			site.log.ERROR.Println("battery mode:", err)
 		}
 	}
+}
+
+// optimizerBatteryBoostActive reports whether the optimizer is boosting a car
+// from the home battery this cycle (any loadpoint charging from source
+// "battery"). During a boost the pack's discharge reserve is pinned to the plan's
+// target SoC (in normal mode) so it stops there instead of draining to MinSoc.
+func (site *Site) optimizerBatteryBoostActive() bool {
+	for _, lp := range site.loadpoints {
+		if lp != nil && lp.optimizerChargeSource == sourceBattery {
+			return true
+		}
+	}
+	return false
 }
 
 // batteryBoostActive reports whether any loadpoint is boosting, i.e. draining
@@ -180,13 +215,15 @@ func (site *Site) batteryMaxSocReached(dev config.Device[api.Meter]) (bool, erro
 	return false, nil
 }
 
-// applyBatteryMode applies the mode to each battery
+// applyBatteryMode applies the mode to each battery. boost indicates the
+// optimizer is draining the pack into a car this cycle, which pins normal mode's
+// reserve to the plan's target SoC.
 //
 // api.BatteryCharge:
 //
 //	The current soc is validated against max soc.
 //	In case max soc is reached, hold mode is applied.
-func (site *Site) applyBatteryMode(mode api.BatteryMode) error {
+func (site *Site) applyBatteryMode(mode api.BatteryMode, boost bool) error {
 	fromToCharge := mode == api.BatteryCharge || mode == api.BatteryUnknown && site.batteryMode == api.BatteryCharge
 
 	for _, dev := range site.batteryMeters {
@@ -216,8 +253,13 @@ func (site *Site) applyBatteryMode(mode api.BatteryMode) error {
 			if ctrl, ok := api.Cap[api.BatteryModeController](meter); ok {
 				// target-aware controllers pin the reserve to the optimizer's
 				// planned SoC (e.g. stop a grid discharge at the target instead
-				// of draining to min soc)
-				err = ctrl.SetBatteryModeSoc(mode, site.optimizerBatteryTargetSoc(dev.Config().Name))
+				// of draining to min soc). Normal mode only pins during a boost;
+				// plain self-consumption keeps the pack available down to MinSoc.
+				target := site.optimizerBatteryTargetSoc(dev.Config().Name)
+				if mode == api.BatteryNormal && !boost {
+					target = 0
+				}
+				err = ctrl.SetBatteryModeSoc(mode, target)
 			} else {
 				err = batCtrl.SetBatteryMode(mode)
 			}

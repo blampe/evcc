@@ -120,6 +120,7 @@ type Site struct {
 	suggestions              map[string]types.Suggestion // Optimizer suggestions by device key
 	batterySchedules         map[string][]batterySlot    // per-battery optimizer mode plan, for front-running export transitions
 	batterySpikeSlot         time.Time                   // 15-min slot the export spike was last (re)written for
+	batteryBoostSlot         time.Time                   // 15-min slot the battery-boost reserve was last pinned for (zero = not boosting)
 	suggestionActions        map[string]string           // last notified actionable optimizer action by device key
 
 	optimizerMu      sync.Mutex // guards optimizer runs
@@ -362,10 +363,15 @@ func (site *Site) Boot(log *util.Logger, loadpoints []*Loadpoint, tariffs *tarif
 		site.collectors[ref] = me
 	}
 
-	// revert battery mode on shutdown
+	// revert battery mode on shutdown. Also restore the reserve after a battery
+	// boost: a boost runs in normal mode with the reserve pinned to the plan's
+	// target SoC, which batteryModeModified does not flag, so guard on it too.
 	shutdown.Register(func() {
-		if mode := site.GetBatteryMode(); batteryModeModified(mode) {
-			if err := site.applyBatteryMode(api.BatteryNormal); err != nil {
+		site.RLock()
+		boosted := !site.batteryBoostSlot.IsZero()
+		site.RUnlock()
+		if mode := site.GetBatteryMode(); batteryModeModified(mode) || boosted {
+			if err := site.applyBatteryMode(api.BatteryNormal, false); err != nil {
 				site.log.ERROR.Println("battery mode:", err)
 			}
 		}
