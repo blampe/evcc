@@ -139,11 +139,27 @@ const actionDischarge = "discharge"
 // charge sources classify where a loadpoint's charge comes from in the
 // optimizer's plan (see types.Suggestion.Source). A non-surplus source charges
 // the car at the requested power in PV mode instead of deferring to real-time
-// surplus.
+// surplus:
+//   - grid:    the slot imports (a grid-sourced fast charge)
+//   - battery: the home battery discharges to feed the car (no grid flow), so
+//     measured export surplus is ~0 and would otherwise starve the car
+//   - surplus: real-time PV export; PV mode tracks it directly
 const (
 	sourceSurplus = "surplus"
 	sourceGrid    = "grid"
+	sourceBattery = "battery"
 )
+
+// evChargeSource refines a car's charge source: a surplus charge where the home
+// battery is discharging (and nothing is exported) is actually battery-fed. PV
+// mode must then charge at the planned power instead of deferring to measured
+// export surplus, which won't reflect the battery's contribution.
+func evChargeSource(base string, batteryDischarging, gridExporting bool) string {
+	if base == sourceSurplus && batteryDischarging && !gridExporting {
+		return sourceBattery
+	}
+	return base
+}
 
 // evSuggestion notifies when the optimizer's advisory action for a device changes
 const evSuggestion = "suggestion"
@@ -851,6 +867,21 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 		lo.Min(req.TimeSeries.PN)*1000, lo.Max(req.TimeSeries.PN)*1000,
 		lo.Min(req.TimeSeries.PE)*1000, lo.Max(req.TimeSeries.PE)*1000)
 
+	// aggregate home-battery discharge in the current slot. If the pack is
+	// discharging while the car charges (and nothing is imported or exported), the
+	// car is being fed from the battery, not from real-time PV surplus - so PV
+	// mode must charge at the planned power instead of deferring to measured export.
+	var homeDischargeNow float64
+	for i, detail := range details {
+		if detail.Type != batteryTypeBattery {
+			continue
+		}
+		if d := res.Batteries[i].DischargingPower; len(d) > 0 {
+			homeDischargeNow += float64(d[0]) / slotHours
+		}
+	}
+	batteryDischarging := homeDischargeNow > suggestionThreshold
+
 	// first slot boundary; battery-mode plan slots are keyed by their end time so
 	// the control loop can front-run an export-mode transition near the boundary
 	// regardless of when the optimizer last ran.
@@ -882,6 +913,9 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 
 		// current-slot advisory, for the UI and notifications
 		if s := currentSlotSuggestion(detail, batRes, 0, gridImporting, gridExporting, noGridImport, slotHours); s.Action != "" {
+			if detail.Type == batteryTypeVehicle && s.Action == actionCharge {
+				s.Source = evChargeSource(s.Source, batteryDischarging, gridExporting)
+			}
 			suggestions[key] = s
 		}
 

@@ -196,27 +196,34 @@ func TestOptimizerLoadpointAction(t *testing.T) {
 		name        string
 		mode        api.ChargeMode
 		action      string
+		source      string  // optimizer charge source (surplus/grid/battery)
 		chargePower float64 // optimizer's requested charge power (W)
 		sitePower   float64 // surplus (<0) or deficit (>0)
 		expect      func(*api.MockCharger)
 	}{
 		// PV + stop: pause the car despite PV surplus (so it exports)
-		{"pv stop pauses despite surplus", api.ModePV, actionStop, 0, -2000, func(c *api.MockCharger) {
+		{"pv stop pauses despite surplus", api.ModePV, actionStop, "", 0, -2000, func(c *api.MockCharger) {
 			c.EXPECT().Enable(false).Return(nil)
 		}},
-		// PV + charge: never grid-charges. With surplus the car tracks it (6A offered
-		// + 4A of surplus = 10A), not a fast-charge to max; the requested kW is ignored.
-		{"pv charge tracks surplus", api.ModePV, actionCharge, 9600, -920, func(c *api.MockCharger) {
+		// PV + surplus charge: never grid-charges. With surplus the car tracks it (6A
+		// offered + 4A of surplus = 10A), not a fast-charge to max; the kW is ignored.
+		{"pv surplus charge tracks surplus", api.ModePV, actionCharge, sourceSurplus, 9600, -920, func(c *api.MockCharger) {
 			c.EXPECT().MaxCurrent(int64(10)).Return(nil)
 		}},
-		// PV + charge with a grid deficit: no surplus => disable like normal PV
-		// instead of importing from the grid.
-		{"pv charge does not import from grid", api.ModePV, actionCharge, 9600, 2000, func(c *api.MockCharger) {
+		// PV + surplus charge with a grid deficit: no surplus => disable like normal
+		// PV instead of importing from the grid.
+		{"pv surplus charge does not import from grid", api.ModePV, actionCharge, sourceSurplus, 9600, 2000, func(c *api.MockCharger) {
 			c.EXPECT().Enable(false).Return(nil)
+		}},
+		// PV + battery-sourced charge: the home battery feeds the car, so there is no
+		// measured surplus - honor the optimizer's requested power (2760W @ 1p = 12A)
+		// instead of deferring to surplus and stalling.
+		{"pv battery charge honors optimizer kW", api.ModePV, actionCharge, sourceBattery, 2760, 0, func(c *api.MockCharger) {
+			c.EXPECT().MaxCurrent(int64(12)).Return(nil)
 		}},
 		// MinPV + charge: outside pure PV, honor the optimizer's requested power
 		// (2760W @ 1p = 12A), grid-charging past the deficit — not a blind max.
-		{"minpv charge honors optimizer kW", api.ModeMinPV, actionCharge, 2760, 2000, func(c *api.MockCharger) {
+		{"minpv charge honors optimizer kW", api.ModeMinPV, actionCharge, "", 2760, 2000, func(c *api.MockCharger) {
 			c.EXPECT().MaxCurrent(int64(12)).Return(nil)
 		}},
 	} {
@@ -245,6 +252,7 @@ func TestOptimizerLoadpointAction(t *testing.T) {
 		lp.enabled = true
 		lp.offeredCurrent = minA
 		lp.optimizerAction = tc.action
+		lp.optimizerChargeSource = tc.source
 		lp.optimizerChargePower = tc.chargePower
 
 		charger.EXPECT().Status().Return(api.StatusC, nil)

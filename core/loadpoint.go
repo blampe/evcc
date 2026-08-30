@@ -2297,9 +2297,11 @@ func (lp *Loadpoint) Update(sitePower, batteryPower float64, consumption, feedin
 		// exported (or the battery is reserved) instead of self-consumed: PV → off,
 		// MinPV → min (the floor the mode allows). "charge" is mode- and
 		// source-dependent — a pure-PV surplus charge falls through to the surplus
-		// logic below so it tracks real-time PV (never grid); a grid-sourced charge
-		// ("grid") or any MinPV charge takes the optimizer's requested power, pulling
-		// from the grid as needed.
+		// logic below so it tracks real-time PV. A grid-sourced ("grid") or
+		// battery-sourced ("battery") charge, or any MinPV charge, takes the
+		// optimizer's requested power: grid pulls from the grid, battery draws the
+		// home battery down (its self-consumption mode covers the extra load) —
+		// neither shows up as measured export surplus, so it can't be tracked.
 		if lp.optimizerAction == actionStop {
 			lp.log.DEBUG.Println("optimizer: stop charging")
 			if mode == api.ModeMinPV {
@@ -2312,7 +2314,8 @@ func (lp *Loadpoint) Update(sitePower, batteryPower float64, consumption, feedin
 			break
 		}
 
-		if lp.optimizerAction == actionCharge && (mode == api.ModeMinPV || lp.optimizerChargeSource == sourceGrid) {
+		optimizerFastCharge := lp.optimizerChargeSource == sourceGrid || lp.optimizerChargeSource == sourceBattery
+		if lp.optimizerAction == actionCharge && (mode == api.ModeMinPV || optimizerFastCharge) {
 			current := lp.optimizerChargeCurrent()
 			lp.log.DEBUG.Printf("optimizer: charge %.0fW → %.3gA (%s)", lp.optimizerChargePower, current, lp.optimizerChargeSource)
 			err = lp.setLimit(current)

@@ -485,6 +485,16 @@ func TestApplyPlanGoal(t *testing.T) {
 	})
 }
 
+func TestEvChargeSource(t *testing.T) {
+	// a surplus charge is reclassified as battery-fed only when the pack is
+	// discharging and nothing is exported
+	assert.Equal(t, sourceBattery, evChargeSource(sourceSurplus, true, false), "pack discharging, no export -> battery")
+	assert.Equal(t, sourceSurplus, evChargeSource(sourceSurplus, false, false), "pack idle -> surplus")
+	assert.Equal(t, sourceSurplus, evChargeSource(sourceSurplus, true, true), "exporting -> real surplus, not battery")
+	// grid stays grid: an importing slot is never battery-fed
+	assert.Equal(t, sourceGrid, evChargeSource(sourceGrid, true, false), "grid source unchanged")
+}
+
 func TestEvChargeEnergyValue(t *testing.T) {
 	// pa is the home-battery leftover value (~cheapest grid price); the EV is
 	// valued at the average grid price, floored at pa.
