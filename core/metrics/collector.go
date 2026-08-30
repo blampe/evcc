@@ -16,8 +16,9 @@ const (
 	PV          = "pv"
 	Home        = "home" // meter and group (virtual measurement)
 	Loadpoint   = "loadpoint"
-	Meter       = "meter"    // additional meter (ext, monitoring only)
-	Consumer    = "consumer" // consumer meter (consumers list or aux)
+	Meter       = "meter"     // additional meter (ext, monitoring only)
+	Consumer    = "consumer"  // consumer meter (consumers list or aux)
+	Connected   = "connected" // loadpoint connection occupancy (minutes/slot)
 )
 
 type Collector struct {
@@ -173,6 +174,21 @@ func (c *Collector) SetSocTemp(value float64, isTemp bool) error {
 }
 
 func (c *Collector) EnergyProfile(from time.Time) (*[96]float64, error) {
+	return energyProfile(c.entity, from)
+}
+
+// AddConnected integrates the loadpoint's connection state into the current slot,
+// accumulating elapsed connected minutes since the last sample (0..15 per slot).
+func (c *Collector) AddConnected(connected bool) error {
+	return c.process(func() {
+		c.accu.AddConnected(connected)
+	})
+}
+
+// ConnectedProfile returns a per-time-of-day profile of connected minutes per
+// 15min slot (0..15), averaged over the range since from. It reuses the
+// unit-agnostic energy profile machinery, so the stored value is minutes here.
+func (c *Collector) ConnectedProfile(from time.Time) (*[96]float64, error) {
 	return energyProfile(c.entity, from)
 }
 

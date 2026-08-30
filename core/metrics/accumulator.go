@@ -143,3 +143,22 @@ func (m *Accumulator) AddPower(v float64) {
 		m.AddReturnEnergy(-since)
 	}
 }
+
+// AddConnected integrates connection time (in minutes) into the Energy field
+// based on the time since the last update. While connected, the elapsed minutes
+// are accumulated; while disconnected, nothing is added but the clock advances so
+// the disconnected interval is not later back-filled. The value is stored in the
+// unit-agnostic Energy field so the existing persist/profile machinery applies
+// unchanged, yielding connected-minutes per 15min slot (0..15).
+func (m *Accumulator) AddConnected(connected bool) {
+	defer func() { m.updated = m.clock.Now() }()
+
+	// first sample after boot has no elapsed baseline
+	if m.updated.IsZero() {
+		return
+	}
+
+	if connected {
+		m.Energy += m.clock.Since(m.updated).Minutes()
+	}
+}

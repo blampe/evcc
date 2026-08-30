@@ -570,6 +570,108 @@ func TestCollectorLastSlotEnergy(t *testing.T) {
 	require.False(t, ok)
 }
 
+// TestCollectorAddConnected verifies connected-minutes integration across a slot
+// boundary: a fully connected slot accumulates ~15 min, a partially connected
+// slot accumulates proportionally, and a disconnected slot accumulates 0. The
+// accumulator resets at each boundary just like energy.
+func TestCollectorAddConnected(t *testing.T) {
+	clk := clock.NewMock() // 1970-01-01 00:00:00 UTC, on a slot boundary
+
+	require.NoError(t, db.NewInstance("sqlite", ":memory:"))
+	require.NoError(t, SetupSchema())
+
+	col, err := NewCollector(Connected, "lp-1", "", WithClock(clk))
+	require.NoError(t, err)
+
+	// slot 00:00 fully connected, sampled every 5 min
+	require.NoError(t, col.AddConnected(true)) // 00:00, seeds baseline
+	require.Equal(t, 0.0, col.accu.Energy)
+	clk.Add(5 * time.Minute) // 00:05
+	require.NoError(t, col.AddConnected(true))
+	require.InDelta(t, 5.0, col.accu.Energy, 1e-10)
+	clk.Add(5 * time.Minute) // 00:10
+	require.NoError(t, col.AddConnected(true))
+	require.InDelta(t, 10.0, col.accu.Energy, 1e-10)
+
+	// cross into 00:15: slot 00:00 covered the whole 15 minutes connected
+	clk.Add(5 * time.Minute) // 00:15
+	require.NoError(t, col.AddConnected(true))
+	require.Equal(t, 0.0, col.accu.Energy, "accumulator reset at slot boundary")
+
+	// slot 00:15 connected only for its first 5 minutes, then disconnected.
+	// Each sample attributes the elapsed interval to the state reported now, so
+	// the 00:20 sample (true) counts 00:15->00:20 as connected and the later
+	// samples (false) count nothing.
+	clk.Add(5 * time.Minute) // 00:20
+	require.NoError(t, col.AddConnected(true))
+	require.InDelta(t, 5.0, col.accu.Energy, 1e-10)
+	clk.Add(5 * time.Minute) // 00:25
+	require.NoError(t, col.AddConnected(false))
+
+	// cross into 00:30: slot 00:15 accumulated only ~5 connected-minutes
+	clk.Add(5 * time.Minute) // 00:30
+	require.NoError(t, col.AddConnected(false))
+	require.Equal(t, 0.0, col.accu.Energy)
+
+	// slot 00:30 disconnected the whole time
+	clk.Add(5 * time.Minute) // 00:35
+	require.NoError(t, col.AddConnected(false))
+	clk.Add(5 * time.Minute) // 00:40
+	require.NoError(t, col.AddConnected(false))
+
+	// cross into 00:45: persist slot 00:30 (0 connected-minutes)
+	clk.Add(5 * time.Minute) // 00:45
+	require.NoError(t, col.AddConnected(false))
+
+	// verify persisted per-slot values
+	var full meter
+	require.NoError(t, db.Instance.Where("meter = ? AND ts = ?", col.entity.Id, 0).First(&full).Error)
+	require.InDelta(t, 15.0, full.Energy, 1e-10, "fully connected slot -> 15 minutes")
+
+	var partial meter
+	require.NoError(t, db.Instance.Where("meter = ? AND ts = ?", col.entity.Id, 15*60).First(&partial).Error)
+	require.InDelta(t, 5.0, partial.Energy, 1e-10, "partially connected slot -> 5 minutes")
+
+	var empty meter
+	require.NoError(t, db.Instance.Where("meter = ? AND ts = ?", col.entity.Id, 30*60).First(&empty).Error)
+	require.Equal(t, 0.0, empty.Energy, "disconnected slot -> 0 minutes")
+}
+
+// TestCollectorConnectedProfile verifies that persisted connected-minutes slots
+// are read back per time-of-day via ConnectedProfile (which reuses the energy
+// profile machinery, so the values are minutes here).
+func TestCollectorConnectedProfile(t *testing.T) {
+	clk := clock.NewMock()
+
+	// adjust for 00:00 in local timezone
+	_, o := clk.Now().Zone()
+	clk.Add(-time.Duration(o) * time.Second)
+
+	require.NoError(t, db.NewInstance("sqlite", ":memory:"))
+	require.NoError(t, SetupSchema())
+
+	entity := entity{Id: 2, Name: "lp-1", Group: Connected}
+	require.NoError(t, db.Instance.Create(&entity).Error)
+
+	col := &Collector{entity: entity, accu: NewAccumulator(WithClock(clk))}
+
+	// one full day of connected-minutes: slot i holds i%16 minutes
+	for i := range 96 {
+		require.NoError(t, persist(entity, clk.Now(), float64(i%16), 0, nil, false))
+		clk.Add(15 * time.Minute)
+	}
+
+	from := clk.Now().Local().AddDate(0, 0, -1)
+	prof, err := col.ConnectedProfile(from)
+	require.NoError(t, err)
+
+	var expected [96]float64
+	for i := range expected {
+		expected[i] = float64(i % 16)
+	}
+	require.Equal(t, expected, *prof)
+}
+
 func TestCollectorSetEnergy(t *testing.T) {
 	clk := clock.NewMock()
 

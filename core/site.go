@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -172,6 +173,12 @@ func activeMeters(refs []string) ([]config.Device[api.Meter], error) {
 	return res, nil
 }
 
+// connectedKey returns the collectors-map key for a loadpoint's connection
+// occupancy collector, keyed by the loadpoint's stable index.
+func connectedKey(id int) string {
+	return metrics.Connected + "-lp-" + strconv.Itoa(id+1)
+}
+
 func (site *Site) Boot(log *util.Logger, loadpoints []*Loadpoint, tariffs *tariff.Tariffs) error {
 	site.loadpoints = loadpoints
 	site.tariffs = tariffs
@@ -188,6 +195,22 @@ func (site *Site) Boot(log *util.Logger, loadpoints []*Loadpoint, tariffs *tarif
 		return err
 	}
 	site.collectors[metrics.Home] = me
+
+	// per-loadpoint connection occupancy collectors: record how many minutes of
+	// each 15min slot the car was connected, building a per-time-of-day profile
+	// that later hints the optimizer when the car can actually be charged. Keyed
+	// by stable loadpoint index so collectors survive across restarts.
+	for id, lp := range site.loadpoints {
+		if lp == nil {
+			continue
+		}
+		name := "lp-" + strconv.Itoa(id+1)
+		cc, err := metrics.NewCollector(metrics.Connected, name, lp.GetTitle())
+		if err != nil {
+			return err
+		}
+		site.collectors[connectedKey(id)] = cc
+	}
 
 	// reload history in the UI on each persisted 15min slot instead of polling
 	metrics.OnPersist = func(slot time.Time) { site.publish(keys.HistoryUpdated, slot) }
@@ -1181,6 +1204,20 @@ func (site *Site) update(lp updater) {
 
 	// update loadpoints
 	totalChargePower := site.updateLoadpoints(consumption)
+
+	// sample every loadpoint's connection state each cycle (not just the one
+	// being updated), so occupancy is integrated continuously into a per-time-of-day
+	// profile of when the car is actually plugged in
+	for id, lp := range site.loadpoints {
+		if lp == nil {
+			continue
+		}
+		if c, ok := site.collectors[connectedKey(id)]; ok {
+			if err := c.AddConnected(lp.connected()); err != nil {
+				site.log.ERROR.Printf("persist connection occupancy: %v", err)
+			}
+		}
+	}
 
 	// update all circuits' power and currents
 	if site.circuit != nil {
