@@ -741,8 +741,16 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 		batteries = append(batteries, optimizerBattery{cfg, detail})
 	}
 
+	// EV energy is valued higher than home-battery leftovers so a plugged-in car
+	// is a worthwhile place to put energy even with no plan set (see
+	// evChargeEnergyValue).
+	evPA := evChargeEnergyValue(req.TimeSeries.PN, pa)
+
 	for _, b := range batteries {
 		b.cfg.PA = pa
+		if b.detail.Type == batteryTypeVehicle {
+			b.cfg.PA = evPA
+		}
 		req.Batteries = append(req.Batteries, b.cfg)
 		details.BatteryDetails = append(details.BatteryDetails, b.detail)
 	}
@@ -1155,6 +1163,28 @@ func (site *Site) optimizerChargeFirst() bool {
 	return site.GetOptimizerChargingStrategy() == string(optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport)
 }
 
+// evChargeEnergyValue is the end-of-horizon value (per Wh) placed on energy
+// stored in the EV. Home-battery leftover energy is valued at pa (~the cheapest
+// grid price); the EV is valued at roughly the average grid price, floored at pa,
+// so that even with no departure plan the optimizer treats a plugged-in car as a
+// worthwhile place to put energy:
+//
+//   - above pa → genuine home-battery surplus is boosted into the car instead of
+//     ending the horizon unused ("optimized battery boost")
+//   - at/below the grid price (and the round-trip charge loss adds margin) → the
+//     car fills from PV surplus and the cheaper grid hours, but is never force-
+//     filled to its ceiling off expensive grid; a real plan's hard SGoal does that
+//
+// This replaces the blunt no-plan "fill to the ceiling" fallback goal that
+// applyPlanGoal used to add. The average is the tuning dial: a fraction below 1
+// makes the car more conservative about grid, above 1 more eager.
+func evChargeEnergyValue(pn []float32, pa float32) float32 {
+	if len(pn) == 0 {
+		return pa
+	}
+	return max(pa, lo.Sum(pn)/float32(len(pn)))
+}
+
 func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measurement, grid api.Rates, minLen int, firstSlotDuration time.Duration) (optimizer.BatteryConfig, batteryDetail) {
 	bat := optimizer.BatteryConfig{
 		CMax:      batteryPower,
@@ -1471,49 +1501,40 @@ func scaleAndPrune(rates api.Rates, scale float64, maxLen int) []float32 {
 	return res
 }
 
+// applyPlanGoal sets the optimizer charge goal (SGoal) from the loadpoint's
+// departure plan. Only a real in-horizon plan goal is applied - a hard target the
+// optimizer will pay grid or drain the home battery to reach. With no plan, no
+// goal is set: the car is instead pulled by its elevated end-of-horizon energy
+// value (see evChargeEnergyValue), so a plugged-in car soaks PV surplus and cheap
+// energy without ever being force-filled to its ceiling off expensive grid.
 func (site *Site) applyPlanGoal(lp loadpoint.API, bat *optimizer.BatteryConfig, minLen int) {
 	goal, socBased := lp.GetPlanGoal()
-
-	if goal > 0 {
-		// Convert to Wh
-		if vehicle := lp.GetVehicle(); socBased && vehicle != nil {
-			goal *= vehicle.Capacity() * 10
-		} else {
-			goal *= 1000 // Wh
-		}
-
-		if ts := lp.EffectivePlanTime(); !ts.IsZero() {
-			// TODO precise slot placement
-			slot := int(time.Until(ts) / tariff.SlotDuration)
-			if slot >= 0 && slot < minLen {
-				// a real in-horizon plan goal: honor it exactly, no horizon-end fallback
-				bat.SGoal = make([]float32, minLen)
-				bat.SGoal[slot] = float32(goal)
-				bat.SMax = max(bat.SMax, float32(goal))
-				return
-			}
-			site.log.DEBUG.Printf("plan beyond forecast range or overrun: %.1f at %v slot %d", goal, ts.Round(time.Minute), slot)
-		}
-	}
-
-	// No in-horizon plan goal was set (no goal, no plan time, or the deadline
-	// falls outside [0, minLen)). Fall back to a goal at the vehicle's effective
-	// ceiling on the last slot of the horizon so a connected EV is a real
-	// in-horizon energy sink: battery surplus is routed into the car instead of
-	// being dumped to grid at a low price, rather than the optimizer treating the
-	// car as having zero demand.
-	//
-	// The ceiling is bat.SMax, already set by loadpointRequest to the configured
-	// limit SoC (or the session energy limit, or 100% capacity when no limit is
-	// set). It is in the request's state frame - absolute soc, or charged session
-	// energy when soc is unavailable - so the goal is frame-consistent and never
-	// exceeds, hence never overrides, the user's limit. Nothing to target if there
-	// is no vehicle (EV-only fallback) or no ceiling.
-	if lp.GetVehicle() == nil || bat.SMax <= 0 {
+	if goal <= 0 {
 		return
 	}
+
+	// Convert to Wh
+	if vehicle := lp.GetVehicle(); socBased && vehicle != nil {
+		goal *= vehicle.Capacity() * 10
+	} else {
+		goal *= 1000 // Wh
+	}
+
+	ts := lp.EffectivePlanTime()
+	if ts.IsZero() {
+		return
+	}
+
+	// TODO precise slot placement
+	slot := int(time.Until(ts) / tariff.SlotDuration)
+	if slot < 0 || slot >= minLen {
+		site.log.DEBUG.Printf("plan beyond forecast range or overrun: %.1f at %v slot %d", goal, ts.Round(time.Minute), slot)
+		return
+	}
+
 	bat.SGoal = make([]float32, minLen)
-	bat.SGoal[minLen-1] = bat.SMax
+	bat.SGoal[slot] = float32(goal)
+	bat.SMax = max(bat.SMax, float32(goal))
 }
 
 // TODO remove once smart cost limit usage becomes obsolete

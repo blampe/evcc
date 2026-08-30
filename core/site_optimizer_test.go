@@ -356,8 +356,7 @@ func TestLoadpointRequestChargeGoal(t *testing.T) {
 		limitEnergy, charged  float64 // kWh, Wh
 		wantInitial, wantSMax float32 // Wh
 	}{
-		// soc limit: no plan goal, so the fallback targets the 80% limit ceiling
-		// (40 kWh) at the horizon end without raising SMax past the user's limit
+		// soc limit: SMax reflects the 80% limit (40 kWh); no plan goal is applied
 		{"soc limit", 50, 20, 80, 0, 0, 10000, 40000},
 		{"no capacity, energy limit", 0, 0, 100, 10, 0, 0, 10000},
 		{"no capacity, energy limit partially charged", 0, 0, 100, 10, 4000, 4000, 10000},
@@ -395,11 +394,10 @@ func TestLoadpointRequestChargeGoal(t *testing.T) {
 	}
 }
 
-// TestApplyPlanGoal covers the fallback that makes a connected EV a real
-// in-horizon energy sink: when no in-horizon plan goal is set, a 100% capacity
-// goal is placed at the last slot of the horizon so battery surplus is routed to
-// the car instead of being dumped to grid. A real in-horizon plan goal keeps its
-// exact slot placement with no horizon-end goal added.
+// TestApplyPlanGoal covers the charge goal: only a real in-horizon plan goal is
+// applied (a hard target at its own slot). With no plan - or a deadline outside
+// the horizon - no goal is set; the car is pulled by its elevated energy value
+// instead (see evChargeEnergyValue), never a forced horizon-end ceiling.
 func TestApplyPlanGoal(t *testing.T) {
 	site := &Site{log: util.NewLogger("foo")}
 	const minLen = 8
@@ -418,20 +416,15 @@ func TestApplyPlanGoal(t *testing.T) {
 		return lp, v
 	}
 
-	t.Run("no plan goal -> effective ceiling (limit SoC) at end of horizon", func(t *testing.T) {
+	t.Run("no plan goal -> no goal (pulled by energy value instead)", func(t *testing.T) {
 		lp, _ := newLp(t)
 		lp.EXPECT().GetPlanGoal().Return(0.0, false).AnyTimes()
 
-		// SMax reflects the configured 80% limit (loadpointRequest sets it before applyPlanGoal)
 		bat := &optimizer.BatteryConfig{SMax: 40000}
 		site.applyPlanGoal(lp, bat, minLen)
 
-		require.Len(t, bat.SGoal, minLen)
-		assert.Equal(t, float32(40000), bat.SGoal[minLen-1], "targets the limit-SoC ceiling, not 100% capacity")
-		for i := range minLen - 1 {
-			assert.Zero(t, bat.SGoal[i], "no goal before the horizon end")
-		}
-		assert.Equal(t, float32(40000), bat.SMax, "SMax unchanged: goal equals the ceiling, never overrides the limit")
+		assert.Nil(t, bat.SGoal, "no forced horizon-end goal without a plan")
+		assert.Equal(t, float32(40000), bat.SMax, "SMax untouched")
 	})
 
 	t.Run("in-horizon plan goal -> real slot, no horizon-end goal", func(t *testing.T) {
@@ -449,7 +442,7 @@ func TestApplyPlanGoal(t *testing.T) {
 		assert.Equal(t, float32(40000), bat.SMax, "SMax bumped to the real goal")
 	})
 
-	t.Run("plan deadline beyond horizon -> effective ceiling at end of horizon", func(t *testing.T) {
+	t.Run("plan deadline beyond horizon -> no goal", func(t *testing.T) {
 		lp, _ := newLp(t)
 		// soc plan goal 80%, but due in 24h -> slot 96 >> minLen
 		lp.EXPECT().GetPlanGoal().Return(80.0, true).AnyTimes()
@@ -458,11 +451,7 @@ func TestApplyPlanGoal(t *testing.T) {
 		bat := &optimizer.BatteryConfig{SMax: 40000}
 		site.applyPlanGoal(lp, bat, minLen)
 
-		require.Len(t, bat.SGoal, minLen)
-		assert.Equal(t, float32(40000), bat.SGoal[minLen-1], "fallback to the ceiling at last slot")
-		for i := range minLen - 1 {
-			assert.Zero(t, bat.SGoal[i])
-		}
+		assert.Nil(t, bat.SGoal, "deadline outside the horizon adds no goal")
 		assert.Equal(t, float32(40000), bat.SMax)
 	})
 
@@ -479,7 +468,7 @@ func TestApplyPlanGoal(t *testing.T) {
 		assert.Equal(t, float32(40000), bat.SMax, "SMax untouched without a vehicle")
 	})
 
-	t.Run("energy limit without soc -> goal at session-energy ceiling", func(t *testing.T) {
+	t.Run("energy limit without soc, no plan -> no goal", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		v := api.NewMockVehicle(ctrl)
 		v.EXPECT().Capacity().Return(capacity).AnyTimes()
@@ -488,15 +477,21 @@ func TestApplyPlanGoal(t *testing.T) {
 		lp.EXPECT().GetVehicle().Return(v).AnyTimes()
 		lp.EXPECT().GetPlanGoal().Return(0.0, false).AnyTimes()
 
-		// charged-energy state model: SMax is the session energy limit, not an
-		// absolute SoC. Targeting SMax stays in-frame and never exceeds the limit.
 		bat := &optimizer.BatteryConfig{SMax: 10000}
 		site.applyPlanGoal(lp, bat, minLen)
 
-		require.Len(t, bat.SGoal, minLen)
-		assert.Equal(t, float32(10000), bat.SGoal[minLen-1], "targets the session-energy ceiling")
-		assert.Equal(t, float32(10000), bat.SMax, "user energy limit preserved, not exceeded")
+		assert.Nil(t, bat.SGoal, "no plan, no goal")
+		assert.Equal(t, float32(10000), bat.SMax, "user energy limit preserved")
 	})
+}
+
+func TestEvChargeEnergyValue(t *testing.T) {
+	// pa is the home-battery leftover value (~cheapest grid price); the EV is
+	// valued at the average grid price, floored at pa.
+	assert.Equal(t, float32(0.25), evChargeEnergyValue([]float32{0.2, 0.3}, 0.1), "average grid price when above pa")
+	assert.Greater(t, evChargeEnergyValue([]float32{0.2, 0.3}, 0.1), float32(0.1), "EV valued above the home battery -> boosting enabled")
+	assert.Equal(t, float32(0.1), evChargeEnergyValue([]float32{-0.1, 0.05}, 0.1), "floored at pa when the average dips below it")
+	assert.Equal(t, float32(0.1), evChargeEnergyValue(nil, 0.1), "pa when no prices")
 }
 
 func TestOptimizerChargingStrategy(t *testing.T) {
