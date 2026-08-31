@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -673,20 +672,14 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 		}
 	}
 
-	// no-grid-import cap (self-consumption): cap import at ~0 W and DON'T set
-	// PrcPExcImp. The service then applies its built-in per-Wh import-exceedance
-	// penalty (prc_e_grid_imp_pen ≈ 0.01 scaled ≈ 10/kWh, optimizer.py:89,273),
-	// far above any price — so on TRUE prices the optimizer covers the home from
-	// solar+battery (keeping the overnight reserve) and dumps only the surplus,
-	// instead of dumping the battery and reimporting. It's SOFT: if import is
-	// genuinely unavoidable it still imports (paying the penalty) and reports
-	// grid_import_limit_exceeded rather than going infeasible. Setting PrcPExcImp
-	// here would instead select the weak peak-power "demand rate" mode, so don't.
-	// Lift via OPTIMIZER_ALLOW_GRID_IMPORT=true (winter EV, or full export
-	// arbitrage during a price spike).
-	if allowGridImport, _ := strconv.ParseBool(os.Getenv("OPTIMIZER_ALLOW_GRID_IMPORT")); !allowGridImport {
-		req.Grid.PMaxImp = 1 // W (~0); omitempty needs non-zero, no PrcPExcImp = built-in per-Wh penalty
-	}
+	// self-consumption is no longer forced with a near-zero import cap. On true
+	// prices it falls out of cost minimization (covering the home from the battery
+	// beats importing whenever import > export), and the case a cap used to force -
+	// keeping enough battery for the home instead of dumping it at an export peak -
+	// is handled honestly by the load-aware backup reserve (ReserveForLoad on the
+	// home battery, see batteryRequest), which self-sizes to the load and solar
+	// forecast. Only a real physical import limit (the circuit cap above) sets
+	// PMaxImp now; ordinary home import is priced at the true grid price.
 
 	// static grid export limit configured in the UI: export is capped at this
 	// power, excess PV is curtailed instead of exported
@@ -856,10 +849,10 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 	gridImporting := gridImportAt(res, 0) > 0
 	gridExporting := len(res.GridExport) > 0 && res.GridExport[0] > 0
 
-	// self-consumption (no grid import) mirrors the request-side cap; it remaps a
-	// HOLD suggestion to normal (see currentSlotSuggestion)
-	allowGridImport, _ := strconv.ParseBool(os.Getenv("OPTIMIZER_ALLOW_GRID_IMPORT"))
-	noGridImport := !allowGridImport
+	// the near-zero import cap is gone (self-consumption comes from economics + the
+	// load-aware reserve, see optimizerRequest), so there is no no-import mode to
+	// mirror here: a HOLD suggestion is left as HOLD.
+	noGridImport := false
 
 	// export that exceeds solar in a slot must come from the battery (barely any
 	// from pass-through import): the direct "battery dumped to grid" signal. If
@@ -1244,6 +1237,11 @@ func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measureme
 		SCapacity: float32(*b.Capacity * 1e3),         // Wh
 		SInitial:  float32(*b.Capacity * *b.Soc * 10), // Wh
 		// PA:       pa,
+		// the home battery holds a load-aware backup reserve: enough to cover the
+		// home from now until PV catches up, self-sized from the load and solar
+		// forecast. This is what keeps it from dumping the home's overnight energy
+		// at an export peak, now that the near-zero import cap is gone.
+		ReserveForLoad: true,
 	}
 
 	instance := dev.Instance()
@@ -1251,11 +1249,10 @@ func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measureme
 	controllable := api.HasCap[api.BatteryController](instance)
 	if controllable {
 		// Full grid flexibility: the PW3 may charge from and discharge to grid.
-		// The no-grid-import cap (see optimizerRequest) is what keeps enough battery
+		// The load-aware reserve (ReserveForLoad above) is what keeps enough battery
 		// for the home, so with DischargeToGrid on the optimizer dumps only the
-		// SURPLUS at the export peak — dumping the reserve would force a penalized
-		// reimport, so it won't. Lift the cap (OPTIMIZER_ALLOW_GRID_IMPORT) for
-		// full dump-and-reimport arbitrage during an export-price spike.
+		// SURPLUS above that reserve at an export peak; the energy the home will need
+		// before PV catches up is held back, not dumped-and-reimported.
 		bat.ChargeFromGrid = true
 		bat.DischargeToGrid = true
 	}
