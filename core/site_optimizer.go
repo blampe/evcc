@@ -830,12 +830,30 @@ func (site *Site) optimizerUpdate(battery []types.Measurement) error {
 	return nil
 }
 
+// gridImportAt returns the total grid import at slot j in Wh: the regular
+// grid_import plus grid_import_overshoot. When a grid import limit (Grid.PMaxImp)
+// is set and the schedule has to exceed it, the optimizer books the excess into
+// grid_import_overshoot instead of grid_import. Reading grid_import alone then
+// under-reads the actual import - reporting "not importing" while the home is in
+// fact drawing from the grid - which mis-drives the battery suggestion and
+// understates the planned grid flow.
+func gridImportAt(res optimizer.OptimizationResult, j int) float32 {
+	var v float32
+	if j < len(res.GridImport) {
+		v = res.GridImport[j]
+	}
+	if j < len(res.GridImportOvershoot) {
+		v += res.GridImportOvershoot[j]
+	}
+	return v
+}
+
 // applyOptimizerResult maps the optimizer response onto suggestions, battery
 // forecast and notifications
 func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details []batteryDetail, res optimizer.OptimizationResult) {
 	dt := req.TimeSeries.Dt
 	slotHours := (time.Duration(dt[0]) * time.Second).Hours()
-	gridImporting := len(res.GridImport) > 0 && res.GridImport[0] > 0
+	gridImporting := gridImportAt(res, 0) > 0
 	gridExporting := len(res.GridExport) > 0 && res.GridExport[0] > 0
 
 	// self-consumption (no grid import) mirrors the request-side cap; it remaps a
@@ -858,7 +876,7 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 	site.log.DEBUG.Printf("optimizer grid: slot=%d solar=%.0fWh load=%.0fWh import=%.0fWh export=%.0fWh battToGrid=%.0fWh",
 		len(req.TimeSeries.Gt),
 		lo.Sum(req.TimeSeries.Ft), lo.Sum(req.TimeSeries.Gt),
-		lo.Sum(res.GridImport), lo.Sum(res.GridExport), battToGrid)
+		lo.Sum(res.GridImport)+lo.Sum(res.GridImportOvershoot), lo.Sum(res.GridExport), battToGrid)
 
 	// raw prices the optimizer sees (undo the internal ×0.001 scaling). If export
 	// (PE) shows near the import (PN) range, the feed-in tariff is misconfigured —
@@ -958,7 +976,7 @@ func batteryModePlan(detail batteryDetail, batReq optimizer.BatteryConfig, batRe
 	n := min(len(batRes.ChargingPower), len(dt), frontRunScheduleSlots)
 	plan := make([]batterySlot, 0, n)
 	for j := 0; j < n; j++ {
-		importing := len(res.GridImport) > j && res.GridImport[j] > 0
+		importing := gridImportAt(res, j) > 0
 		exporting := len(res.GridExport) > j && res.GridExport[j] > 0
 		slotHours := (time.Duration(dt[j]) * time.Second).Hours()
 		action := currentSlotSuggestion(detail, batRes, j, importing, exporting, noGridImport, slotHours).Action

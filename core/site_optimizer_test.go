@@ -810,6 +810,52 @@ func TestBatteryModePlanSoc(t *testing.T) {
 	assert.InDelta(t, 40.0, plan[1].soc, 1e-6)
 }
 
+// TestGridImportAt sums the regular grid import and the overshoot. When a grid
+// import limit is set and exceeded, the optimizer books the excess into the
+// overshoot field instead of grid_import, which then reads ~0.
+func TestGridImportAt(t *testing.T) {
+	res := optimizer.OptimizationResult{
+		GridImport:          []float32{0, 5, 0},
+		GridImportOvershoot: []float32{100, 0, 0},
+	}
+	assert.Equal(t, float32(100), gridImportAt(res, 0), "import booked entirely in overshoot")
+	assert.Equal(t, float32(5), gridImportAt(res, 1), "regular import")
+	assert.Zero(t, gridImportAt(res, 2), "neither field imports")
+	assert.Zero(t, gridImportAt(res, 9), "slot out of range")
+
+	// overshoot may be absent or shorter than grid_import
+	res2 := optimizer.OptimizationResult{GridImport: []float32{7, 8}}
+	assert.Equal(t, float32(8), gridImportAt(res2, 1))
+}
+
+// TestBatteryModePlanImportOvershoot verifies that import booked entirely into
+// the overshoot field (a grid import limit exceeded) is still recognised as
+// importing: an idle pack while importing must HOLD, not read as idle-balanced
+// "normal".
+func TestBatteryModePlanImportOvershoot(t *testing.T) {
+	now := time.Now()
+	firstBoundary := now.Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+	dt := []int{900}
+
+	req := optimizer.BatteryConfig{SCapacity: 13500}
+	batRes := optimizer.BatteryResult{
+		ChargingPower:    []float32{0},
+		DischargingPower: []float32{0},
+		StateOfCharge:    []float32{6750},
+	}
+	// grid_import ~0, the real import sits in the overshoot field
+	res := optimizer.OptimizationResult{
+		GridImport:          []float32{0},
+		GridImportOvershoot: []float32{2000},
+	}
+
+	// noGridImport=false isolates the importing signal (hold is not remapped to
+	// normal); an idle pack while importing holds
+	plan := batteryModePlan(batteryDetail{Type: batteryTypeBattery}, req, batRes, res, dt, firstBoundary, false)
+	require.Len(t, plan, 1)
+	assert.Equal(t, "hold", plan[0].action)
+}
+
 // TestOptimizerBatteryTargetSoc resolves the current plan slot's planned SoC,
 // including front-running the export transition to the next slot's SoC.
 func TestOptimizerBatteryTargetSoc(t *testing.T) {
