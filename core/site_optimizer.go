@@ -1395,39 +1395,68 @@ func unmodelledPower(lp loadpoint.API) float64 {
 	return max(0, power)
 }
 
-// homeProfile returns the home base load in Wh
-func (site *Site) homeProfile(minLen int) ([]float64, error) {
-	// kWh over last 30 days
-	profile, err := site.collectors[metrics.Home].EnergyProfile(now.BeginningOfDay().AddDate(0, 0, -30))
+// forecastDays is the history window fed to the hybrid forecast: long enough to
+// resolve multi-week cycles, capped so the daily refit stays inexpensive.
+const forecastDays = 90
+
+type forecastEntry struct {
+	forecast *metrics.HybridForecast
+	day      time.Time
+}
+
+// cachedForecast returns the hybrid forecast for a collector, refitting at most once
+// per calendar day. The detected periodicities are stable over a day and the fit is
+// the only expensive step (~seconds) while evaluation is cheap. It runs under
+// optimizerMu, so the cache needs no further locking.
+func (site *Site) cachedForecast(ref string) (*metrics.HybridForecast, error) {
+	c, ok := site.collectors[ref]
+	if !ok {
+		return nil, fmt.Errorf("no collector %q", ref)
+	}
+
+	day := now.BeginningOfDay()
+	if e, ok := site.forecasts[ref]; ok && e.day.Equal(day) {
+		return e.forecast, nil
+	}
+
+	f, err := c.Forecast(day.AddDate(0, 0, -forecastDays))
 	if err != nil {
 		return nil, err
 	}
 
-	// max 4 days
-	slots := make([]float64, 0, minLen+1)
-	for len(slots) <= minLen+24*4 { // allow for prorating first day
-		slots = append(slots, profile[:]...)
-	}
-
-	res := profileSlotsFromNow(slots)
-	if len(res) < minLen {
-		return nil, fmt.Errorf("minimum home profile length %d is less than required %d", len(res), minLen)
-	}
-	if len(res) > minLen {
-		res = res[:minLen]
-	}
-
-	// convert to Wh
-	return lo.Map(res, func(v float64, i int) float64 {
-		return v * 1e3
-	}), nil
+	site.forecasts[ref] = forecastEntry{forecast: f, day: day}
+	return f, nil
 }
 
-// profileSlotsFromNow strips away any slots before "now".
-// The profile contains 48 15min slots (00:00-23:45) that repeat for multiple days.
-func profileSlotsFromNow(profile []float64) []float64 {
-	firstSlot := int(time.Now().Truncate(tariff.SlotDuration).Sub(now.BeginningOfDay()) / tariff.SlotDuration)
-	return profile[firstSlot:]
+// forecastSlots evaluates a collector's hybrid forecast for the next minLen 15min
+// slots, aligned to the current slot as the optimizer request expects.
+func (site *Site) forecastSlots(ref string, minLen int) ([]float64, error) {
+	f, err := site.cachedForecast(ref)
+	if err != nil {
+		return nil, err
+	}
+
+	base := time.Now().Truncate(tariff.SlotDuration)
+	res := make([]float64, minLen)
+	for i := range res {
+		res[i] = f.At(base.Add(time.Duration(i) * tariff.SlotDuration))
+	}
+	return res, nil
+}
+
+// homeProfile returns the predicted home base load in Wh for the next minLen slots,
+// from the hybrid forecast (civil-time daily seasonal plus multi-day harmonic residual).
+func (site *Site) homeProfile(minLen int) ([]float64, error) {
+	res, err := site.forecastSlots(metrics.Home, minLen)
+	if err != nil {
+		return nil, err
+	}
+
+	// kWh -> Wh, floored at 0 (a low slot's residual can dip the prediction negative)
+	for i, v := range res {
+		res[i] = max(0, v*1e3)
+	}
+	return res, nil
 }
 
 // vehicleAvailability returns a per-slot charge-power cap in W for the vehicle,
@@ -1479,31 +1508,20 @@ func vehicleAvailabilitySlots(connected bool, profile []float64, realCMax float3
 	return res
 }
 
-// connectedProfile returns the recorded per-slot connected minutes (0..15)
-// aligned to now, from the last 30 days, or nil when the collector is missing or
-// the history is incomplete. Mirrors homeProfile but keeps the value in minutes.
+// connectedProfile returns the predicted connected minutes (0..15) for the next
+// minLen slots from the hybrid forecast, or nil when the collector is missing or
+// lacks enough history. Mirrors homeProfile but keeps the value in minutes.
 func (site *Site) connectedProfile(id, minLen int) []float64 {
-	c, ok := site.collectors[connectedKey(id)]
-	if !ok {
-		return nil
-	}
-
-	profile, err := c.ConnectedProfile(now.BeginningOfDay().AddDate(0, 0, -30))
+	res, err := site.forecastSlots(connectedKey(id), minLen)
 	if err != nil {
 		return nil
 	}
 
-	// max 4 days of the repeated daily pattern (mirrors homeProfile)
-	slots := make([]float64, 0, minLen+1)
-	for len(slots) <= minLen+24*4 {
-		slots = append(slots, profile[:]...)
+	// clamp to a slot's 0..15 connected minutes
+	for i, v := range res {
+		res[i] = min(max(v, 0), tariff.SlotDuration.Minutes())
 	}
-
-	res := profileSlotsFromNow(slots)
-	if len(res) < minLen {
-		return nil
-	}
-	return res[:minLen]
+	return res
 }
 
 // measuredSlotEnergy returns the summed energy in Wh of the last completed
