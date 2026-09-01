@@ -3,6 +3,7 @@
 package metrics
 
 import (
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -160,6 +161,139 @@ func TestRealDataConnectedForecast(t *testing.T) {
 }
 
 const forecastWindowDays = 90
+
+// weightedSeasonal computes a per-time-of-day average over the first nTrain samples,
+// weighting each day by exp(-ln2 * ageDays / halflife) so recent days count more. A
+// halflife <= 0 means a flat average (every day weighted equally), i.e. today's code.
+func weightedSeasonal(series []float64, start time.Time, nTrain int, halflife float64) [96]float64 {
+	var wsum, wtot [96]float64
+	last := float64(nTrain - 1)
+	for i := range nTrain {
+		k := todIndex(start.Add(time.Duration(i) * tariff.SlotDuration))
+		w := 1.0
+		if halflife > 0 {
+			w = math.Exp(-math.Ln2 * (last - float64(i)) / 96.0 / halflife)
+		}
+		wsum[k] += w * series[i]
+		wtot[k] += w
+	}
+	var s [96]float64
+	for k := range s {
+		if wtot[k] > 0 {
+			s[k] = wsum[k] / wtot[k]
+		}
+	}
+	return s
+}
+
+// TestRealDataRecencyWeighting sweeps exponential half-lives for the home-load daily
+// seasonal and reports 7-day-holdout RMSE, seasonal-only and full hybrid, against the
+// flat average (today's behavior). It answers whether recency weighting helps.
+func TestRealDataRecencyWeighting(t *testing.T) {
+	realDB(t)
+
+	var e entity
+	require.NoError(t, db.Instance.Where(`"group" = ?`, Home).First(&e).Error)
+
+	start, series, err := meterSeries(e, time.Now().AddDate(0, 0, -forecastWindowDays))
+	require.NoError(t, err)
+	n := len(series)
+	const hold = 7 * 96
+	require.Greater(t, n, hold+14*96, "need enough history for a 7-day holdout")
+	nTrain := n - hold
+
+	rmse := func(pred func(i int, ts time.Time) float64) float64 {
+		var se float64
+		for i := nTrain; i < n; i++ {
+			d := pred(i, start.Add(time.Duration(i)*tariff.SlotDuration)) - series[i]
+			se += d * d
+		}
+		return math.Sqrt(se / hold)
+	}
+
+	t.Logf("home-load 7-day holdout RMSE by seasonal half-life (%.0f days history):", float64(n)/96)
+	t.Logf("  %-12s %-12s %-12s", "half-life", "seasonal", "hybrid")
+	for _, hl := range []float64{0, 45, 30, 21, 14, 7} { // 0 = flat (current)
+		seasonal := weightedSeasonal(series, start, nTrain, hl)
+
+		resid := make([]float64, nTrain)
+		for i := range nTrain {
+			k := todIndex(start.Add(time.Duration(i) * tariff.SlotDuration))
+			resid[i] = series[i] - seasonal[k]
+		}
+		mr := harmonic.Fit(start, tariff.SlotDuration, resid, harmonic.Options{Validate: 0.2})
+
+		seaRMSE := rmse(func(i int, ts time.Time) float64 { return seasonal[todIndex(ts)] })
+		hybRMSE := rmse(func(i int, ts time.Time) float64 { return seasonal[todIndex(ts)] + mr.At(ts) })
+		label := "flat"
+		if hl > 0 {
+			label = fmt.Sprintf("%.0fd", hl)
+		}
+		t.Logf("  %-12s %-12.4f %-12.4f", label, seaRMSE, hybRMSE)
+	}
+}
+
+// synthConn builds a connection series (connected minutes/slot, 0..15): the car is
+// gone leaveHour:00-17:00 every day, connected otherwise. Days on/after changeDay
+// leave at newLeaveHour instead - a departure that shifts earlier partway through.
+func synthConn(start time.Time, days, leaveHour, changeDay, newLeaveHour int) []float64 {
+	y := make([]float64, days*96)
+	for i := range y {
+		ts := start.Add(time.Duration(i) * tariff.SlotDuration)
+		leave := leaveHour
+		if i/96 >= changeDay {
+			leave = newLeaveHour
+		}
+		mod := ts.Hour()*60 + ts.Minute()
+		if mod >= leave*60 && mod < 17*60 {
+			y[i] = 0 // gone
+		} else {
+			y[i] = 15 // home
+		}
+	}
+	return y
+}
+
+// TestSyntheticRecencyAdaptation is the adaptation benchmark: a daily departure that
+// shifts 08:00 -> 07:00 starting `elapsed` days ago. It reports the predicted
+// connected-minutes at the newly-vacated 07:00-08:00 window for each seasonal
+// half-life. Ground truth after the change is 0 (gone), and < 7.5 means the model now
+// predicts "gone" there - so lower/sooner is faster adaptation. This is what the
+// steady-state RMSE test could not show.
+func TestSyntheticRecencyAdaptation(t *testing.T) {
+	start := time.Date(2025, 1, 6, 0, 0, 0, 0, time.UTC) // arbitrary; DST-free
+	const histDays = 90
+	window := []int{28, 29, 30, 31} // 07:00,07:15,07:30,07:45
+
+	avgWindow := func(s [96]float64) float64 {
+		var sum float64
+		for _, k := range window {
+			sum += s[k]
+		}
+		return sum / float64(len(window))
+	}
+
+	halflives := []float64{0, 45, 30, 14, 7} // 0 = flat (current behavior)
+	hdr := "  days-since-change"
+	for _, hl := range halflives {
+		if hl == 0 {
+			hdr += fmt.Sprintf("  %8s", "flat")
+		} else {
+			hdr += fmt.Sprintf("  %7.0fd", hl)
+		}
+	}
+	t.Logf("predicted connected-min at the vacated 07:00-08:00 window (truth after change = 0;")
+	t.Logf("< 7.5 => model now predicts 'gone'; lower/sooner = faster adaptation):")
+	t.Log(hdr)
+	for _, elapsed := range []int{0, 7, 14, 21, 28, 45} {
+		hist := synthConn(start, histDays, 8, histDays-elapsed, 7)
+		row := fmt.Sprintf("  %17d", elapsed)
+		for _, hl := range halflives {
+			row += fmt.Sprintf("  %8.1f", avgWindow(weightedSeasonal(hist, start, len(hist), hl)))
+		}
+		t.Log(row)
+	}
+}
 
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
