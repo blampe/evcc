@@ -24,7 +24,11 @@ import (
 //
 // It copies the database to a temp file first, so the live database is never
 // written (NewInstance runs migrations).
-func TestRealDataHarmonic(t *testing.T) {
+
+// realDB copies the live evcc database (EVCC_DB or ~/.evcc/evcc.db) to a temp file
+// and points db.Instance at the copy, so tests never write the live database.
+func realDB(t *testing.T) {
+	t.Helper()
 	src := os.Getenv("EVCC_DB")
 	if src == "" {
 		home, _ := os.UserHomeDir()
@@ -33,10 +37,13 @@ func TestRealDataHarmonic(t *testing.T) {
 	if _, err := os.Stat(src); err != nil {
 		t.Skipf("no database at %s (set EVCC_DB)", src)
 	}
-
 	tmp := filepath.Join(t.TempDir(), "evcc.db")
 	require.NoError(t, copyFile(src, tmp))
 	require.NoError(t, db.NewInstance("sqlite", tmp))
+}
+
+func TestRealDataHarmonic(t *testing.T) {
+	realDB(t)
 
 	var e entity
 	require.NoError(t, db.Instance.Where(`"group" = ?`, Home).First(&e).Error)
@@ -122,6 +129,37 @@ func TestRealDataHarmonic(t *testing.T) {
 	t.Logf("  harmonic (CV)              = %.4f  (%.0f%%)", rmse(func(_ int, ts time.Time) float64 { return mCV.At(ts) }), 100*rmse(func(_ int, ts time.Time) float64 { return mCV.At(ts) })/base)
 	t.Logf("  hybrid = ToD + CV residual = %.4f  (%.0f%%)", rmse(func(i int, ts time.Time) float64 { return tod(i) + mr.At(ts) }), 100*rmse(func(i int, ts time.Time) float64 { return tod(i) + mr.At(ts) })/base)
 }
+
+// TestRealDataConnectedForecast demonstrates the EV connection forecast on the
+// backfilled connected data (M-F 07:15-17:00 disconnected, weekends connected). It
+// contrasts the time-of-day-average baseline - which blends weekday and weekend into
+// one useless midday value - against the hybrid, which should recover the weekday vs
+// weekend distinction at midday.
+func TestRealDataConnectedForecast(t *testing.T) {
+	realDB(t)
+
+	col, err := NewCollector(Connected, "lp-1", "Home")
+	require.NoError(t, err)
+
+	from := time.Now().AddDate(0, 0, -forecastWindowDays)
+	seasonal, err := energyProfile(col.entity, from)
+	require.NoError(t, err)
+	hf, err := col.Forecast(from)
+	require.NoError(t, err)
+
+	// predicted connected minutes at local noon for the next 8 days: the seasonal alone
+	// is flat (weekday/weekend blended), the hybrid should split ~0 on weekdays and ~15
+	// on weekends
+	n := time.Now()
+	noon := time.Date(n.Year(), n.Month(), n.Day(), 12, 0, 0, 0, time.Local)
+	t.Logf("predicted connected minutes at 12:00 (seasonal-only vs hybrid):")
+	for d := range 8 {
+		day := noon.AddDate(0, 0, d)
+		t.Logf("  %s: seasonal=%5.1f  hybrid=%5.1f", day.Format("Mon 01-02"), seasonal[todIndex(day)], hf.At(day))
+	}
+}
+
+const forecastWindowDays = 90
 
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)

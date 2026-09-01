@@ -212,7 +212,10 @@ func TestHarmonicCarLikeBeatsTimeOfDayAverage(t *testing.T) {
 	for i := range train {
 		resid[i] = train[i] - tod(i)
 	}
-	mr := Fit(harmonicStart, slot, resid, Options{MinPeriod: 36 * time.Hour, Validate: 0.2})
+	// no period floor: the residual is orthogonal to the pure daily harmonics (the
+	// seasonal removed them), so the fit picks up the daily-frequency sidebands that
+	// encode the weekend-differs-from-weekday intra-day shape
+	mr := Fit(harmonicStart, slot, resid, Options{Validate: 0.2})
 
 	var rmseBase, rmseHybrid float64
 	for i := n - hold; i < n; i++ {
@@ -228,5 +231,5 @@ func TestHarmonicCarLikeBeatsTimeOfDayAverage(t *testing.T) {
 		rmseBase, rmseHybrid, 100*rmseHybrid/rmseBase, mr.Periods())
 
 	assert.NotEmpty(t, mr.comps, "hybrid must discover the weekly/biweekly structure")
-	assert.Less(t, rmseHybrid, 0.9*rmseBase, "hybrid clearly beats the blended average")
+	assert.Less(t, rmseHybrid, 0.7*rmseBase, "hybrid clearly beats the blended average")
 }
