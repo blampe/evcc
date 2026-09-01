@@ -856,6 +856,72 @@ func TestBatteryModePlanImportOvershoot(t *testing.T) {
 	assert.Equal(t, "hold", plan[0].action)
 }
 
+// TestBatteryModePlanHoldWithinExport verifies that a HOLD slot opening onto an
+// export slot is relabeled to HoldCharge. Within an export peak the pack meets a
+// slot's discharge target early, so the slot's tail reads idle+import → HOLD;
+// left as HOLD it drops the Powerwall to backup mode and imports the house load
+// from the grid mid-peak. Relabeling keeps it in autonomous + sell spike.
+func TestBatteryModePlanHoldWithinExport(t *testing.T) {
+	now := time.Now()
+	firstBoundary := now.Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+	detail := batteryDetail{Type: batteryTypeBattery}
+	req := optimizer.BatteryConfig{SCapacity: 13500}
+
+	// [hold, discharge]: the current slot's lull opens onto the next export slot
+	// (the log's discharge → hold → discharge). The head HOLD is bridged.
+	t.Run("head lull before export", func(t *testing.T) {
+		batRes := optimizer.BatteryResult{
+			ChargingPower:    []float32{0, 0},
+			DischargingPower: []float32{0, 2000},
+			StateOfCharge:    []float32{6750, 6750},
+		}
+		res := optimizer.OptimizationResult{
+			GridImport: []float32{100, 0},
+			GridExport: []float32{0, 2000},
+		}
+		plan := batteryModePlan(detail, req, batRes, res, []int{900, 900}, firstBoundary, false)
+		require.Len(t, plan, 2)
+		assert.Equal(t, api.BatteryHoldCharge.String(), plan[0].action)
+		assert.Equal(t, actionDischarge, plan[1].action)
+	})
+
+	// [discharge, hold, discharge]: an interior lull sandwiched between exports.
+	t.Run("interior lull between exports", func(t *testing.T) {
+		batRes := optimizer.BatteryResult{
+			ChargingPower:    []float32{0, 0, 0},
+			DischargingPower: []float32{2000, 0, 2000},
+			StateOfCharge:    []float32{6750, 6750, 6750},
+		}
+		res := optimizer.OptimizationResult{
+			GridImport: []float32{0, 100, 0},
+			GridExport: []float32{2000, 0, 2000},
+		}
+		plan := batteryModePlan(detail, req, batRes, res, []int{900, 900, 900}, firstBoundary, false)
+		require.Len(t, plan, 3)
+		assert.Equal(t, actionDischarge, plan[0].action)
+		assert.Equal(t, api.BatteryHoldCharge.String(), plan[1].action)
+		assert.Equal(t, actionDischarge, plan[2].action)
+	})
+
+	// [hold, normal]: a HOLD not followed by an export slot is left untouched, so
+	// a genuine hold (preserve the pack, import the house) still holds.
+	t.Run("hold not before export is preserved", func(t *testing.T) {
+		batRes := optimizer.BatteryResult{
+			ChargingPower:    []float32{0, 0},
+			DischargingPower: []float32{0, 0},
+			StateOfCharge:    []float32{6750, 6750},
+		}
+		res := optimizer.OptimizationResult{
+			GridImport: []float32{100, 0},
+			GridExport: []float32{0, 0},
+		}
+		plan := batteryModePlan(detail, req, batRes, res, []int{900, 900}, firstBoundary, false)
+		require.Len(t, plan, 2)
+		assert.Equal(t, api.BatteryHold.String(), plan[0].action)
+		assert.Equal(t, api.BatteryNormal.String(), plan[1].action)
+	})
+}
+
 // TestOptimizerBatteryTargetSoc resolves the current plan slot's planned SoC,
 // including front-running the export transition to the next slot's SoC.
 func TestOptimizerBatteryTargetSoc(t *testing.T) {

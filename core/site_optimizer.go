@@ -968,7 +968,9 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 // batteryModePlan builds the per-slot battery-mode plan (slot end time + mode
 // action) that the control loop resolves each cycle to front-run export-mode
 // transitions. Slot j spans [firstBoundary+(j-1)·slot, firstBoundary+j·slot];
-// slot 0 is the current partial slot ending at firstBoundary.
+// slot 0 is the current partial slot ending at firstBoundary. A HOLD slot that
+// opens onto an export slot is relabeled to HoldCharge so a within-peak lull
+// doesn't drop the Powerwall out of autonomous (see the relabel loop below).
 func batteryModePlan(detail batteryDetail, batReq optimizer.BatteryConfig, batRes optimizer.BatteryResult, res optimizer.OptimizationResult, dt []int, firstBoundary time.Time, noGridImport bool) []batterySlot {
 	n := min(len(batRes.ChargingPower), len(dt), frontRunScheduleSlots)
 	plan := make([]batterySlot, 0, n)
@@ -980,6 +982,23 @@ func batteryModePlan(detail batteryDetail, batReq optimizer.BatteryConfig, batRe
 		until := firstBoundary.Add(time.Duration(j) * tariff.SlotDuration)
 		plan = append(plan, batterySlot{until: until, action: action, soc: slotSocPercent(batReq, batRes, j)})
 	}
+
+	// Bridge a within-peak lull: a HOLD slot that opens onto an export slot is a
+	// gap where the pack already met this slot's discharge target, so the residual
+	// house load reads as a small grid import and the slot classifies idle+import →
+	// HOLD. Left as HOLD it maps to PW3 backup mode + the real tariff, which drops
+	// the export spike, serves the house from the grid, and re-incurs the ~2min
+	// autonomous pickup lag when the next export slot resumes. Relabel it to
+	// HoldCharge (autonomous + sell spike + pv_only): the pack covers the house
+	// from the battery instead of the grid and the Powerwall never leaves
+	// autonomous across the peak. Only the slot abutting the export is bridged, so
+	// a genuine longer hold ahead of a peak still preserves the pack.
+	for j := 0; j+1 < len(plan); j++ {
+		if plan[j].action == api.BatteryHold.String() && isSpikeAction(plan[j+1].action) {
+			plan[j].action = api.BatteryHoldCharge.String()
+		}
+	}
+
 	return plan
 }
 
