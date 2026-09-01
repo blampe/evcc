@@ -132,6 +132,7 @@ type Loadpoint struct {
 	measuredPhases        int       // Charger physically measured phases
 	offeredCurrent        float64   // Charger current limit
 	socUpdated            time.Time // Soc updated timestamp (poll: connected)
+	startupSocPolled      bool      // Soc polled once at startup, even while disconnected
 	vehicleDetect         time.Time // Vehicle connected timestamp
 	chargerSwitched       time.Time // Charger enabled/disabled timestamp
 	optimizerAction       string    // current optimizer suggestion (charge|stop|""), set by the site each cycle
@@ -2020,6 +2021,7 @@ func (lp *Loadpoint) publishSocAndRange() {
 		// arrives, instead of waiting for the next interval
 		if !errors.Is(socErr, api.ErrMustRetry) {
 			lp.socUpdated = lp.clock.Now()
+			lp.startupSocPolled = true // the startup one-shot is consumed by the first poll
 		}
 
 		// range

@@ -695,6 +695,9 @@ func TestSocPoll(t *testing.T) {
 	lp := &Loadpoint{
 		clock: clock,
 		log:   util.NewLogger("foo"),
+		// startup one-shot already consumed; this table exercises steady-state
+		// polling (the startup poll is covered by TestStartupSocPoll)
+		startupSocPolled: true,
 		Soc: loadpoint.SocConfig{
 			Poll: loadpoint.PollConfig{
 				Interval: time.Hour,
@@ -770,6 +773,30 @@ func TestSocPoll(t *testing.T) {
 
 		assert.Equal(t, tc.res, res)
 	}
+}
+
+// TestStartupSocPoll verifies the one-shot poll at startup fires even while the
+// car is disconnected (so its Soc is seeded instead of projected as 0%), and is
+// not repeated once consumed.
+func TestStartupSocPoll(t *testing.T) {
+	clock := clock.NewMock()
+	lp := &Loadpoint{
+		clock:  clock,
+		log:    util.NewLogger("foo"),
+		status: api.StatusA, // disconnected
+		Soc: loadpoint.SocConfig{
+			Poll: loadpoint.PollConfig{Mode: loadpoint.PollConnected, Interval: time.Hour},
+		},
+	}
+
+	// disconnected, Soc never polled: the startup one-shot forces a poll
+	require.False(t, lp.startupSocPolled)
+	assert.True(t, lp.vehicleSocPollAllowed(), "startup poll must fire even while disconnected")
+
+	// once consumed, a still-disconnected car is not polled again
+	lp.startupSocPolled = true
+	lp.socUpdated = clock.Now()
+	assert.False(t, lp.vehicleSocPollAllowed(), "no further poll while disconnected after startup")
 }
 
 // test PV hysteresis after phase switch down, depending on remaining energy

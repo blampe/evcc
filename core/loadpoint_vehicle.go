@@ -370,6 +370,12 @@ func (lp *Loadpoint) vehicleSocPollAllowed() bool {
 		return false
 	}
 
+	// poll once at startup, even while disconnected, so a car's Soc is seeded
+	// rather than projected as 0% until it is first plugged in
+	if !lp.startupSocPolled {
+		return true
+	}
+
 	// always update soc when charging
 	if lp.charging() || lp.vehicleHasFeature(api.Streaming) {
 		return true
