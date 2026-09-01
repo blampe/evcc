@@ -78,6 +78,7 @@ export interface EvoptData {
 			c_min: number;
 			c_max: number;
 			d_max: number;
+			c_max_t?: number[]; // per-slot max charge power (W); 0 = car expected disconnected
 		}>;
 	};
 	res: {

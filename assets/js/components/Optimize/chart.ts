@@ -66,3 +66,29 @@ export function formatSlotRange(times: number[], dt: number[], index: number): s
 export function whToKW(wh: number, dtSeconds: number): number {
   return wh / (dtSeconds / 3600) / 1000;
 }
+
+// per-slot flag: the car is expected to be disconnected in slots where its per-slot
+// charge cap c_max_t is 0. An absent c_max_t (e.g. a home battery) is never disconnected.
+export function disconnectedSlots(cMaxT: number[] | undefined, length: number): boolean[] {
+  return Array.from({ length }, (_, i) => Array.isArray(cMaxT) && cMaxT[i] === 0);
+}
+
+// expandSlots turns per-slot values into an explicit staircase - two points per slot,
+// [slotStart, v] and [slotEnd, v] - so a plain line renders the step:"start" shape while
+// null slots break cleanly. That lets a colour layer masked to the connected slots sit over
+// a continuous grey base without the step/null rendering ambiguities of a single stepped
+// series. The last slot ends at endTime.
+export function expandSlots(
+  times: number[],
+  endTime: number,
+  values: (number | null)[]
+): [number, number | null][] {
+  const out: [number, number | null][] = [];
+  for (let i = 0; i < times.length; i++) {
+    const end = i + 1 < times.length ? times[i + 1]! : endTime;
+    const v = values[i] ?? null;
+    out.push([times[i]!, v]);
+    out.push([end, v]);
+  }
+  return out;
+}

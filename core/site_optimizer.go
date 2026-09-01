@@ -701,23 +701,27 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 	var unmodelled float64
 
 	for id, lp := range site.ActiveLoadpoints() {
-		// ignore disconnected loadpoints, including StatusNone
-		if s := lp.GetStatus(); s != api.StatusB && s != api.StatusC {
-			continue
-		}
-
-		// no vehicle capacity and no session energy limit to model against:
-		// account for the consumption as uncontrollable load
+		// no vehicle capacity and no session energy limit to model against: account for
+		// the consumption as uncontrollable load. A disconnected loadpoint with no default
+		// vehicle also lands here (nil vehicle) and draws ~0W.
 		if v := lp.GetVehicle(); v == nil || (v.Capacity() == 0 && lp.GetLimitEnergy() == 0) {
 			unmodelled += unmodelledPower(lp)
 			continue
 		}
 
-		// skip disabled loadpoints
-		if cfg, detail := site.loadpointRequest(lp, minLen, firstSlotDuration, grid); cfg.CMax > 0 {
-			detail.loadpoint = &id
-			batteries = append(batteries, optimizerBattery{cfg, detail})
+		// skip disabled loadpoints (ModeOff sets CMax to 0)
+		cfg, detail := site.loadpointRequest(lp, minLen, firstSlotDuration, grid)
+		if cfg.CMax <= 0 {
+			continue
 		}
+
+		// gate the per-slot charge power by when the car is (predicted to be) plugged in, so
+		// the plan charges while the car is actually connected rather than deferring to a
+		// theoretical future slot. The car is always modelled now, connected or not, so its
+		// plan always renders; unavailable slots get CMaxT 0.
+		cfg.CMaxT = site.vehicleAvailability(id, lp, cfg.CMax, minLen)
+		detail.loadpoint = &id
+		batteries = append(batteries, optimizerBattery{cfg, detail})
 	}
 
 	// home profile subtracts all loadpoint power, so unmodelled loadpoints would
@@ -1405,6 +1409,82 @@ func (site *Site) homeProfile(minLen int) ([]float64, error) {
 func profileSlotsFromNow(profile []float64) []float64 {
 	firstSlot := int(time.Now().Truncate(tariff.SlotDuration).Sub(now.BeginningOfDay()) / tariff.SlotDuration)
 	return profile[firstSlot:]
+}
+
+// vehicleAvailability returns a per-slot charge-power cap in W for the vehicle,
+// gating realCMax by when the car is (predicted to be) plugged in:
+//   - the current and next slot follow the real, current connection state, so a
+//     connected car can charge now and a disconnected one cannot;
+//   - further slots follow the recorded connection profile - available when the
+//     car was connected more than half of that time-of-day slot on average;
+//   - without enough history the far slots default to available, so a plan still
+//     renders and the behaviour degrades to the old always-connected model until
+//     the profile fills in.
+//
+// The result feeds BatteryConfig.CMaxT, which overrides the scalar CMax per slot;
+// it is a power cap (not energy), so it is not prorated - the optimizer converts
+// it per slot via dt.
+func (site *Site) vehicleAvailability(id int, lp loadpoint.API, realCMax float32, minLen int) []float32 {
+	connected := false
+	if s := lp.GetStatus(); s == api.StatusB || s == api.StatusC {
+		connected = true
+	}
+	return vehicleAvailabilitySlots(connected, site.connectedProfile(id, minLen), realCMax, minLen)
+}
+
+// vehicleAvailabilitySlots builds the per-slot charge-power cap from the current
+// connection state and the aligned connection profile (per-slot connected
+// minutes, or nil when unavailable). Split out from vehicleAvailability so the
+// slot logic is testable without the metrics store. See vehicleAvailability.
+func vehicleAvailabilitySlots(connected bool, profile []float64, realCMax float32, minLen int) []float32 {
+	res := make([]float32, minLen)
+	threshold := tariff.SlotDuration.Minutes() / 2 // connected more than half the slot
+
+	for i := range res {
+		var available bool
+		switch {
+		case i < 2:
+			// current and next slot reflect the real, current connection state
+			available = connected
+		case profile != nil:
+			available = profile[i] > threshold
+		default:
+			// no ≥30-day history yet: assume available so the plan still renders
+			available = true
+		}
+		if available {
+			res[i] = realCMax
+		}
+	}
+
+	return res
+}
+
+// connectedProfile returns the recorded per-slot connected minutes (0..15)
+// aligned to now, from the last 30 days, or nil when the collector is missing or
+// the history is incomplete. Mirrors homeProfile but keeps the value in minutes.
+func (site *Site) connectedProfile(id, minLen int) []float64 {
+	c, ok := site.collectors[connectedKey(id)]
+	if !ok {
+		return nil
+	}
+
+	profile, err := c.ConnectedProfile(now.BeginningOfDay().AddDate(0, 0, -30))
+	if err != nil {
+		return nil
+	}
+
+	// max 4 days of the repeated daily pattern (mirrors homeProfile)
+	slots := make([]float64, 0, minLen+1)
+	for len(slots) <= minLen+24*4 {
+		slots = append(slots, profile[:]...)
+	}
+
+	res := profileSlotsFromNow(slots)
+	if len(res) < minLen {
+		return nil
+	}
+	return res[:minLen]
 }
 
 // measuredSlotEnergy returns the summed energy in Wh of the last completed

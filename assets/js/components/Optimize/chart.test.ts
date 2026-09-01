@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vite-plus/test";
-import { isMidnight, slotXAxis } from "./chart";
+import { disconnectedSlots, expandSlots, isMidnight, slotXAxis } from "./chart";
 
 // 15min slots starting at the given local hour
 function times(startHour: number, count: number): number[] {
@@ -31,5 +31,48 @@ describe("slotXAxis", () => {
     expect(axis.splitLine.interval(15)).toBe(false);
     // no line at the axis start, even if the first slot is midnight
     expect(slotXAxis(times(0, 4), weekdayShort).splitLine.interval(0)).toBe(false);
+  });
+});
+
+describe("disconnectedSlots", () => {
+  test("flags slots where the per-slot charge cap is 0", () => {
+    expect(disconnectedSlots([8000, 0, 0, 8000], 4)).toEqual([false, true, true, false]);
+  });
+
+  test("no c_max_t (e.g. home battery) is never disconnected", () => {
+    expect(disconnectedSlots(undefined, 3)).toEqual([false, false, false]);
+  });
+
+  test("pads to the requested length when c_max_t is shorter", () => {
+    expect(disconnectedSlots([0], 3)).toEqual([true, false, false]);
+  });
+});
+
+describe("expandSlots", () => {
+  const t = [0, 100, 200];
+  const endTime = 300;
+
+  test("emits two points per slot forming a staircase", () => {
+    expect(expandSlots(t, endTime, [1, 2, 3])).toEqual([
+      [0, 1],
+      [100, 1],
+      [100, 2],
+      [200, 2],
+      [200, 3],
+      [300, 3],
+    ]);
+  });
+
+  test("keeps null slots as gaps so a masked layer breaks cleanly", () => {
+    // the middle slot is masked out; its two points stay null so the line does not
+    // bridge the connected slots on either side
+    expect(expandSlots(t, endTime, [1, null, 3])).toEqual([
+      [0, 1],
+      [100, 1],
+      [100, null],
+      [200, null],
+      [200, 3],
+      [300, 3],
+    ]);
   });
 });

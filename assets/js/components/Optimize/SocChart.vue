@@ -22,7 +22,7 @@ import echartsChart from "@/mixins/echartsChart";
 import { is12hFormat } from "@/units";
 import type { EvoptData } from "./TimeSeriesDataTable.vue";
 import LegendList from "../Sessions/LegendList.vue";
-import { slotTimes } from "./chart";
+import { slotTimes, disconnectedSlots, expandSlots } from "./chart";
 
 export interface SocChartEntry {
 	index: number; // index into evopt.res.batteries
@@ -59,13 +59,22 @@ export default defineComponent({
 			const last = this.times[this.times.length - 1];
 			return last === undefined ? 0 : last + (dt[dt.length - 1] || 0) * 1000;
 		},
-		socSeries(): [number, number][] {
+		socPercents(): number[] {
 			const soc = this.evopt.res.batteries[this.entry.index]?.state_of_charge || [];
 			const capacityWh = this.entry.capacity * 1000;
-			return this.times.map((t, i) => {
+			return this.times.map((_, i) => {
 				const wh = soc[i] ?? 0;
-				return [t, capacityWh > 0 ? (wh / capacityWh) * 100 : 0] as [number, number];
+				return capacityWh > 0 ? (wh / capacityWh) * 100 : 0;
 			});
+		},
+		// per-slot flag: the car is expected to be disconnected where its per-slot charge
+		// cap c_max_t is 0 (see disconnectedSlots).
+		disconnected(): boolean[] {
+			const cMaxT = this.evopt.req.batteries?.[this.entry.index]?.c_max_t;
+			return disconnectedSlots(cMaxT, this.times.length);
+		},
+		hasDisconnected(): boolean {
+			return this.disconnected.some(Boolean);
 		},
 		xAxes(): Record<string, unknown>[] {
 			const stepHours = is12hFormat() ? 6 : 4;
@@ -112,20 +121,42 @@ export default defineComponent({
 						formatter: (v: number) => this.fmtNumber(v, 0),
 					},
 				}),
-				series: [
-					{
-						type: "line",
-						step: "start",
-						z: 3,
-						data: this.socSeries,
-						showSymbol: false,
-						lineStyle: { color: this.entry.color, width: 2 },
-						itemStyle: { color: this.entry.color },
-						areaStyle: { color: dimColor(this.entry.color) },
-						emphasis: { disabled: true },
-					},
-				],
+				series: this.socChartSeries,
 			};
+		},
+		socChartSeries(): Record<string, unknown>[] {
+			const color = this.entry.color;
+			const muted = colors.muted || "";
+
+			const line = (
+				data: [number, number | null][],
+				c: string,
+				z: number,
+				silent = false
+			) => ({
+				type: "line",
+				z,
+				data,
+				showSymbol: false,
+				silent,
+				lineStyle: { color: c, width: 2 },
+				itemStyle: { color: c },
+				areaStyle: { color: dimColor(c) },
+				emphasis: { disabled: true },
+			});
+
+			const expand = (values: (number | null)[]) => expandSlots(this.times, this.endTime, values);
+
+			// colored layer, drawn in full when the car never disconnects
+			if (!this.hasDisconnected) {
+				return [line(expand(this.socPercents), color, 3)];
+			}
+
+			// grey base across the whole horizon greys the projection where the car is
+			// expected to be disconnected; the colored layer is masked to the connected
+			// slots and drawn on top, so only those windows keep the battery colour
+			const masked = this.socPercents.map((v, i) => (this.disconnected[i] ? null : v));
+			return [line(expand(this.socPercents), muted, 2, true), line(expand(masked), color, 3)];
 		},
 	},
 	methods: {

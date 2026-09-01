@@ -983,3 +983,67 @@ func TestDiffSuggestions(t *testing.T) {
 	assert.Empty(t, site.diffSuggestions(map[string]pendingSuggestion{}))
 	assert.Len(t, site.diffSuggestions(pending(stop)), 1)
 }
+
+func TestVehicleAvailabilitySlots(t *testing.T) {
+	const c = float32(8000) // realCMax
+
+	// far-slot connection profile in minutes/slot (0..15); slots 0,1 are always
+	// overridden by the real connection state so their profile values don't matter.
+	// threshold is >7.5 min (more than half of a 15min slot).
+	profile := []float64{15, 15, 10, 5, 8, 7.5, 7.6, 0}
+
+	tc := []struct {
+		name      string
+		connected bool
+		profile   []float64
+		minLen    int
+		expected  []float32
+	}{
+		{"connected, no history → available everywhere", true, nil, 5, []float32{c, c, c, c, c}},
+		{"disconnected, no history → near slots blocked, far available", false, nil, 5, []float32{0, 0, c, c, c}},
+		{
+			"connected, profile gates the far slots (>7.5min)", true, profile, 8,
+			// slots 0,1 = connected; 2:10>7.5, 3:5, 4:8>7.5, 5:7.5(not >), 6:7.6>7.5, 7:0
+			[]float32{c, c, c, 0, c, 0, c, 0},
+		},
+		{
+			"disconnected, near slots forced 0, far slots follow profile", false, profile, 8,
+			[]float32{0, 0, c, 0, c, 0, c, 0},
+		},
+	}
+
+	for _, tc := range tc {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, vehicleAvailabilitySlots(tc.connected, tc.profile, c, tc.minLen))
+		})
+	}
+}
+
+func TestVehicleAvailability(t *testing.T) {
+	// no collectors configured → connectedProfile returns nil, so the far slots fall
+	// back to available. This also verifies the connection state is read from the
+	// loadpoint status (B/C connected, else disconnected).
+	site := &Site{}
+
+	for _, tc := range []struct {
+		status    api.ChargeStatus
+		connected bool
+	}{
+		{api.StatusC, true},
+		{api.StatusB, true},
+		{api.StatusA, false},
+		{api.StatusNone, false},
+	} {
+		ctrl := gomock.NewController(t)
+		lp := loadpoint.NewMockAPI(ctrl)
+		lp.EXPECT().GetStatus().Return(tc.status).AnyTimes()
+
+		res := site.vehicleAvailability(0, lp, 8000, 5)
+		if tc.connected {
+			assert.Equal(t, []float32{8000, 8000, 8000, 8000, 8000}, res, "status %s", tc.status)
+		} else {
+			assert.Equal(t, []float32{0, 0, 8000, 8000, 8000}, res, "status %s", tc.status)
+		}
+		ctrl.Finish()
+	}
+}
