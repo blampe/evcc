@@ -132,31 +132,36 @@ export default defineComponent({
 				data: [number, number | null][],
 				c: string,
 				z: number,
-				silent = false
+				silent = false,
+				dashed = false
 			) => ({
 				type: "line",
 				z,
 				data,
 				showSymbol: false,
 				silent,
-				lineStyle: { color: c, width: 2 },
+				lineStyle: { color: c, width: 2, type: dashed ? "dashed" : "solid" },
 				itemStyle: { color: c },
 				areaStyle: { color: dimColor(c) },
 				emphasis: { disabled: true },
 			});
 
-			const expand = (values: (number | null)[]) => expandSlots(this.times, this.endTime, values);
+			const expand = (values: (number | null)[]) =>
+				expandSlots(this.times, this.endTime, values);
 
 			// colored layer, drawn in full when the car never disconnects
 			if (!this.hasDisconnected) {
 				return [line(expand(this.socPercents), color, 3)];
 			}
 
-			// grey base across the whole horizon greys the projection where the car is
-			// expected to be disconnected; the colored layer is masked to the connected
-			// slots and drawn on top, so only those windows keep the battery colour
+			// grey dashed base across the whole horizon marks where the car is expected to
+			// be disconnected; the colored solid layer is masked to the connected slots and
+			// drawn on top, so those windows keep the battery colour and hide the dashes
 			const masked = this.socPercents.map((v, i) => (this.disconnected[i] ? null : v));
-			return [line(expand(this.socPercents), muted, 2, true), line(expand(masked), color, 3)];
+			return [
+				line(expand(this.socPercents), muted, 2, true, true),
+				line(expand(masked), color, 3),
+			];
 		},
 	},
 	methods: {
