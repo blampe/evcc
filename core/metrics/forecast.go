@@ -49,20 +49,7 @@ func todIndex(t time.Time) int {
 // (equal-weight) average. It returns ErrIncomplete when the series does not span a full
 // day, i.e. some time-of-day slot has no sample.
 func recencySeasonal(start time.Time, series []float64, halflife time.Duration) ([96]float64, error) {
-	var wsum, wtot [96]float64
-	n := len(series)
-	halflifeDays := halflife.Hours() / 24
-
-	for i, v := range series {
-		k := todIndex(start.Add(time.Duration(i) * tariff.SlotDuration))
-		w := 1.0
-		if halflifeDays > 0 {
-			ageDays := float64(n-1-i) / 96 // 96 slots per day
-			w = math.Exp(-math.Ln2 * ageDays / halflifeDays)
-		}
-		wsum[k] += w * v
-		wtot[k] += w
-	}
+	wsum, wtot := weightedTodBuckets(start, series, halflife, false)
 
 	var s [96]float64
 	for k := range s {
@@ -74,6 +61,29 @@ func recencySeasonal(start time.Time, series []float64, halflife time.Duration) 
 	return s, nil
 }
 
+// weightedTodBuckets accumulates an evenly sampled series (sample i is the slot at start +
+// i·slot) into per-local-time-of-day sum and weight buckets, weighting each sample by
+// exp(-ln2·age/halflife) so recent days count more (halflife <= 0 gives equal weight). With
+// skipZero the zero samples are excluded, yielding a conditional average over the nonzero
+// slots (see awayRateSeasonal); otherwise every sample counts (see recencySeasonal).
+func weightedTodBuckets(start time.Time, series []float64, halflife time.Duration, skipZero bool) (wsum, wtot [96]float64) {
+	n := len(series)
+	halflifeDays := halflife.Hours() / 24
+	for i, v := range series {
+		if skipZero && v == 0 {
+			continue
+		}
+		k := todIndex(start.Add(time.Duration(i) * tariff.SlotDuration))
+		w := 1.0
+		if halflifeDays > 0 {
+			w = math.Exp(-math.Ln2 * float64(n-1-i) / 96 / halflifeDays) // 96 slots per day
+		}
+		wsum[k] += w * v
+		wtot[k] += w
+	}
+	return wsum, wtot
+}
+
 // Forecast fits a hybrid model to the entity's history since from: a recency-weighted
 // daily seasonal plus a cross-validated harmonic model of the residual. It returns
 // ErrIncomplete when there is not enough history for the seasonal.
@@ -82,7 +92,13 @@ func (c *Collector) Forecast(from time.Time) (*HybridForecast, error) {
 	if err != nil {
 		return nil, err
 	}
+	return newHybridForecast(start, series)
+}
 
+// newHybridForecast builds a hybrid model from an evenly sampled series (sample i is
+// the slot at start + i·slot). Split from Forecast so a synthesized series (e.g. vehicle
+// consumption derived from sessions) can be forecast the same way.
+func newHybridForecast(start time.Time, series []float64) (*HybridForecast, error) {
 	// the residual is taken against the flat (equal-weight) time-of-day mean. Subtracting
 	// the per-time-of-day mean makes it orthogonal to every pure daily harmonic, so the
 	// fit cannot re-model the daily cycle even with no period floor - what it picks up

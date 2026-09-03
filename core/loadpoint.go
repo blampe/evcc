@@ -529,9 +529,10 @@ func (lp *Loadpoint) evChargeStartHandler() {
 		if session.Created.IsZero() {
 			session.Created = lp.clock.Now()
 		}
-		// capture start soc once available (may not be present at session start)
-		if soc := lp.vehicleSoc; session.SocStart == nil && soc > 0 && !lp.chargerHasFeature(api.Heating) {
-			session.SocStart = &soc
+		// capture start soc once available (may not be present at session start); tracked as
+		// the running minimum so a stale post-reconnect reading is not locked in
+		if soc := lp.vehicleSoc; soc > 0 && !lp.chargerHasFeature(api.Heating) {
+			session.SocStart = sessionStartSoc(session.SocStart, soc)
 		}
 	})
 }
@@ -2045,6 +2046,15 @@ func (lp *Loadpoint) publishSocAndRange() {
 		}
 	}
 	lp.publish(keys.VehicleSoc, lp.vehicleSoc)
+
+	// keep the session start SoC at the running minimum over the session (see
+	// sessionStartSoc): the first reading after reconnect can be the stale pre-drive
+	// value, so the real post-drive low only shows up on a later poll.
+	if soc := lp.vehicleSoc; soc > 0 && !lp.chargerHasFeature(api.Heating) && lp.session != nil && !lp.session.Created.IsZero() {
+		if s := sessionStartSoc(lp.session.SocStart, soc); s != lp.session.SocStart {
+			lp.updateSession(func(sess *session.Session) { sess.SocStart = s })
+		}
+	}
 
 	apiLimitSoc := 100
 	if limitR != nil {

@@ -113,11 +113,16 @@ export default defineComponent({
 			this.entryOrder.forEach((index) => {
 				const battery = this.evopt.res.batteries[index];
 				if (!battery) return;
-				// charging positive, discharging negative; one of both is always zero
+				// s_drain_t is an exogenous power (W): a vehicle consuming its own charge while
+				// driven away. It never overlaps charging (the car is unplugged then).
+				const drain = this.evopt.req.batteries?.[index]?.s_drain_t || [];
+				// charging positive; discharging or driving-drain negative (at most one is nonzero)
 				const power = battery.charging_power.map((charging, i) => {
 					const chargingKW = this.toKW(charging, i);
+					if (chargingKW > 0) return chargingKW;
 					const dischargingKW = this.toKW(battery.discharging_power[i] || 0, i);
-					return chargingKW > 0 ? chargingKW : -dischargingKW;
+					if (dischargingKW > 0) return -dischargingKW;
+					return -(drain[i] || 0) / 1000; // W -> kW (already a power, so no dt scaling)
 				});
 				series.push({
 					name: this.getBatteryTitle(index),

@@ -67,6 +67,18 @@ func (lp *Loadpoint) createSession() {
 	lp.publish(keys.ChargedEnergy, lp.GetChargedEnergy())
 }
 
+// sessionStartSoc returns the running-minimum session-start SoC: the lower of the
+// current start and a new reading. The first reading after a reconnect is often the
+// stale pre-drive value (SoC is not polled while unplugged), so tracking the minimum
+// lets the true post-drive low - reached before charging pulls the SoC back up - win.
+// It returns the same pointer when unchanged, so callers can skip a needless persist.
+func sessionStartSoc(start *float64, soc float64) *float64 {
+	if start == nil || soc < *start {
+		return &soc
+	}
+	return start
+}
+
 // applyEnergyMetrics writes current energy metrics into the session and persists it.
 func (lp *Loadpoint) applyEnergyMetrics(s *session.Session) {
 	if meterStop := lp.chargeMeterTotal(); meterStop > 0 {

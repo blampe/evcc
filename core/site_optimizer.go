@@ -720,6 +720,11 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 		// theoretical future slot. The car is always modelled now, connected or not, so its
 		// plan always renders; unavailable slots get CMaxT 0.
 		cfg.CMaxT = site.vehicleAvailability(id, lp, cfg.CMax, minLen)
+
+		// while the car is away it drains, so start the plan's reconnect charging from the
+		// expected post-drive SoC rather than the frozen disconnect SoC.
+		site.applyConsumption(&cfg, lp)
+
 		detail.loadpoint = &id
 		batteries = append(batteries, optimizerBattery{cfg, detail})
 	}

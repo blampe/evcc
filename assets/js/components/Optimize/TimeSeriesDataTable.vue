@@ -79,6 +79,7 @@ export interface EvoptData {
 			c_max: number;
 			d_max: number;
 			c_max_t?: number[]; // per-slot max charge power (W); 0 = car expected disconnected
+			s_drain_t?: number[]; // per-slot exogenous drain power (W): a vehicle driving away
 		}>;
 	};
 	res: {

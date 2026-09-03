@@ -123,9 +123,10 @@ type Site struct {
 	batteryBoostSlot         time.Time                   // 15-min slot the battery-boost reserve was last pinned for (zero = not boosting)
 	suggestionActions        map[string]string           // last notified actionable optimizer action by device key
 
-	optimizerMu      sync.Mutex               // guards optimizer runs
-	optimizerUpdated time.Time                // last optimizer run, guarded by optimizerMu
-	forecasts        map[string]forecastEntry // cached hybrid forecasts by collector ref, refit daily under optimizerMu
+	optimizerMu      sync.Mutex                  // guards optimizer runs
+	optimizerUpdated time.Time                   // last optimizer run, guarded by optimizerMu
+	forecasts        map[string]forecastEntry    // cached hybrid forecasts by collector ref, refit daily under optimizerMu
+	consumption      map[string]consumptionEntry // cached vehicle driving forecasts by loadpoint title, refit daily under optimizerMu
 
 	solarScaleCached func() (float64, error) // util.Cached wrapper around querySolarScale
 }
@@ -386,8 +387,9 @@ func NewSite() *Site {
 	site := &Site{
 		log:        util.NewLogger("site"),
 		Voltage:    230, // V
-		collectors: make(map[string]*metrics.Collector),
-		forecasts:  make(map[string]forecastEntry),
+		collectors:  make(map[string]*metrics.Collector),
+		forecasts:   make(map[string]forecastEntry),
+		consumption: make(map[string]consumptionEntry),
 	}
 
 	// the result only depends on completed days, so it cannot change within a day
