@@ -404,4 +404,3 @@ func (c *ChargePoint) ChargeDuration() (time.Duration, error) {
 	res, err := c.sessionG.Get()
 	return time.Duration(res.ChargingTime) * time.Millisecond, err
 }
-

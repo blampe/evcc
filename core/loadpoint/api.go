@@ -104,6 +104,8 @@ type API interface {
 	EffectivePriority() int
 	// EffectiveLimitSoc returns the effective session limit soc
 	EffectiveLimitSoc() int
+	// EffectiveMinSoc returns the effective min soc across loadpoint and vehicle
+	EffectiveMinSoc() int
 	// EffectivePlanId returns the effective plan id
 	EffectivePlanId() int
 	// EffectivePlanTime returns the effective plan time

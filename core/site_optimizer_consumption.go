@@ -153,25 +153,16 @@ func (site *Site) cachedConsumption(lp loadpoint.API) *metrics.ConsumptionForeca
 	return fc
 }
 
-// applyConsumption models a disconnected vehicle draining its own charge while driven
-// away. It sets SInitial to the best estimate of the SoC now - the disconnect SoC minus
-// what has been driven since departure - and emits a per-slot exogenous drain (SDrainT)
-// over the rest of the away-window, so the plan's SoC declines to the predicted reconnect
-// level and then charges back up, instead of being pinned flat (the optimizer cannot
-// otherwise lower a vehicle's SoC: it has no discharge path). Connected cars, and those
-// without enough driving history, are left unchanged.
+// applyConsumption emits the vehicle's forecast driving as a per-slot drain (SDrainT) over every
+// away-period in the horizon, so the plan charges to cover each upcoming trip and its SoC declines as
+// the car is driven. This runs for connected cars too: a car plugged in tonight still has a forecast
+// commute tomorrow, and the optimizer needs the drain to know to charge for it. Only the SInitial
+// back-estimate is disconnected-only - while a trip is in progress the held SoC is the stale
+// disconnect value and must be walked forward by what has been driven since; a connected car's SoC is
+// already real. Vehicles without enough driving history are left unchanged.
 func (site *Site) applyConsumption(cfg *optimizer.BatteryConfig, lp loadpoint.API) {
-	if s := lp.GetStatus(); s == api.StatusB || s == api.StatusC {
-		return // connected: the current SoC is real, nothing is draining
-	}
-
 	fc := site.cachedConsumption(lp)
 	if fc == nil {
-		return
-	}
-
-	departs, ok := lastDisconnect(lp.GetTitle())
-	if !ok {
 		return
 	}
 
@@ -180,30 +171,37 @@ func (site *Site) applyConsumption(cfg *optimizer.BatteryConfig, lp loadpoint.AP
 		return
 	}
 
-	// reconnect = the first slot the availability model expects the car plugged in again
 	base := time.Now().Truncate(tariff.SlotDuration)
-	reconnect := len(cfg.CMaxT)
-	for i, c := range cfg.CMaxT {
-		if c > 0 {
-			reconnect = i
-			break
+
+	// the drain is capped per away-period so the optimizer's SoC stays feasible: a trip already in
+	// progress at the SoC it has now, later trips at the pack headroom the car can recharge into
+	// between them (see drainProfile). Connected: no trip in progress, so the first away-period is a
+	// future one and uses the pack headroom like the rest.
+	availMax := (float64(cfg.SMax) - float64(cfg.SMin)) / (capacity * 10)
+	availNow := availMax
+
+	// while disconnected a trip is in progress: back-estimate the SoC now (disconnect SoC minus what
+	// has been driven since departure, since SocStart at reconnect is stale) and cap the current
+	// away-period at it.
+	if s := lp.GetStatus(); s != api.StatusB && s != api.StatusC {
+		if departs, ok := lastDisconnect(lp.GetTitle()); ok {
+			// reconnect = the first slot the availability model expects the car plugged in again;
+			// only the current commute-style away-period counts, a multi-day gap is out of model
+			reconnect := len(cfg.CMaxT)
+			for i, c := range cfg.CMaxT {
+				if c > 0 {
+					reconnect = i
+					break
+				}
+			}
+			if d := base.Add(time.Duration(reconnect) * tariff.SlotDuration).Sub(departs); d > 0 && d <= maxAwayWindow {
+				already := fc.Drain(departs, base) // SoC percent driven departure -> now
+				cfg.SInitial = max(cfg.SMin, cfg.SInitial-float32(already*capacity*10))
+				availNow = (float64(cfg.SInitial) - float64(cfg.SMin)) / (capacity * 10)
+			}
 		}
 	}
 
-	// only the current commute-style away-period; a multi-day gap is out of model
-	if d := base.Add(time.Duration(reconnect) * tariff.SlotDuration).Sub(departs); d <= 0 || d > maxAwayWindow {
-		return
-	}
-
-	// SInitial := the SoC now - the disconnect SoC (which evcc still holds, since SocStart at
-	// reconnect is stale) minus what has already been driven since departure.
-	already := fc.Drain(departs, base) // SoC percent driven departure -> now
-	cfg.SInitial = max(cfg.SMin, cfg.SInitial-float32(already*capacity*10))
-
-	// per-slot drain across every away-period in the horizon, capped so the optimizer can
-	// always recharge enough to keep its SoC equality feasible (see drainProfile).
-	availNow := (float64(cfg.SInitial) - float64(cfg.SMin)) / (capacity * 10) // current away: SoC now
-	availMax := (float64(cfg.SMax) - float64(cfg.SMin)) / (capacity * 10)     // later: pack headroom
 	cfg.SDrainT = drainProfile(fc, base, cfg.CMaxT, capacity, availNow, availMax)
 }
 

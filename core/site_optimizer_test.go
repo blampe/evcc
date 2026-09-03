@@ -418,6 +418,7 @@ func TestLoadpointRequestChargeGoal(t *testing.T) {
 			lp.EXPECT().GetVehicle().Return(v).AnyTimes()
 			lp.EXPECT().GetSoc().Return(tc.soc).AnyTimes()
 			lp.EXPECT().EffectiveLimitSoc().Return(tc.limitSoc).AnyTimes()
+			lp.EXPECT().EffectiveMinSoc().Return(0).AnyTimes()
 			lp.EXPECT().GetLimitEnergy().Return(tc.limitEnergy).AnyTimes()
 			lp.EXPECT().GetChargedEnergy().Return(tc.charged).AnyTimes()
 			lp.EXPECT().GetTitle().Return("lp").AnyTimes()
@@ -439,8 +440,8 @@ func TestLoadpointRequestChargeGoal(t *testing.T) {
 
 // TestApplyPlanGoal covers the charge goal: only a real in-horizon plan goal is
 // applied (a hard target at its own slot). With no plan - or a deadline outside
-// the horizon - no goal is set; the car is pulled by its elevated energy value
-// instead (see evChargeEnergyValue), never a forced horizon-end ceiling.
+// the horizon - no goal is set; a plugged-in car is kept charged by its
+// forecast-driving commitment (SDrainT) instead, never a forced horizon-end ceiling.
 func TestApplyPlanGoal(t *testing.T) {
 	site := &Site{log: util.NewLogger("foo")}
 	const minLen = 8
@@ -536,15 +537,6 @@ func TestEvChargeSource(t *testing.T) {
 	assert.Equal(t, sourceSurplus, evChargeSource(sourceSurplus, true, true), "exporting -> real surplus, not battery")
 	// grid stays grid: an importing slot is never battery-fed
 	assert.Equal(t, sourceGrid, evChargeSource(sourceGrid, true, false), "grid source unchanged")
-}
-
-func TestEvChargeEnergyValue(t *testing.T) {
-	// pa is the home-battery leftover value (~cheapest grid price); the EV is
-	// valued at the average grid price, floored at pa.
-	assert.Equal(t, float32(0.25), evChargeEnergyValue([]float32{0.2, 0.3}, 0.1), "average grid price when above pa")
-	assert.Greater(t, evChargeEnergyValue([]float32{0.2, 0.3}, 0.1), float32(0.1), "EV valued above the home battery -> boosting enabled")
-	assert.Equal(t, float32(0.1), evChargeEnergyValue([]float32{-0.1, 0.05}, 0.1), "floored at pa when the average dips below it")
-	assert.Equal(t, float32(0.1), evChargeEnergyValue(nil, 0.1), "pa when no prices")
 }
 
 func TestOptimizerChargingStrategy(t *testing.T) {

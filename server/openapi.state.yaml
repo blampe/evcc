@@ -1146,6 +1146,12 @@ components:
         discharge:
           description: Recommended discharge power in W.
           type: number
+        source:
+          description: "Where a charge is sourced from in the plan: PV surplus or grid-sourced fast charge."
+          type: string
+          enum:
+            - surplus
+            - grid
         actionable:
           description: Suggestion differs from the current operating mode.
           type: boolean

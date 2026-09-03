@@ -5,12 +5,63 @@ import (
 	"testing"
 	"time"
 
+	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/core/loadpoint"
 	"github.com/evcc-io/evcc/core/metrics"
+	"github.com/jinzhu/now"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
+
+	optimizer "github.com/evcc-io/optimizer/client"
 )
 
 func nfloat(v float64) sql.NullFloat64 { return sql.NullFloat64{Float64: v, Valid: true} }
+
+// TestApplyConsumptionConnected pins the bug fix: a connected car still has forecast trips ahead, so
+// applyConsumption must emit their drain (SDrainT) - it used to return early for connected cars and
+// leave the optimizer blind to tomorrow's commute. The SInitial back-estimate stays disconnected-only.
+func TestApplyConsumptionConnected(t *testing.T) {
+	// away every slot -> a positive, time-of-day-independent drain rate (as in TestDrainProfile)
+	start := time.Date(2025, 1, 6, 0, 0, 0, 0, time.UTC)
+	var eps []metrics.AwayEpisode
+	for d := range 30 {
+		day := start.AddDate(0, 0, d)
+		eps = append(eps, metrics.AwayEpisode{Departs: day, Returns: day.AddDate(0, 0, 1), Consumed: 9.6})
+	}
+	fc := metrics.NewConsumptionForecast(eps)
+	require.NotNil(t, fc)
+
+	const capacity = 66.5 // kWh
+	site := &Site{consumption: map[string]consumptionEntry{
+		"foo": {forecast: fc, day: now.BeginningOfDay()},
+	}}
+
+	ctrl := gomock.NewController(t)
+	v := api.NewMockVehicle(ctrl)
+	v.EXPECT().Capacity().Return(capacity).AnyTimes()
+	lp := loadpoint.NewMockAPI(ctrl)
+	lp.EXPECT().GetTitle().Return("foo").AnyTimes()
+	lp.EXPECT().GetVehicle().Return(v).AnyTimes()
+	lp.EXPECT().GetStatus().Return(api.StatusB).AnyTimes() // connected, plugged in, idle
+
+	// plugged now (slots 0-1), a forecast trip while away (slots 2-3), back on the plug (slots 4-5)
+	const soc0 = 33250.0
+	cfg := &optimizer.BatteryConfig{
+		SMin: 0, SMax: capacity * 1e3, SInitial: soc0,
+		CMaxT: []float32{11000, 11000, 0, 0, 11000, 11000},
+	}
+	site.applyConsumption(cfg, lp)
+
+	require.NotNil(t, cfg.SDrainT, "connected car must still get its forecast-trip drain")
+	require.Len(t, cfg.SDrainT, 6)
+	assert.Zero(t, cfg.SDrainT[0], "plugged slot: no drain")
+	assert.Zero(t, cfg.SDrainT[1], "plugged slot: no drain")
+	assert.Positive(t, cfg.SDrainT[2], "away slot drains for the forecast trip")
+	assert.Positive(t, cfg.SDrainT[3], "away slot drains for the forecast trip")
+	assert.Zero(t, cfg.SDrainT[4], "plugged again: no drain")
+	assert.Equal(t, float32(soc0), cfg.SInitial, "connected: SoC is real, no back-estimate")
+}
 
 func TestSessionStartSoc(t *testing.T) {
 	assert.Equal(t, 76.0, *sessionStartSoc(nil, 76), "first reading")

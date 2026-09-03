@@ -759,16 +759,13 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 		batteries = append(batteries, optimizerBattery{cfg, detail})
 	}
 
-	// EV energy is valued higher than home-battery leftovers so a plugged-in car
-	// is a worthwhile place to put energy even with no plan set (see
-	// evChargeEnergyValue).
-	evPA := evChargeEnergyValue(req.TimeSeries.PN, pa)
-
+	// all batteries value leftover stored energy at pa (~the cheapest grid price). The EV is no longer
+	// boosted above this: keeping a plugged-in car charged is handled by its forecast-driving
+	// commitment (s_drain_t, see applyConsumption), not by making stored energy look valuable - so the
+	// car charges exactly for its forecast trips at the cheapest times, instead of filling toward full
+	// off cheap-but-unneeded grid the way the elevated end-of-horizon value used to pull it.
 	for _, b := range batteries {
 		b.cfg.PA = pa
-		if b.detail.Type == batteryTypeVehicle {
-			b.cfg.PA = evPA
-		}
 		req.Batteries = append(req.Batteries, b.cfg)
 		details.BatteryDetails = append(details.BatteryDetails, b.detail)
 	}
@@ -1137,6 +1134,14 @@ func (site *Site) loadpointRequest(lp loadpoint.API, minLen int, firstSlotDurati
 		maxSoc := capacity * float64(lp.EffectiveLimitSoc()) * 10 // Wh
 		bat.SInitial = float32(capacity * soc * 10)               // Wh
 		bat.SMax = max(bat.SInitial, float32(maxSoc))             // prevent infeasible if current soc above maximum
+
+		// hold the configured minimum SoC as a floor so the plan keeps the car above it instead of
+		// coasting toward empty between trips (the optimizer otherwise only charges for forecast
+		// driving). It is a soft L1 reserve, so a car already below the floor stays feasible - clamp
+		// to the current SoC and let the reserve penalty carry the rest.
+		if minSoc := lp.EffectiveMinSoc(); minSoc > 0 {
+			bat.SMin = min(bat.SInitial, float32(capacity*float64(minSoc)*10)) // Wh
+		}
 	}
 
 	detail.Type = batteryTypeVehicle
@@ -1234,28 +1239,6 @@ func (site *Site) evChargePriority() int {
 // strategy is active.
 func (site *Site) optimizerChargeFirst() bool {
 	return site.GetOptimizerChargingStrategy() == string(optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport)
-}
-
-// evChargeEnergyValue is the end-of-horizon value (per Wh) placed on energy
-// stored in the EV. Home-battery leftover energy is valued at pa (~the cheapest
-// grid price); the EV is valued at roughly the average grid price, floored at pa,
-// so that even with no departure plan the optimizer treats a plugged-in car as a
-// worthwhile place to put energy:
-//
-//   - above pa → genuine home-battery surplus is boosted into the car instead of
-//     ending the horizon unused ("optimized battery boost")
-//   - at/below the grid price (and the round-trip charge loss adds margin) → the
-//     car fills from PV surplus and the cheaper grid hours, but is never force-
-//     filled to its ceiling off expensive grid; a real plan's hard SGoal does that
-//
-// This replaces the blunt no-plan "fill to the ceiling" fallback goal that
-// applyPlanGoal used to add. The average is the tuning dial: a fraction below 1
-// makes the car more conservative about grid, above 1 more eager.
-func evChargeEnergyValue(pn []float32, pa float32) float32 {
-	if len(pn) == 0 {
-		return pa
-	}
-	return max(pa, lo.Sum(pn)/float32(len(pn)))
 }
 
 func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measurement, grid api.Rates, minLen int, firstSlotDuration time.Duration) (optimizer.BatteryConfig, batteryDetail) {
@@ -1683,9 +1666,10 @@ func scaleAndPrune(rates api.Rates, scale float64, maxLen int) []float32 {
 // applyPlanGoal sets the optimizer charge goal (SGoal) from the loadpoint's
 // departure plan. Only a real in-horizon plan goal is applied - a hard target the
 // optimizer will pay grid or drain the home battery to reach. With no plan, no
-// goal is set: the car is instead pulled by its elevated end-of-horizon energy
-// value (see evChargeEnergyValue), so a plugged-in car soaks PV surplus and cheap
-// energy without ever being force-filled to its ceiling off expensive grid.
+// goal is set: a plugged-in car is instead kept charged by its forecast-driving
+// commitment (SDrainT, see applyConsumption), so it covers its predicted trips
+// from PV surplus and the cheapest grid hours without ever being force-filled to
+// its ceiling off expensive grid.
 func (site *Site) applyPlanGoal(lp loadpoint.API, bat *optimizer.BatteryConfig, minLen int) {
 	goal, socBased := lp.GetPlanGoal()
 	if goal <= 0 {
