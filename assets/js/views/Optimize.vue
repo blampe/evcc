@@ -21,6 +21,21 @@
 					<h2 class="mt-2 mb-4">Optimizer Plan</h2>
 
 					<Card
+						v-if="!hasPlan"
+						title="Charging Plan"
+						edge-to-edge
+						class="box-pull-out mb-4"
+					>
+						<p class="m-3 text-muted">
+							No plan to show — the optimizer returned
+							<strong>{{ evopt.res?.status || "no result" }}</strong>. Its constraints
+							could not all be met this run, so there is no schedule. The request and
+							response below remain available for debugging.
+						</p>
+					</Card>
+
+					<Card
+						v-if="hasPlan"
 						title="Charging Plan"
 						subtitle="kW"
 						edge-to-edge
@@ -36,7 +51,7 @@
 					</Card>
 
 					<Card
-						v-if="socEntries.length"
+						v-if="hasPlan && socEntries.length"
 						title="SoC Projections"
 						subtitle="%"
 						edge-to-edge
@@ -57,6 +72,7 @@
 					</Card>
 
 					<Card
+						v-if="hasPlan"
 						title="Timeline"
 						:subtitle="timeSeriesSubtitle"
 						edge-to-edge
@@ -176,6 +192,16 @@ export default defineComponent({
 	computed: {
 		evopt() {
 			return store.state.evopt;
+		},
+		// a plan only exists for a solved result; an infeasible response carries an empty
+		// res.batteries while details.batteryDetails (from the request) is still populated, so the
+		// response charts must be skipped or they index an empty array. See #infeasible handling.
+		hasPlan(): boolean {
+			const res = this.evopt?.res;
+			return (
+				(res?.status === "Optimal" || res?.status === "Feasible") &&
+				(res?.batteries?.length || 0) > 0
+			);
 		},
 		currency() {
 			return store.state.currency || CURRENCY.EUR;

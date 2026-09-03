@@ -110,8 +110,9 @@ export default defineComponent({
 					emphasis: { disabled: true },
 				},
 			];
+			const batteries = this.evopt.res.batteries || [];
 			this.entryOrder.forEach((index) => {
-				const battery = this.evopt.res.batteries[index];
+				const battery = batteries[index];
 				if (!battery) return;
 				// s_drain_t is an exogenous power (W): a vehicle consuming its own charge while
 				// driven away. It never overlaps charging (the car is unplugged then).

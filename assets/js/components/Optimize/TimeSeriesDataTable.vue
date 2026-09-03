@@ -200,7 +200,7 @@ export default defineComponent({
 					],
 				},
 			];
-			res.batteries.forEach((battery, i) => {
+			(res.batteries || []).forEach((battery, i) => {
 				const color = this.batteryColors[i] || "";
 				const config = this.evopt.req.batteries?.[i];
 				const capacity = this.batteryDetails[i]?.capacity || 0;

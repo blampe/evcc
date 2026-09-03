@@ -60,7 +60,7 @@ export default defineComponent({
 			return last === undefined ? 0 : last + (dt[dt.length - 1] || 0) * 1000;
 		},
 		socPercents(): number[] {
-			const soc = this.evopt.res.batteries[this.entry.index]?.state_of_charge || [];
+			const soc = (this.evopt.res.batteries || [])[this.entry.index]?.state_of_charge || [];
 			const capacityWh = this.entry.capacity * 1000;
 			return this.times.map((_, i) => {
 				const wh = soc[i] ?? 0;
