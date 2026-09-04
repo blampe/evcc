@@ -107,6 +107,8 @@ type Site struct {
 	collectors map[string]*metrics.Collector // keyed by meter ref
 	tariffSlot time.Time                     // last persisted tariff slot
 
+	batterySocEstimators map[string]*soc.BatteryEstimator // per-battery soc interpolators, keyed by meter ref
+
 	// cached state
 	gridPower                float64                     // Grid power
 	pvPower                  float64                     // PV power
@@ -387,9 +389,10 @@ func NewSite() *Site {
 	site := &Site{
 		log:        util.NewLogger("site"),
 		Voltage:    230, // V
-		collectors:  make(map[string]*metrics.Collector),
-		forecasts:   make(map[string]forecastEntry),
-		consumption: make(map[string]consumptionEntry),
+		collectors:           make(map[string]*metrics.Collector),
+		forecasts:            make(map[string]forecastEntry),
+		consumption:          make(map[string]consumptionEntry),
+		batterySocEstimators: make(map[string]*soc.BatteryEstimator),
 	}
 
 	// the result only depends on completed days, so it cannot change within a day
@@ -761,6 +764,20 @@ func (site *Site) updatePvMeters() {
 	}
 }
 
+// batterySocEstimator returns the per-battery soc interpolator for the given
+// meter ref, creating it on first use.
+func (site *Site) batterySocEstimator(ref string) *soc.BatteryEstimator {
+	if site.batterySocEstimators == nil {
+		site.batterySocEstimators = make(map[string]*soc.BatteryEstimator)
+	}
+	e, ok := site.batterySocEstimators[ref]
+	if !ok {
+		e = soc.NewBatteryEstimator(site.log)
+		site.batterySocEstimators[ref] = e
+	}
+	return e
+}
+
 // updateBatteryMeters updates battery meters
 func (site *Site) updateBatteryMeters() {
 	if len(site.batteryMeters) == 0 {
@@ -777,13 +794,26 @@ func (site *Site) updateBatteryMeters() {
 		if m, ok := api.Cap[api.Battery](meter); ok {
 			batSoc, err := soc.Guard(m.Soc())
 			if err == nil {
-				mm[i].Soc = new(batSoc)
-
+				var capacity float64
 				if bc, ok := api.Cap[api.BatteryCapacity](meter); ok {
-					mm[i].Capacity = new(bc.Capacity())
+					capacity = bc.Capacity()
+					mm[i].Capacity = new(capacity)
 				}
 
-				site.log.DEBUG.Printf("battery %d soc: %.0f%%", i+1, batSoc)
+				// the raw soc can lag reality by minutes (e.g. the Tesla Powerwall
+				// Fleet API): interpolate it from measured power between updates
+				rawSoc := batSoc
+				if capacity > 0 {
+					batSoc = site.batterySocEstimator(dev.Config().Name).Soc(rawSoc, mm[i].Power, capacity)
+				}
+
+				mm[i].Soc = new(batSoc)
+
+				if math.Abs(batSoc-rawSoc) >= 0.5 {
+					site.log.DEBUG.Printf("battery %d soc: %.1f%% (raw %.0f%%)", i+1, batSoc, rawSoc)
+				} else {
+					site.log.DEBUG.Printf("battery %d soc: %.0f%%", i+1, batSoc)
+				}
 			} else {
 				site.log.ERROR.Printf("battery %d soc: %v", i+1, err)
 			}
