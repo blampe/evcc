@@ -318,7 +318,8 @@ func (site *Site) optimizerBatteryMode() api.BatteryMode {
 		if dev == nil {
 			continue
 		}
-		action := currentBatteryAction(schedules[batteryKey(dev.Config().Name)], now)
+		name := dev.Config().Name
+		action := currentBatteryAction(schedules[batteryKey(name)], now, site.batteryDeviceSoc(name))
 		if action == "" {
 			continue
 		}
@@ -538,16 +539,33 @@ type batterySlot struct {
 	soc    float64 // optimizer's planned end-of-slot SoC (percent), 0 if unknown
 }
 
-// currentBatterySlot resolves the plan slot in effect at `now`. Resolving by slot
-// end time keeps the current slot correct even when a boundary passes between
-// optimizer runs. It front-runs an export-mode transition: within
-// optimizerFrontRunLead of the upcoming boundary, if the next slot flips
-// export-ness, it returns the next slot to cover the Powerwall's ~2min
-// autonomous pickup.
-func currentBatterySlot(plan []batterySlot, now time.Time) (batterySlot, bool) {
+// currentBatterySlot resolves the plan slot in effect at `now` for a battery at
+// the given soc (percent; 0 when unknown). Slots are indexed by end time, which
+// keeps the current slot correct even when a boundary passes between optimizer
+// runs. Two front-runs adopt an upcoming slot early:
+//
+//   - by soc: a charge/discharge slot whose end-of-slot target the pack has
+//     already reached is skipped, so the optimizer's next slot applies now. The
+//     optimizer plans a full per-slot sequence, so reaching a discharge target
+//     ahead of its time boundary just means the pack is ahead of the plan and
+//     the next slot (e.g. HoldCharge, covering the house from the pack) is what
+//     it decided to do next — otherwise the pack sits pinned at the reserve and
+//     the house imports from the grid until the boundary. Reacting on the
+//     estimator-smoothed soc lets a max-rate export that hits the target
+//     mid-slot transition immediately instead of minutes late.
+//   - by time: within optimizerFrontRunLead of the upcoming boundary, if the
+//     next slot flips export-ness, adopt it to cover the Powerwall's ~2min
+//     autonomous pickup.
+func currentBatterySlot(plan []batterySlot, now time.Time, soc float64) (batterySlot, bool) {
 	i := slices.IndexFunc(plan, func(s batterySlot) bool { return s.until.After(now) })
 	if i < 0 {
 		return batterySlot{}, false
+	}
+
+	// skip slots whose soc target is already met: the pack is ahead of the plan,
+	// so the next slot's action/target is what applies now
+	for i+1 < len(plan) && batterySlotSatisfied(plan[i], soc) {
+		i++
 	}
 
 	cur := plan[i]
@@ -560,12 +578,45 @@ func currentBatterySlot(plan []batterySlot, now time.Time) (batterySlot, bool) {
 	return cur, true
 }
 
+// batterySlotSatisfied reports whether the pack at soc (percent) has already
+// reached the plan slot's end-of-slot target in the direction of its action: a
+// discharge that has fallen to/below its target, or a charge that has risen
+// to/above it. Only these two actions are soc-gated; holding actions (hold,
+// holdcharge, normal) hold in place and are never treated as satisfied. A
+// missing soc or target (0) is not satisfied, falling back to time resolution.
+func batterySlotSatisfied(s batterySlot, soc float64) bool {
+	if soc <= 0 || s.soc <= 0 {
+		return false
+	}
+	switch s.action {
+	case actionDischarge:
+		return soc <= s.soc
+	case api.BatteryCharge.String():
+		return soc >= s.soc
+	default:
+		return false
+	}
+}
+
 // currentBatteryAction resolves the battery-mode action for `now` from the plan.
-func currentBatteryAction(plan []batterySlot, now time.Time) string {
-	if s, ok := currentBatterySlot(plan, now); ok {
+func currentBatteryAction(plan []batterySlot, now time.Time, soc float64) string {
+	if s, ok := currentBatterySlot(plan, now, soc); ok {
 		return s.action
 	}
 	return ""
+}
+
+// batteryDeviceSoc returns the freshest known soc (percent) for the named
+// battery from the latest per-device measurements, or 0 when unknown. This is
+// the estimator-smoothed value (see BatteryEstimator), so plan advancement
+// reacts to a reached target without the raw sensor's minutes-long lag.
+func (site *Site) batteryDeviceSoc(name string) float64 {
+	for _, d := range site.battery.Devices {
+		if d.Name == name && d.Soc != nil {
+			return *d.Soc
+		}
+	}
+	return 0
 }
 
 // optimizerBatteryTargetSoc returns the optimizer's planned SoC (percent) for the
@@ -578,7 +629,7 @@ func (site *Site) optimizerBatteryTargetSoc(name string) float64 {
 	plan := site.batterySchedules[batteryKey(name)]
 	site.RUnlock()
 
-	if s, ok := currentBatterySlot(plan, now); ok {
+	if s, ok := currentBatterySlot(plan, now, site.batteryDeviceSoc(name)); ok {
 		return s.soc
 	}
 	return 0

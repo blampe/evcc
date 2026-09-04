@@ -811,35 +811,93 @@ func TestCurrentBatteryAction(t *testing.T) {
 		{until: now.Add(10 * time.Minute), action: api.BatteryNormal.String()},
 		{until: now.Add(10*time.Minute + slot), action: actionDischarge},
 	}
-	assert.Equal(t, api.BatteryNormal.String(), currentBatteryAction(far, now))
+	assert.Equal(t, api.BatteryNormal.String(), currentBatteryAction(far, now, 0))
 
 	// within the lead and the next slot flips into export: adopt it now
 	near := []batterySlot{
 		{until: now.Add(time.Minute), action: api.BatteryNormal.String()},
 		{until: now.Add(time.Minute + slot), action: actionDischarge},
 	}
-	assert.Equal(t, actionDischarge, currentBatteryAction(near, now))
+	assert.Equal(t, actionDischarge, currentBatteryAction(near, now, 0))
 
 	// both sides already export (no operating-mode pickup): stay put
 	sameExport := []batterySlot{
 		{until: now.Add(time.Minute), action: api.BatteryHoldCharge.String()},
 		{until: now.Add(time.Minute + slot), action: actionDischarge},
 	}
-	assert.Equal(t, api.BatteryHoldCharge.String(), currentBatteryAction(sameExport, now))
+	assert.Equal(t, api.BatteryHoldCharge.String(), currentBatteryAction(sameExport, now, 0))
 
 	// no next slot: nothing to front-run
 	single := []batterySlot{{until: now.Add(time.Minute), action: api.BatteryNormal.String()}}
-	assert.Equal(t, api.BatteryNormal.String(), currentBatteryAction(single, now))
+	assert.Equal(t, api.BatteryNormal.String(), currentBatteryAction(single, now, 0))
 
 	// a boundary already passed: the next slot is now the current one
 	stale := []batterySlot{
 		{until: now.Add(-time.Minute), action: api.BatteryNormal.String()},
 		{until: now.Add(10 * time.Minute), action: actionDischarge},
 	}
-	assert.Equal(t, actionDischarge, currentBatteryAction(stale, now))
+	assert.Equal(t, actionDischarge, currentBatteryAction(stale, now, 0))
 
 	// empty plan: no action
-	assert.Empty(t, currentBatteryAction(nil, now))
+	assert.Empty(t, currentBatteryAction(nil, now, 0))
+}
+
+// TestCurrentBatterySlotSocAdvance covers the soc front-run: a discharge slot
+// whose end-of-slot target the pack has already reached hands off to the
+// optimizer's next slot immediately, well before the time boundary, so the house
+// is covered from the pack instead of importing until the boundary.
+func TestCurrentBatterySlotSocAdvance(t *testing.T) {
+	now := time.Now()
+	slot := tariff.SlotDuration
+
+	// discharge-to-50 this slot, then HoldCharge (cover the house from the pack).
+	// The time boundary is far off, so time resolution alone stays on discharge.
+	plan := []batterySlot{
+		{until: now.Add(10 * time.Minute), action: actionDischarge, soc: 50},
+		{until: now.Add(10*time.Minute + slot), action: api.BatteryHoldCharge.String(), soc: 50},
+	}
+
+	// target not yet reached: keep discharging, reserve pinned at the target
+	assert.Equal(t, actionDischarge, currentBatteryAction(plan, now, 55))
+	if s, ok := currentBatterySlot(plan, now, 55); assert.True(t, ok) {
+		assert.Equal(t, actionDischarge, s.action)
+		assert.Equal(t, 50.0, s.soc)
+	}
+
+	// target reached mid-slot: advance to HoldCharge now, don't wait for `until`
+	assert.Equal(t, api.BatteryHoldCharge.String(), currentBatteryAction(plan, now, 50))
+	assert.Equal(t, api.BatteryHoldCharge.String(), currentBatteryAction(plan, now, 48))
+
+	// unknown soc (0): no advancement, fall back to time resolution
+	assert.Equal(t, actionDischarge, currentBatteryAction(plan, now, 0))
+
+	// consecutive discharge slots: a met first target advances to the next
+	// discharge (keep exporting toward the lower target), not straight to hold
+	steps := []batterySlot{
+		{until: now.Add(10 * time.Minute), action: actionDischarge, soc: 50},
+		{until: now.Add(10*time.Minute + slot), action: actionDischarge, soc: 45},
+		{until: now.Add(10*time.Minute + 2*slot), action: api.BatteryHoldCharge.String(), soc: 45},
+	}
+	assert.Equal(t, actionDischarge, currentBatteryAction(steps, now, 50)) // 50 met, 45 not
+	if s, ok := currentBatterySlot(steps, now, 50); assert.True(t, ok) {
+		assert.Equal(t, 45.0, s.soc) // reserve now tracks the next target
+	}
+	assert.Equal(t, api.BatteryHoldCharge.String(), currentBatteryAction(steps, now, 45)) // both met
+
+	// charge is soc-gated symmetrically: a reached charge target advances
+	charge := []batterySlot{
+		{until: now.Add(10 * time.Minute), action: api.BatteryCharge.String(), soc: 80},
+		{until: now.Add(10*time.Minute + slot), action: api.BatteryNormal.String(), soc: 80},
+	}
+	assert.Equal(t, api.BatteryCharge.String(), currentBatteryAction(charge, now, 79))
+	assert.Equal(t, api.BatteryNormal.String(), currentBatteryAction(charge, now, 80))
+
+	// a holding slot is never soc-satisfied: it stays until its time boundary
+	held := []batterySlot{
+		{until: now.Add(10 * time.Minute), action: api.BatteryHoldCharge.String(), soc: 50},
+		{until: now.Add(10*time.Minute + slot), action: actionDischarge, soc: 45},
+	}
+	assert.Equal(t, api.BatteryHoldCharge.String(), currentBatteryAction(held, now, 40))
 }
 
 // TestSlotSocPercent converts the optimizer's planned end-of-slot SoC (Wh) to a
