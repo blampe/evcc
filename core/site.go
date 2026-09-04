@@ -123,6 +123,7 @@ type Site struct {
 	batterySchedules         map[string][]batterySlot    // per-battery optimizer mode plan, for front-running export transitions
 	batterySpikeSlot         time.Time                   // 15-min slot the export spike was last (re)written for
 	batteryBoostSlot         time.Time                   // 15-min slot the battery-boost reserve was last pinned for (zero = not boosting)
+	batteryBoostReserveSlot  time.Time                   // 15-min slot a battery boost hit the pack's reserve (latches the car stop, zero = not tripped)
 	suggestionActions        map[string]string           // last notified actionable optimizer action by device key
 
 	optimizerMu      sync.Mutex                  // guards optimizer runs

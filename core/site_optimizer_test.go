@@ -644,6 +644,80 @@ func TestLoadpointOptimizerAction(t *testing.T) {
 	assert.Empty(t, source)
 }
 
+// TestBatteryBoostReserveGate stops a battery-sourced boost once the home
+// battery reaches its planned reserve, so the car doesn't keep charging from the
+// grid at peak prices. It trips when the pack soc reaches the target, or in real
+// time when the boost's own draw spills to the grid, and latches for the slot.
+func TestBatteryBoostReserveGate(t *testing.T) {
+	newSite := func() *Site {
+		s := &Site{
+			log:        util.NewLogger("foo"),
+			loadpoints: []*Loadpoint{NewLoadpoint(util.NewLogger("lp0"), nil)},
+			batteryMeters: []config.Device[api.Meter]{
+				config.NewStaticDevice(config.Named{Name: "home"}, api.Meter(&recordingBatteryController{})),
+			},
+			batterySchedules: map[string][]batterySlot{
+				batteryKey("home"): {{until: time.Now().Add(time.Hour), action: "normal", soc: 55}},
+			},
+		}
+		s.battery.Soc = 59 // above the 55% reserve
+		s.setSuggestions(map[string]types.Suggestion{
+			loadpointKey(0): {Action: actionCharge, Charge: 9600, Source: sourceBattery},
+		})
+		return s
+	}
+
+	// pack above reserve, not importing => boost charges
+	site := newSite()
+	action, power, source := site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionCharge, action, "above reserve: boost charges")
+	assert.Equal(t, 9600.0, power)
+	assert.Equal(t, sourceBattery, source, "source stays battery so the reserve stays pinned")
+
+	// pack soc reached the reserve => stop, keeping the source pinned so the pack
+	// holds at the target instead of draining further
+	site = newSite()
+	site.battery.Soc = 55
+	action, _, source = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionStop, action, "at reserve: boost stops")
+	assert.Equal(t, sourceBattery, source, "source stays battery so the pack holds at the reserve")
+
+	// pack still above reserve but the boost's draw is already spilling to the grid
+	// (the pack stopped discharging early) => real-time stop
+	site = newSite()
+	site.loadpoints[0].chargePower = 9600 // car is drawing the boost power
+	site.gridPower = 9000                 // most of it from the grid
+	action, _, _ = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionStop, action, "grid import while boosting stops the car")
+
+	// pre-boost grid import (car not drawing yet) must NOT trip the guard, or it
+	// would latch the car off before the boost even starts
+	site = newSite()
+	site.loadpoints[0].chargePower = 0 // boost hasn't started drawing
+	site.gridPower = 9000              // e.g. leftover import from the prior hold state
+	action, _, _ = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionCharge, action, "pre-boost grid import doesn't false-trip")
+
+	// latch: once tripped this slot the car stays stopped even if the pack recovers
+	site = newSite()
+	site.battery.Soc = 55
+	action, _, _ = site.loadpointOptimizerAction(0) // trips + latches
+	require.Equal(t, actionStop, action)
+	site.battery.Soc = 59 // pack "recovered" (shouldn't matter within the slot)
+	action, _, _ = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionStop, action, "latched for the slot")
+
+	// a grid-sourced charge is never gated by the home battery reserve
+	site = newSite()
+	site.battery.Soc = 10 // well below any reserve
+	site.setSuggestions(map[string]types.Suggestion{
+		loadpointKey(0): {Action: actionCharge, Charge: 7000, Source: sourceGrid},
+	})
+	action, _, source = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionCharge, action, "grid-sourced charge isn't gated")
+	assert.Equal(t, sourceGrid, source)
+}
+
 // TestLoadpointChargeSource classifies a loadpoint charge as grid-sourced when
 // the plan imports, else surplus; a non-charge action carries no source.
 func TestLoadpointChargeSource(t *testing.T) {
