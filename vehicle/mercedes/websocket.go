@@ -3,6 +3,10 @@ package mercedes
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,19 +19,32 @@ import (
 )
 
 const (
-	// wsReadTimeout bounds a single read. The backend sends a full update right
-	// after connecting and keeps a keep-alive going; a read blocking this long
-	// means the connection is dead and we reconnect.
-	wsReadTimeout = 60 * time.Second
-
-	// wsPingInterval keeps the connection alive between VSU pushes.
+	// wsPingInterval keeps the connection alive and proves liveness between VSU
+	// pushes. A parked vehicle sends no data for hours; the successful ping (not
+	// incoming data) is what tells us the cached snapshot is still current.
 	wsPingInterval = 30 * time.Second
 
-	// wsReconnectDelay is the minimum delay between connection attempts. The
-	// backend pushes a full update on connect, so this is also the effective
-	// poll interval; keep it comfortably above zero to avoid 429 account blocks
-	// (mbapi2020 uses a comparable duty cycle).
-	wsReconnectDelay = 60 * time.Second
+	// wsMinReconnectDelay is the floor between handshake attempts. The VSU socket
+	// is long-lived — kept open by pings and only re-dialed when the backend
+	// actually drops us — so this simply bounds how fast we re-handshake after a
+	// drop. Re-dialing too eagerly is what earns HTTP 429 account blocks, so the
+	// connection is never torn down on idle; it is held open instead.
+	wsMinReconnectDelay = 30 * time.Second
+
+	// wsMaxReconnectDelay caps the exponential backoff after repeated dial
+	// failures.
+	wsMaxReconnectDelay = 5 * time.Minute
+
+	// wsRateLimitBackoff is the minimum cooldown after an HTTP 429 handshake
+	// rejection that carries no Retry-After. A 429 means we dialed too often for
+	// the account, so we wait far longer than a normal reconnect before retrying.
+	wsRateLimitBackoff = 5 * time.Minute
+
+	// wsHealthyThreshold is how long a connection must stay up to count as a
+	// healthy session that resets the reconnect backoff. A connection that drops
+	// sooner leaves the backoff climbing, so repeated fast drops back off instead
+	// of hammering the handshake.
+	wsHealthyThreshold = 60 * time.Second
 
 	// wsMaxMessageBytes bounds a single websocket frame. VSU full updates carry
 	// ~250 attributes per vehicle; 8 MiB is comfortably above that.
@@ -53,6 +70,12 @@ type Websocket struct {
 	sessionID string
 	states    map[string]*wsState                 // keyed by VIN
 	commands  map[string]*pb.AppTwinCommandStatus // latest command result, keyed by VIN
+
+	// lastAlive is the last time the connection proved itself alive — a
+	// successful ping or an incoming message — guarded by mu. The freshness guard
+	// keys off this rather than the age of the last data push, since a healthy
+	// connection to a parked car legitimately delivers nothing for long stretches.
+	lastAlive time.Time
 
 	// conn is the current connection, guarded by mu; used to send acks from the
 	// read loop.
@@ -138,34 +161,42 @@ func (ws *Websocket) sendCommand(ctx context.Context, req *pb.CommandRequest) (s
 	})
 }
 
-// run maintains the connection with exponential backoff. A fresh full update
-// arrives after every (re)connect, so each reconnect doubles as a poll.
+// run maintains a single long-lived VSU connection. The socket is kept open
+// (pings prove liveness); we only re-dial when the backend drops us, which keeps
+// the handshake rate low enough to stay clear of the 429 account limit.
 //
-// A minimum reconnect delay is always enforced between connection attempts
-// (even successful ones): mbapi2020 documents that reconnecting too eagerly can
-// trigger HTTP 429 account blocks, so the connection runs on a duty cycle
-// rather than reconnecting instantly.
+// Reconnects use exponential backoff floored at wsMinReconnectDelay. A healthy
+// session (one that stayed up past wsHealthyThreshold) resets the backoff; a
+// handshake rejected with HTTP 429 forces at least wsRateLimitBackoff — or the
+// server's Retry-After — before the next attempt.
 func (ws *Websocket) run(ctx context.Context) {
 	bo := backoff.NewExponentialBackOff(
 		backoff.WithMaxElapsedTime(0),
-		backoff.WithMaxInterval(2*time.Minute),
+		backoff.WithInitialInterval(wsMinReconnectDelay),
+		backoff.WithMaxInterval(wsMaxReconnectDelay),
 	)
 
 	for ctx.Err() == nil {
-		err := ws.connect(ctx)
+		healthy, err := ws.connect(ctx)
 		if err != nil && !errors.Is(err, context.Canceled) {
 			ws.log.DEBUG.Printf("websocket: %v", err)
 		}
+		if healthy {
+			bo.Reset()
+		}
 
-		// On errors use exponential backoff; on a clean disconnect fall back to
-		// the minimum reconnect delay.
-		delay := wsReconnectDelay
-		if err != nil {
-			if d := bo.NextBackOff(); d > delay {
+		delay := bo.NextBackOff()
+		if delay < wsMinReconnectDelay {
+			delay = wsMinReconnectDelay
+		}
+
+		// A 429 means the backend rate-limited the handshake itself; wait out its
+		// cooldown (Retry-After if given, else wsRateLimitBackoff) before retrying.
+		var rl *rateLimitError
+		if errors.As(err, &rl) {
+			if d := max(rl.retryAfter, wsRateLimitBackoff); d > delay {
 				delay = d
 			}
-		} else {
-			bo.Reset()
 		}
 
 		select {
@@ -176,22 +207,30 @@ func (ws *Websocket) run(ctx context.Context) {
 	}
 }
 
-// connect dials the websocket and runs the read loop until the connection
-// drops. It returns the terminating error (nil on a clean close).
-func (ws *Websocket) connect(ctx context.Context) error {
+// connect dials the websocket and runs the read loop until the connection drops,
+// returning the terminating error. The bool reports whether the session was
+// healthy (stayed up past wsHealthyThreshold) so the caller can reset its
+// reconnect backoff.
+//
+// There is deliberately no read deadline: a parked vehicle receives its full
+// update on connect and then goes quiet indefinitely, so a read timeout would
+// tear down a perfectly good connection and drive the very reconnect storm that
+// triggers 429s. Liveness is instead proven by the pinger, which closes the
+// connection on a failed ping and thereby unblocks Read with an error.
+func (ws *Websocket) connect(ctx context.Context) (bool, error) {
 	tok, err := ws.identity.Token()
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	headers := wsheaders(tok.AccessToken, ws.sessionID, ws.region)
 	opts := &websocket.DialOptions{HTTPHeader: mapToHeader(headers)}
 
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	conn, _, err := websocket.Dial(dialCtx, getWebsocketUri(ws.region), opts)
+	conn, resp, err := websocket.Dial(dialCtx, getWebsocketUri(ws.region), opts)
 	cancel()
 	if err != nil {
-		return err
+		return false, dialError(err, resp)
 	}
 	conn.SetReadLimit(wsMaxMessageBytes)
 
@@ -206,56 +245,35 @@ func (ws *Websocket) connect(ctx context.Context) error {
 		_ = conn.CloseNow()
 	}()
 
+	connectedAt := time.Now()
+	ws.markAlive()
 	ws.log.DEBUG.Println("websocket: connected")
 
 	// Ping keep-alive. Liveness is proven by pings, not by data: the pinger
 	// tears the connection down when a ping fails, so a stalled connection is
-	// surfaced as a read error rather than being mistaken for an idle cycle.
+	// surfaced as a read error rather than blocking Read forever.
 	pingCtx, pingCancel := context.WithCancel(ctx)
 	defer pingCancel()
 	go ws.pinger(pingCtx, conn)
 
-	var gotData bool
 	for {
-		readCtx, readCancel := context.WithTimeout(ctx, wsReadTimeout)
-		typ, data, err := conn.Read(readCtx)
-		readCancel()
+		typ, data, err := conn.Read(ctx)
 		if err != nil {
-			if idleCycleEnd(err, ctx.Err(), gotData) {
-				// Clean end of a poll cycle: the backend pushed its update(s)
-				// and then went quiet, and the keep-alive pings are still
-				// succeeding. Return nil so run() reconnects on the steady duty
-				// cycle and resets the backoff instead of treating this normal
-				// condition as an error.
-				return nil
-			}
-			return err
+			// Any read return means the connection dropped: the pinger closed a
+			// dead link, the backend closed it, or the network failed. Report
+			// whether the session lived long enough to count as healthy so run()
+			// can decide between resetting and climbing its backoff.
+			return time.Since(connectedAt) >= wsHealthyThreshold, err
 		}
+		ws.markAlive()
 		if typ != websocket.MessageBinary {
 			continue
 		}
-		gotData = true
 
 		if err := ws.handleMessage(ctx, data); err != nil {
 			ws.log.DEBUG.Printf("websocket: handle: %v", err)
 		}
 	}
-}
-
-// idleCycleEnd reports whether a read error is the benign end of a poll cycle:
-// our own read deadline fired (context.DeadlineExceeded) rather than a
-// parent-context cancellation (parentErr != nil), and the connection had already
-// delivered at least one message. A healthy connection to a parked vehicle
-// always ends this way, so it must not be logged as an error or drive the
-// reconnect backoff upward.
-//
-// The gotData guard keeps a genuine fault visible: a connection that times out
-// having delivered nothing is abnormal (the backend pushes a full update on
-// connect) and is reported as an error so it is logged and backed off. A
-// connection that dies mid-life is caught by the pinger, which closes it and
-// makes Read return a non-deadline error.
-func idleCycleEnd(err, parentErr error, gotData bool) bool {
-	return gotData && parentErr == nil && errors.Is(err, context.DeadlineExceeded)
 }
 
 func (ws *Websocket) pinger(ctx context.Context, conn *websocket.Conn) {
@@ -272,16 +290,17 @@ func (ws *Websocket) pinger(ctx context.Context, conn *websocket.Conn) {
 			cancel()
 			if err != nil {
 				// A failed ping means the connection is dead. Close it so the
-				// read loop unblocks immediately with a non-deadline error and
-				// reconnects, instead of waiting out the full read timeout and
-				// mistaking the dead connection for a clean idle cycle. Skip the
-				// close on parent-context teardown, where connect() already
-				// closes the connection.
+				// read loop unblocks immediately with an error and reconnects.
+				// Skip the close on parent-context teardown, where connect()
+				// already closes the connection.
 				if ctx.Err() == nil {
 					_ = conn.CloseNow()
 				}
 				return
 			}
+			// A successful ping proves the link is alive even while a parked car
+			// sends no data, keeping the freshness guard satisfied.
+			ws.markAlive()
 		}
 	}
 }
@@ -401,6 +420,66 @@ func (ws *Websocket) applyCommandStatus(upd *pb.AppTwinCommandStatusUpdatesByVIN
 			}
 		}
 	}
+}
+
+// markAlive records that the connection just proved itself alive (a successful
+// ping or an incoming message).
+func (ws *Websocket) markAlive() {
+	ws.mu.Lock()
+	ws.lastAlive = time.Now()
+	ws.mu.Unlock()
+}
+
+// alive returns the last time the connection proved itself alive. The provider's
+// freshness guard treats the cached snapshot as current while this is recent.
+func (ws *Websocket) alive() time.Time {
+	ws.mu.RLock()
+	defer ws.mu.RUnlock()
+	return ws.lastAlive
+}
+
+// rateLimitError marks a handshake rejected with HTTP 429. retryAfter carries
+// the server's Retry-After hint when present (zero otherwise).
+type rateLimitError struct {
+	retryAfter time.Duration
+}
+
+func (e *rateLimitError) Error() string {
+	if e.retryAfter > 0 {
+		return fmt.Sprintf("handshake rate limited (429), retry after %s", e.retryAfter)
+	}
+	return "handshake rate limited (429)"
+}
+
+// dialError classifies a websocket.Dial failure. A 429 handshake response is
+// wrapped as a rateLimitError so run() applies the longer rate-limit cooldown;
+// every other failure is returned unchanged.
+func dialError(err error, resp *http.Response) error {
+	if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
+		return &rateLimitError{retryAfter: parseRetryAfter(resp.Header.Get("Retry-After"))}
+	}
+	return err
+}
+
+// parseRetryAfter parses a Retry-After header (delta-seconds or HTTP-date) into
+// a positive duration, returning 0 when it is absent or unparseable.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // mapToHeader converts a header map to http.Header for the dialer.

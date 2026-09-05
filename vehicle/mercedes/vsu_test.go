@@ -1,11 +1,10 @@
 package mercedes
 
 import (
-	"context"
 	"errors"
-	"fmt"
-	"net"
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/evcc-io/evcc/api"
 	pb "github.com/evcc-io/evcc/vehicle/mercedes/pb"
@@ -131,37 +130,66 @@ func TestMapVSUSocLimitPresentButZero(t *testing.T) {
 	assert.Equal(t, 100, res.EvInfo.Battery.SocLimit, "must fall back to charge program, not report 0%")
 }
 
-// TestIdleCycleEnd covers the read-loop classification: a read deadline that
-// fires after data was delivered is a benign end-of-cycle (reconnect quietly),
-// while a zero-data timeout, a parent cancellation, or any non-deadline error is
-// a real error the loop must propagate.
-func TestIdleCycleEnd(t *testing.T) {
-	// coder/websocket wraps the context error as "failed to get reader: %w".
-	readDeadline := fmt.Errorf("failed to get reader: %w", context.DeadlineExceeded)
-
-	tt := []struct {
-		name      string
-		err       error
-		parentErr error
-		gotData   bool
-		want      bool
-	}{
-		{"idle after data", readDeadline, nil, true, true},
-		{"bare deadline after data", context.DeadlineExceeded, nil, true, true},
-		{"timeout with no data", readDeadline, nil, false, false},
-		{"parent cancelled", readDeadline, context.Canceled, true, false},
-		{"connection closed", fmt.Errorf("failed to get reader: %w", net.ErrClosed), nil, true, false},
-		// Non-deadline errors must not be mistaken for an idle cycle even when
-		// they wrap another context error (Canceled) or are plain.
-		{"wrapped cancel", fmt.Errorf("boom: %w", context.Canceled), nil, true, false},
-		{"plain error", errors.New("plain error"), nil, true, false},
+// TestDialErrorRateLimit covers the handshake-failure classification: a 429
+// response becomes a rateLimitError carrying its Retry-After hint, while any
+// other response (or none) passes the original dial error through unchanged.
+func TestDialErrorRateLimit(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{"120"}},
 	}
+	err := dialError(errors.New("expected handshake response status code 101 but got 429"), resp)
+	var rl *rateLimitError
+	require.True(t, errors.As(err, &rl), "429 must classify as rateLimitError")
+	assert.Equal(t, 120*time.Second, rl.retryAfter)
 
-	for _, tc := range tt {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, idleCycleEnd(tc.err, tc.parentErr, tc.gotData))
-		})
+	// Non-429 and nil responses pass the original error through untouched.
+	orig := errors.New("dial tcp: connection refused")
+	assert.Equal(t, orig, dialError(orig, nil))
+	assert.Equal(t, orig, dialError(orig, &http.Response{StatusCode: http.StatusInternalServerError}))
+}
+
+// TestParseRetryAfter covers Retry-After parsing: valid delta-seconds map to a
+// duration; empty, non-positive, or unparseable values yield zero (fall back to
+// the default rate-limit cooldown).
+func TestParseRetryAfter(t *testing.T) {
+	assert.Equal(t, 90*time.Second, parseRetryAfter("90"))
+	assert.Equal(t, time.Duration(0), parseRetryAfter(""))
+	assert.Equal(t, time.Duration(0), parseRetryAfter("garbage"))
+	assert.Equal(t, time.Duration(0), parseRetryAfter("0"))
+	assert.Equal(t, time.Duration(0), parseRetryAfter("-5"))
+}
+
+// TestVSUStatusFreshness covers the liveness-based freshness guard: before any
+// update the provider signals retry; a cached snapshot stays fresh as long as
+// the connection proved itself alive recently (even when the data itself is
+// old, as for a parked car); and it only goes stale once the connection has
+// been dark past the staleness window.
+func TestVSUStatusFreshness(t *testing.T) {
+	const vin = "WDB1234567890"
+	ws := &Websocket{states: map[string]*wsState{}}
+
+	// No full update yet → retry semantics.
+	_, err := vsuStatus(ws, vin, time.Minute)
+	assert.ErrorIs(t, err, api.ErrMustRetry)
+
+	// Old cached data but a link that pinged moments ago → still fresh.
+	ws.states[vin] = &wsState{
+		vsu: &pb.VehicleStatusUpdate{
+			Odo: &pb.Int64DistanceAttribute{Value: 4242, Unit: pb.VehicleAttributeStatus_KILOMETERS},
+		},
+		updated: time.Now().Add(-time.Hour),
 	}
+	ws.lastAlive = time.Now()
+	res, err := vsuStatus(ws, vin, time.Minute)
+	require.NoError(t, err, "a live connection keeps a parked car's snapshot fresh")
+	assert.Equal(t, 4242, res.VehicleInfo.Odometer.Value)
+
+	// Connection silent past the staleness window (max(15m, 3*cache) = 15m) →
+	// stale, even though the cached data is untouched.
+	ws.lastAlive = time.Now().Add(-30 * time.Minute)
+	_, err = vsuStatus(ws, vin, time.Minute)
+	assert.Error(t, err, "a dark connection eventually goes stale")
 }
 
 // TestMergeVSUReplacesFields verifies that a partial update replaces individual
