@@ -160,6 +160,20 @@ func TestParseRetryAfter(t *testing.T) {
 	assert.Equal(t, time.Duration(0), parseRetryAfter("-5"))
 }
 
+// TestRateLimitCooldown covers the escalating 429 backoff: it starts at
+// wsRateLimitBackoff, doubles per consecutive rejection, caps at
+// wsMaxRateLimitBackoff, and yields to a longer Retry-After hint.
+func TestRateLimitCooldown(t *testing.T) {
+	assert.Equal(t, wsRateLimitBackoff, rateLimitCooldown(1, 0))
+	assert.Equal(t, 2*wsRateLimitBackoff, rateLimitCooldown(2, 0))
+	assert.Equal(t, 4*wsRateLimitBackoff, rateLimitCooldown(3, 0))
+	assert.Equal(t, wsMaxRateLimitBackoff, rateLimitCooldown(99, 0), "escalation is capped")
+
+	// A longer Retry-After wins; a shorter one never shrinks the escalated wait.
+	assert.Equal(t, time.Hour, rateLimitCooldown(1, time.Hour))
+	assert.Equal(t, 2*wsRateLimitBackoff, rateLimitCooldown(2, time.Second))
+}
+
 // TestVSUStatusFreshness covers the liveness-based freshness guard: before any
 // update the provider signals retry; a cached snapshot stays fresh as long as
 // the connection proved itself alive recently (even when the data itself is

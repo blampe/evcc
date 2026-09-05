@@ -35,10 +35,17 @@ const (
 	// failures.
 	wsMaxReconnectDelay = 5 * time.Minute
 
-	// wsRateLimitBackoff is the minimum cooldown after an HTTP 429 handshake
+	// wsRateLimitBackoff is the initial cooldown after an HTTP 429 handshake
 	// rejection that carries no Retry-After. A 429 means we dialed too often for
 	// the account, so we wait far longer than a normal reconnect before retrying.
 	wsRateLimitBackoff = 5 * time.Minute
+
+	// wsMaxRateLimitBackoff caps the escalating 429 cooldown. The backend's
+	// account block outlasts a single cooldown and only clears after a sustained
+	// quiet period, so consecutive rejections back off toward this cap rather than
+	// re-dialing every wsRateLimitBackoff forever (which can keep resetting a
+	// rolling-window block so it never clears).
+	wsMaxRateLimitBackoff = 30 * time.Minute
 
 	// wsHealthyThreshold is how long a connection must stay up to count as a
 	// healthy session that resets the reconnect backoff. A connection that drops
@@ -165,10 +172,12 @@ func (ws *Websocket) sendCommand(ctx context.Context, req *pb.CommandRequest) (s
 // (pings prove liveness); we only re-dial when the backend drops us, which keeps
 // the handshake rate low enough to stay clear of the 429 account limit.
 //
-// Reconnects use exponential backoff floored at wsMinReconnectDelay. A healthy
-// session (one that stayed up past wsHealthyThreshold) resets the backoff; a
-// handshake rejected with HTTP 429 forces at least wsRateLimitBackoff — or the
-// server's Retry-After — before the next attempt.
+// Normal reconnects use exponential backoff floored at wsMinReconnectDelay, and
+// a healthy session (one that stayed up past wsHealthyThreshold) resets it. A
+// handshake rejected with HTTP 429 is handled separately: the cooldown escalates
+// across consecutive rejections (see rateLimitCooldown) so a sustained account
+// block gets an increasingly quiet window to clear rather than being reset by
+// eager re-dials.
 func (ws *Websocket) run(ctx context.Context) {
 	bo := backoff.NewExponentialBackOff(
 		backoff.WithMaxElapsedTime(0),
@@ -176,26 +185,29 @@ func (ws *Websocket) run(ctx context.Context) {
 		backoff.WithMaxInterval(wsMaxReconnectDelay),
 	)
 
+	var rateLimits int // consecutive 429 handshake rejections
 	for ctx.Err() == nil {
 		healthy, err := ws.connect(ctx)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			ws.log.DEBUG.Printf("websocket: %v", err)
-		}
-		if healthy {
-			bo.Reset()
-		}
 
-		delay := bo.NextBackOff()
-		if delay < wsMinReconnectDelay {
-			delay = wsMinReconnectDelay
-		}
-
-		// A 429 means the backend rate-limited the handshake itself; wait out its
-		// cooldown (Retry-After if given, else wsRateLimitBackoff) before retrying.
+		var delay time.Duration
 		var rl *rateLimitError
-		if errors.As(err, &rl) {
-			if d := max(rl.retryAfter, wsRateLimitBackoff); d > delay {
-				delay = d
+		switch {
+		case errors.As(err, &rl):
+			rateLimits++
+			delay = rateLimitCooldown(rateLimits, rl.retryAfter)
+			ws.log.DEBUG.Printf("websocket: handshake rate limited (429) x%d, backing off %s", rateLimits, delay.Round(time.Second))
+
+		default:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				ws.log.DEBUG.Printf("websocket: %v", err)
+			}
+			rateLimits = 0
+			if healthy {
+				bo.Reset()
+			}
+			delay = bo.NextBackOff()
+			if delay < wsMinReconnectDelay {
+				delay = wsMinReconnectDelay
 			}
 		}
 
@@ -205,6 +217,21 @@ func (ws *Websocket) run(ctx context.Context) {
 		case <-time.After(delay):
 		}
 	}
+}
+
+// rateLimitCooldown returns how long to wait after `consecutive` back-to-back
+// 429 handshake rejections. The wait starts at wsRateLimitBackoff and doubles
+// each time up to wsMaxRateLimitBackoff, so a sustained account block gets an
+// increasingly quiet window to clear. A server Retry-After hint wins if longer.
+func rateLimitCooldown(consecutive int, retryAfter time.Duration) time.Duration {
+	d := wsRateLimitBackoff
+	for i := 1; i < consecutive && d < wsMaxRateLimitBackoff; i++ {
+		d *= 2
+	}
+	if d > wsMaxRateLimitBackoff {
+		d = wsMaxRateLimitBackoff
+	}
+	return max(d, retryAfter)
 }
 
 // connect dials the websocket and runs the read loop until the connection drops,
