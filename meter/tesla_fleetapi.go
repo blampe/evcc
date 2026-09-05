@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -34,6 +35,13 @@ type fleetAPIProvider struct {
 	energySiteID int64
 	liveStatusG  func() (*teslaclient.EnergySiteLiveStatus, error)
 	siteInfoG    func() (*teslaclient.EnergySite, error)
+
+	// tariffPlanName is the Tesla catalog lookup key for the user's utility rate
+	// plan (e.g. "CPSF-E-ELEC-NEM3-2026"). Optional; when set it lets restoreTariff
+	// recover the fully-labeled plan from the catalog if evcc never snapshotted the
+	// real tariff (cold start onto a stranded spike). The pack does not expose this
+	// key, so it must be configured.
+	tariffPlanName string
 
 	// guard snapshots the real tariff while a synthetic export-forcing tariff is
 	// active. It lives on the shared provider so the battery controller (which
@@ -74,7 +82,8 @@ func NewFleetAPIFromConfig(other map[string]any) (api.Meter, error) {
 		Usage              string
 		Credentials        oauth.ClientCredentials
 		Tokens             oauth.Tokens
-		EnergySiteID       int64 `mapstructure:"siteid"`
+		EnergySiteID       int64  `mapstructure:"siteid"`
+		Tariff             string `mapstructure:"tariff"` // Tesla catalog plan name for labeled restore-by-name (optional)
 		Cache              time.Duration
 		AllowGridImport    bool // permit charging the pack from the grid (default off)
 		batterySocLimits   `mapstructure:",squash"`
@@ -115,12 +124,12 @@ func NewFleetAPIFromConfig(other map[string]any) (api.Meter, error) {
 		cc.Usage = "solar"
 	}
 
-	return NewFleetAPI(cc.Usage, cc.Credentials.ID, cc.Credentials.Secret, token, cc.EnergySiteID, cc.Cache, cc.batterySocLimits, cc.batteryPowerLimits, cc.AllowGridImport)
+	return NewFleetAPI(cc.Usage, cc.Credentials.ID, cc.Credentials.Secret, token, cc.EnergySiteID, cc.Tariff, cc.Cache, cc.batterySocLimits, cc.batteryPowerLimits, cc.AllowGridImport)
 }
 
 var fleetAPIProviders = utilcache.New[*fleetAPIProvider]()
 
-func getOrCreateProvider(clientID, clientSecret string, token *oauth2.Token, energySiteID int64, cacheDur time.Duration) (*fleetAPIProvider, error) {
+func getOrCreateProvider(clientID, clientSecret string, token *oauth2.Token, energySiteID int64, tariffPlanName string, cacheDur time.Duration) (*fleetAPIProvider, error) {
 	log := util.NewLogger("fleetapi").Redact(token.AccessToken, token.RefreshToken, clientID, clientSecret)
 
 	tc, err := newFleetClient(log, evcctesla.OAuth2Config(clientID, clientSecret), token)
@@ -155,11 +164,12 @@ func getOrCreateProvider(clientID, clientSecret string, token *oauth2.Token, ene
 		}
 
 		p := &fleetAPIProvider{
-			log:          log,
-			client:       tc,
-			site:         site,
-			energySiteID: energySiteID,
-			guard:        newTariffGuard(fmt.Sprintf("tesla.%d.tariff", energySiteID)),
+			log:            log,
+			client:         tc,
+			site:           site,
+			energySiteID:   energySiteID,
+			tariffPlanName: tariffPlanName,
+			guard:          newTariffGuard(fmt.Sprintf("tesla.%d.tariff", energySiteID)),
 		}
 
 		p.liveStatusG = util.Cached(p.getLiveStatus, cacheDur)
@@ -203,8 +213,8 @@ func newFleetClient(log *util.Logger, oc *oauth2.Config, token *oauth2.Token) (*
 }
 
 // NewFleetAPI creates a Tesla Fleet API Meter for Powerwall 3.
-func NewFleetAPI(usage, clientID, clientSecret string, token *oauth2.Token, energySiteID int64, cacheDur time.Duration, socLimits batterySocLimits, powerLimits batteryPowerLimits, allowGridImport bool) (api.Meter, error) {
-	provider, err := getOrCreateProvider(clientID, clientSecret, token, energySiteID, cacheDur)
+func NewFleetAPI(usage, clientID, clientSecret string, token *oauth2.Token, energySiteID int64, tariffPlanName string, cacheDur time.Duration, socLimits batterySocLimits, powerLimits batteryPowerLimits, allowGridImport bool) (api.Meter, error) {
+	provider, err := getOrCreateProvider(clientID, clientSecret, token, energySiteID, tariffPlanName, cacheDur)
 	if err != nil {
 		return nil, err
 	}
@@ -315,9 +325,16 @@ func isSyntheticTariff(t *teslaclient.TariffContentV2) bool {
 // tariffGuard remembers the user's real Powerwall tariff so evcc can restore it
 // after overwriting it with a synthetic export-forcing tariff. The snapshot is
 // persisted (keyed by settingsKey) so it survives an evcc restart taken while a
-// synthetic tariff is active. It never records a synthetic tariff as the real
-// one — otherwise a restart mid-discharge could make evcc "restore" the
-// synthetic tariff permanently.
+// synthetic tariff is active.
+//
+// Two invariants make it robust:
+//   - It never records a synthetic tariff as the real one — otherwise a restart
+//     mid-discharge could make evcc "restore" the synthetic tariff permanently.
+//   - It is never deleted, only refreshed. remember() updates the snapshot to the
+//     latest real tariff whenever one is observed (so a utility plan change is
+//     tracked automatically — the annual rate schedule itself never goes stale),
+//     and persists immediately so a crash right after entering discharge can't
+//     strand the pack with a snapshot that only lived in memory.
 type tariffGuard struct {
 	mu          sync.Mutex
 	settingsKey string
@@ -342,36 +359,38 @@ func (g *tariffGuard) load() {
 	}
 }
 
-// remember records current as the real tariff to restore later, unless we
-// already hold one or current is synthetic (our own export-forcing tariff).
+// remember refreshes the saved real tariff to current, so the snapshot always
+// tracks the latest real plan (a utility switch or annual rate revision is picked
+// up the next time the pack shows a real tariff). It ignores a nil or synthetic
+// current (never recording our own export-forcing tariff as real), and no-ops
+// when current is unchanged so an unchanged read costs no persist. On a real
+// change it persists immediately so a crash can't strand the snapshot in memory.
 func (g *tariffGuard) remember(current *teslaclient.TariffContentV2) {
+	if current == nil || isSyntheticTariff(current) {
+		return
+	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if g.saved != nil || current == nil || isSyntheticTariff(current) {
+	if g.saved != nil && reflect.DeepEqual(g.saved, current) {
 		return
 	}
 	g.saved = current
 	if g.settingsKey != "" {
-		_ = settings.SetJson(g.settingsKey, current)
+		if err := settings.SetJson(g.settingsKey, current); err == nil {
+			_ = settings.Persist()
+		}
 	}
 }
 
-// peek returns the saved real tariff without clearing it, or nil.
+// peek returns the saved real tariff without clearing it, or nil. The snapshot is
+// never dropped — restore rewrites it but keeps it, so evcc can restore again any
+// time (the schedule stays valid indefinitely; remember refreshes it on change).
 func (g *tariffGuard) peek() *teslaclient.TariffContentV2 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.saved
-}
-
-// forget drops the saved real tariff. Call it only after a successful restore.
-func (g *tariffGuard) forget() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	g.saved = nil
-	if g.settingsKey != "" {
-		_ = settings.Delete(g.settingsKey)
-	}
 }
 
 // snapshotTariff records the user's real tariff before a synthetic export-forcing
@@ -391,22 +410,44 @@ func (m *FleetAPI) snapshotTariff() {
 	m.provider.guard.remember(site.TariffContentV2)
 }
 
-// restoreTariff writes back the user's real tariff if a synthetic one was
-// applied. It is a no-op when nothing was snapshotted, and keeps the snapshot
-// if the write fails so a later attempt can retry.
+// restoreTariff writes the user's real tariff back after a synthetic one was
+// applied. With a snapshot in hand it rewrites it and KEEPS it (never deleted, so
+// evcc can always restore again — the annual schedule stays valid indefinitely).
+//
+// With no snapshot — evcc crashed before the snapshot persisted, or started up
+// onto a pack already carrying a stranded spike — it reads the live tariff and
+// self-heals: if the live tariff is synthetic it reconstructs the real one and
+// writes that back, rather than masking the spike forever (effectiveTariff only
+// hides it from our own reporting). Reconstruction prefers the fully-labeled plan
+// from the catalog when a plan name is configured (tariffPlanName), and otherwise
+// falls back to unspikeTariff (rates-exact, labels blank).
 func (m *FleetAPI) restoreTariff() error {
 	if m.provider.guard == nil {
 		return nil
 	}
-	t := m.provider.guard.peek()
-	if t == nil {
-		return nil
+	if t := m.provider.guard.peek(); t != nil {
+		return m.apiWrite("raw tariff → restore real", func() error { return m.provider.site.SetRawTariff(*t) })
 	}
-	if err := m.apiWrite("raw tariff → restore real", func() error { return m.provider.site.SetRawTariff(*t) }); err != nil {
-		return err
+
+	site, err := m.provider.client.EnergySite(m.provider.energySiteID)
+	if err != nil {
+		return retryable("restore tariff: read site", err)
 	}
-	m.provider.guard.forget()
-	return nil
+	if !isSyntheticTariff(site.TariffContentV2) {
+		return nil // already on a real tariff, nothing to restore
+	}
+
+	// prefer the fully-labeled plan from the catalog (looked up by configured name)
+	if name := m.provider.tariffPlanName; name != "" {
+		if plan, err := m.provider.client.RateTariff(name); err == nil && plan != nil {
+			return m.apiWrite("tariff → restore by name (catalog)", func() error { return m.provider.site.SetTariffContent(*plan) })
+		} else if err != nil {
+			m.provider.log.WARN.Printf("restore tariff by name %q failed, reconstructing from spike: %v", name, err)
+		}
+	}
+
+	real := unspikeTariff(site.TariffContentV2)
+	return m.apiWrite("raw tariff → unspike stranded synthetic", func() error { return m.provider.site.SetRawTariff(*real) })
 }
 
 // setDischargeTariff writes the sell-only export spike built from the user's real
@@ -470,11 +511,19 @@ func rateAtV2(seasons map[string]teslaclient.TariffSeasonV2, charges map[string]
 // snapshot if we still hold it, otherwise the real rates reconstructed from the
 // spike (unspikeTariff). We must never leak the raw spike — that happens
 // routinely in the window after we restore the real tariff but before the cached
-// site-info refreshes (the guard is already cleared), and for a leftover spike
-// left on the Powerwall by a crashed session.
+// site-info refreshes, and for a leftover spike left on the Powerwall by a
+// crashed session.
+//
+// When the live tariff is real this is also where we keep the guard snapshot
+// fresh: every real read refreshes it (remember no-ops if unchanged), so a plan
+// change is captured automatically and we always hold the latest real tariff to
+// restore — without any extra Fleet API calls.
 func (m *FleetAPI) effectiveTariff(site *teslaclient.EnergySite) *teslaclient.TariffContentV2 {
 	t := site.TariffContentV2
 	if !isSyntheticTariff(t) {
+		if m.provider.guard != nil {
+			m.provider.guard.remember(t)
+		}
 		return t
 	}
 	if m.provider.guard != nil {

@@ -600,13 +600,11 @@ func TestTariffGuard(t *testing.T) {
 	real := tariffWith("PG&E")
 	synthetic := tariffWith(syntheticTariffUtility)
 
-	t.Run("snapshot then restore once", func(t *testing.T) {
+	t.Run("snapshot is readable and never dropped", func(t *testing.T) {
 		g := newTariffGuard("") // empty key => no persistence
 		g.remember(real)
 		assert.Equal(t, real, g.peek(), "peek returns the snapshot without clearing it")
-		assert.Equal(t, real, g.peek(), "peek is non-destructive")
-		g.forget()
-		assert.Nil(t, g.peek(), "forget clears the snapshot")
+		assert.Equal(t, real, g.peek(), "peek is non-destructive; the snapshot is never dropped")
 	})
 
 	t.Run("never snapshot a synthetic tariff as real", func(t *testing.T) {
@@ -624,11 +622,14 @@ func TestTariffGuard(t *testing.T) {
 		assert.Equal(t, real, g.peek(), "must keep the real tariff, not overwrite with synthetic")
 	})
 
-	t.Run("first real snapshot wins until restored", func(t *testing.T) {
+	t.Run("remember refreshes to the latest real tariff", func(t *testing.T) {
+		// a plan switch / annual rate revision shows up as a new real tariff; the
+		// snapshot must track it (not pin the first one forever).
 		g := newTariffGuard("")
 		g.remember(real)
-		g.remember(tariffWith("SCE"))
-		assert.Equal(t, real, g.peek(), "repeated remember keeps the first real snapshot")
+		sce := tariffWith("SCE")
+		g.remember(sce)
+		assert.Equal(t, sce, g.peek(), "a real change must refresh the snapshot")
 	})
 
 	t.Run("nil current is ignored", func(t *testing.T) {
@@ -655,6 +656,14 @@ func TestEffectiveTariff(t *testing.T) {
 	// live tariff is real -> report it unchanged
 	live := tariffWith("SCE")
 	assert.Equal(t, live, m.effectiveTariff(&teslaclient.EnergySite{TariffContentV2: live}))
+
+	// a real live read also refreshes the guard so we always hold the latest real
+	// tariff to restore (a plan change is captured without extra API calls)
+	freshGuard := newTariffGuard("")
+	m3 := &FleetAPI{provider: &fleetAPIProvider{guard: freshGuard}}
+	live2 := tariffWith("PG&E-2027")
+	assert.Equal(t, live2, m3.effectiveTariff(&teslaclient.EnergySite{TariffContentV2: live2}))
+	assert.Equal(t, live2, freshGuard.peek(), "a real live read must refresh the guard snapshot")
 
 	// synthetic live tariff but nothing snapshotted -> reconstruct the real rates
 	// from the spike rather than leaking the bumped prices into the optimizer/UI.

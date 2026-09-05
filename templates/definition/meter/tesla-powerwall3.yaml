@@ -91,6 +91,15 @@ params:
     help:
       en: allow charging the battery from the grid (default off); when off the optimizer never plans to grid-charge the pack and it charges from solar only
       de: Laden der Batterie aus dem Netz erlauben (Standard aus); wenn aus, plant der Optimizer kein Netzladen der Batterie und sie lädt nur aus Solar
+  - name: tariff
+    advanced: true
+    usages: ["battery"]
+    description:
+      en: Utility rate plan name
+      de: Name des Stromtarifs
+    help:
+      en: Tesla catalog plan name (e.g. CPSF-E-ELEC-NEM3-2026). Only needed for grid-discharge; lets evcc restore your labeled utility plan from Tesla's catalog if it ever has to recover a leftover export tariff before it snapshotted the real one. Not the plan "code" the Powerwall shows.
+      de: Tesla-Katalog-Tarifname (z. B. CPSF-E-ELEC-NEM3-2026). Nur für Netzentladung nötig; erlaubt evcc, den echten Tarif aus dem Tesla-Katalog wiederherzustellen, falls ein Export-Tarif entfernt werden muss, bevor der echte gesichert wurde.
   - name: cache
     default: 5s
     advanced: true
@@ -111,4 +120,5 @@ render: |
   {{ if .maxchargepower }}maxchargepower: {{ .maxchargepower }}{{ end }}
   {{ if .maxdischargepower }}maxdischargepower: {{ .maxdischargepower }}{{ end }}
   {{ if .allowGridImport }}allowGridImport: {{ .allowGridImport }}{{ end }}
+  {{ if .tariff }}tariff: {{ .tariff }}{{ end }}
   cache: {{ .cache }}
