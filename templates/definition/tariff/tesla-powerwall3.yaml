@@ -41,6 +41,19 @@ params:
     help:
       en: optional energy site identifier, leave empty for auto-detection
       de: optionale Energy Site ID, leer lassen für automatische Erkennung
+  - name: ownerapitoken
+    description:
+      generic: Owner API Token (VPP)
+    help:
+      en: optional legacy owner-api refresh token. On an export tariff it enables automatic Tesla VPP (grid-services) event detection, reflecting the event export payout in this tariff so the optimizer plans around it.
+      de: optionaler Owner-API Refresh-Token. Bei einem Einspeisetarif aktiviert er die automatische Erkennung von Tesla VPP-Ereignissen (Netzdienste) und berücksichtigt die Einspeisevergütung des Ereignisses in diesem Tarif.
+    mask: true
+  - name: vpppremium
+    description:
+      generic: VPP Premium
+    help:
+      en: export payout per kWh applied to slots during a VPP event (default 2.0)
+      de: Einspeisevergütung pro kWh während eines VPP-Ereignisses (Standard 2.0)
 render: |
   type: teslafleetapi
   tariffDirection: {{ .tariffDirection }}
@@ -50,3 +63,5 @@ render: |
     access: {{ .accessToken }}
     refresh: {{ .refreshToken }}
   {{ if .siteid }}siteid: {{ .siteid }}{{ end }}
+  {{ if .ownerapitoken }}ownerapitoken: {{ .ownerapitoken }}{{ end }}
+  {{ if .vpppremium }}vpppremium: {{ .vpppremium }}{{ end }}

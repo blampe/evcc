@@ -58,6 +58,13 @@ type FleetAPI struct {
 	provider        *fleetAPIProvider
 	socLimits       batterySocLimits
 	allowGridImport bool // permit charging the pack from the grid (default off)
+
+	// VPP (grid-services) event awareness, only on a feed-in tariff meter: when a
+	// scheduled event overlaps a feed-in slot, Rates() raises that slot to the
+	// export premium so the optimizer pre-charges for and plans discharge into it.
+	// nil unless an owner-api token is configured (auto-detection is opt-in).
+	vppEventsG func() ([]vppEvent, error)
+	vppPremium float64
 }
 
 var (
@@ -85,7 +92,9 @@ func NewFleetAPIFromConfig(other map[string]any) (api.Meter, error) {
 		EnergySiteID       int64  `mapstructure:"siteid"`
 		Tariff             string `mapstructure:"tariff"` // Tesla catalog plan name for labeled restore-by-name (optional)
 		Cache              time.Duration
-		AllowGridImport    bool // permit charging the pack from the grid (default off)
+		AllowGridImport    bool    // permit charging the pack from the grid (default off)
+		OwnerAPIToken      string  `mapstructure:"ownerapitoken"` // legacy ownerapi REFRESH token, enables VPP event auto-detection on a feed-in tariff (optional)
+		VPPPremium         float64 `mapstructure:"vpppremium"`    // export payout $/kWh applied to feed-in slots during a VPP event (default $2)
 		batterySocLimits   `mapstructure:",squash"`
 		batteryPowerLimits `mapstructure:",squash"`
 	}{
@@ -124,7 +133,18 @@ func NewFleetAPIFromConfig(other map[string]any) (api.Meter, error) {
 		cc.Usage = "solar"
 	}
 
-	return NewFleetAPI(cc.Usage, cc.Credentials.ID, cc.Credentials.Secret, token, cc.EnergySiteID, cc.Tariff, cc.Cache, cc.batterySocLimits, cc.batteryPowerLimits, cc.AllowGridImport)
+	m, err := NewFleetAPI(cc.Usage, cc.Credentials.ID, cc.Credentials.Secret, token, cc.EnergySiteID, cc.Tariff, cc.Cache, cc.batterySocLimits, cc.batteryPowerLimits, cc.AllowGridImport)
+	if err != nil {
+		return nil, err
+	}
+
+	// opt-in VPP event auto-detection on a feed-in tariff: with an owner-api refresh
+	// token configured, poll the grid-services schedule and reflect the export
+	// premium in the feed-in rates during events.
+	if fa, ok := m.(*FleetAPI); ok && cc.OwnerAPIToken != "" && (fa.usage == "feedin" || fa.usage == "solar") {
+		fa.enableVPP(cc.OwnerAPIToken, cc.VPPPremium)
+	}
+	return m, nil
 }
 
 var fleetAPIProviders = utilcache.New[*fleetAPIProvider]()
@@ -603,6 +623,26 @@ func dischargeReserve(targetSoc, minSoc float64) float64 {
 	return max(targetSoc, minSoc)
 }
 
+// vppReserve is the reserve to configure as the VPP (grid-services) event floor:
+// the optimizer's discharge floor (its target SoC, floored at MinSoc), so a
+// Tesla-auto-dispatched event discharges only as deep as the optimizer intends.
+// It reuses the grid-discharge reserve so the event floor tracks the plan exactly.
+func vppReserve(targetSoc, minSoc float64) uint64 {
+	return clampReserve(dischargeReserve(targetSoc, minSoc))
+}
+
+// syncVPPReserve best-effort writes the VPP event reserve to the optimizer's
+// discharge floor. Failures are logged but not returned: a bad VPP-reserve write
+// must not abort the actual battery-mode change (Tesla may reject the write while
+// it owns the reserve during an active event).
+func (m *FleetAPI) syncVPPReserve(targetSoc float64) {
+	reserve := vppReserve(targetSoc, m.socLimits.MinSoc)
+	m.provider.log.DEBUG.Printf("tesla api: vpp backup reserve → %d%% (optimizer floor, target %.0f%%)", reserve, targetSoc)
+	if err := m.provider.site.SetVPPBackupReserve(reserve); err != nil {
+		m.provider.log.WARN.Printf("vpp backup reserve → %d%% failed (non-fatal): %v", reserve, err)
+	}
+}
+
 // holdChargeReserveMargin is how far (percent) below the current SoC the
 // hold-charge reserve sits, so the pack can still cover the home through a brief
 // PV dip (self-consumption) instead of forcing a grid import, while staying high
@@ -647,6 +687,19 @@ func holdChargeReserve(soc, minSoc float64) float64 {
 func (m *FleetAPI) SetBatteryModeSoc(mode api.BatteryMode, targetSoc float64) error {
 	limits := m.socLimits
 	site := m.provider.site
+
+	// Keep the VPP event reserve synced to the optimizer's discharge floor. A Tesla
+	// VPP (grid-services) event is auto-dispatched by Tesla down to
+	// vpp_backup_reserve_percent, so writing the optimizer's floor here makes an
+	// event stop where the optimizer wants — not at the app's static VPP reserve.
+	// Only for modes we actually apply (skip unsupported ones — no pack writes), and
+	// best-effort so a VPP-reserve failure never blocks the real mode change.
+	switch mode {
+	case api.BatteryNormal, api.BatteryHold, api.BatteryHoldCharge, api.BatteryCharge, api.BatteryDischarge:
+		m.syncVPPReserve(targetSoc)
+	default:
+		return api.ErrNotAvailable
+	}
 
 	switch mode {
 	case api.BatteryNormal:
@@ -807,25 +860,61 @@ func (m *FleetAPI) Rates() (api.Rates, error) {
 		return nil, err
 	}
 	isFeedIn := m.usage == "feedin" || m.usage == "solar"
+
+	var rates api.Rates
 	if tc := m.effectiveTariff(site); tc != nil {
 		if isFeedIn {
 			if tc.SellTariff == nil {
 				return nil, api.ErrNotAvailable
 			}
-			return ratesFromV2(tc.SellTariff.Seasons, tc.SellTariff.EnergyCharges)
+			rates, err = ratesFromV2(tc.SellTariff.Seasons, tc.SellTariff.EnergyCharges)
+		} else {
+			rates, err = ratesFromV2(tc.Seasons, tc.EnergyCharges)
 		}
-		return ratesFromV2(tc.Seasons, tc.EnergyCharges)
-	}
-	if site.TariffContent != nil {
+	} else if site.TariffContent != nil {
 		if isFeedIn {
 			if site.TariffContent.SellTariff == nil {
 				return nil, api.ErrNotAvailable
 			}
-			return ratesFromV1(site.TariffContent.SellTariff.Seasons, site.TariffContent.SellTariff.EnergyCharges)
+			rates, err = ratesFromV1(site.TariffContent.SellTariff.Seasons, site.TariffContent.SellTariff.EnergyCharges)
+		} else {
+			rates, err = ratesFromV1(site.TariffContent.Seasons, site.TariffContent.EnergyCharges)
 		}
-		return ratesFromV1(site.TariffContent.Seasons, site.TariffContent.EnergyCharges)
+	} else {
+		return nil, api.ErrNotAvailable
 	}
-	return nil, api.ErrNotAvailable
+	if err != nil {
+		return nil, err
+	}
+
+	// overlay the VPP export premium on feed-in slots that fall inside a scheduled
+	// grid-services event, so the optimizer values export during the event and
+	// pre-charges for it. Only when auto-detection is configured (feed-in meter).
+	if isFeedIn && m.vppEventsG != nil {
+		if events, verr := m.vppEventsG(); verr == nil {
+			rates = applyVPPPremium(rates, events, m.vppPremium)
+		} else {
+			m.provider.log.WARN.Printf("vpp events unavailable, feed-in premium not applied: %v", verr)
+		}
+	}
+	return rates, nil
+}
+
+// enableVPP turns on VPP event auto-detection for this (feed-in) meter: it polls
+// the owner-api programs schedule (authenticated by the ownerapi refresh token)
+// and feeds the windows into Rates via applyVPPPremium.
+func (m *FleetAPI) enableVPP(refreshToken string, premium float64) {
+	if premium <= 0 {
+		premium = vppPremiumDefault
+	}
+	log := m.provider.log
+	client := newVPPClient(log, newOwnerAPITokenSource(log, refreshToken))
+	siteID := m.provider.energySiteID
+	m.vppPremium = premium
+	m.vppEventsG = util.Cached(func() ([]vppEvent, error) {
+		return client.events(siteID)
+	}, vppPollInterval)
+	log.DEBUG.Printf("VPP event auto-detection enabled (premium $%.2f/kWh)", premium)
 }
 
 // Type implements the api.Tariff interface.

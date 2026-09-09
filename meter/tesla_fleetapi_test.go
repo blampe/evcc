@@ -520,6 +520,17 @@ func TestDischargeReserve(t *testing.T) {
 	assert.Equal(t, 20.0, dischargeReserve(-5, 20), "negative target falls back to min soc")
 }
 
+// TestVPPReserve verifies the VPP event reserve tracks the optimizer's discharge
+// floor: the target SoC floored at MinSoc (falling back to MinSoc with no target),
+// snapped by clampReserve to a value the Powerwall accepts.
+func TestVPPReserve(t *testing.T) {
+	assert.Equal(t, uint64(20), vppReserve(0, 20), "no target → MinSoc floor")
+	assert.Equal(t, uint64(20), vppReserve(10, 20), "target below MinSoc → MinSoc")
+	assert.Equal(t, uint64(55), vppReserve(55, 20), "target above MinSoc is honored")
+	assert.Equal(t, uint64(80), vppReserve(90, 20), "target in the PW3-rejected (80,100) band snaps to 80")
+	assert.Equal(t, uint64(100), vppReserve(100, 20), "100 is allowed")
+}
+
 // TestHoldChargeReserve verifies hold-charge sits the reserve a small margin
 // below the current SoC (so a PV dip is covered from the battery, not the grid),
 // never below min soc. With clampReserve, an SoC in the PW3-rejected (80,100)
