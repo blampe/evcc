@@ -93,4 +93,28 @@ func TestApplyVPPPremium(t *testing.T) {
 		out := applyVPPPremium(api.Rates{mkRate(100, 200, 0.03)}, optedOut, 2.0)
 		assert.Equal(t, 0.03, out[0].Value)
 	})
+
+	// regression: a slot straddling the event edge must be split so the premium
+	// stops at the event boundary — otherwise the optimizer sees a phantom
+	// high-value slot after the event and defers discharge past it.
+	t.Run("splits slots at the event boundary", func(t *testing.T) {
+		rates := api.Rates{mkRate(100, 200, 0.03), mkRate(200, 300, 0.03)}
+		events := []vppEvent{{Start: time.Unix(150, 0), End: time.Unix(250, 0), OptedIn: true}}
+		out := applyVPPPremium(rates, events, 2.0)
+		require.Len(t, out, 4)
+		want := []struct {
+			start, end int64
+			value      float64
+		}{
+			{100, 150, 0.03}, // before the event: real
+			{150, 200, 2.00}, // in event
+			{200, 250, 2.00}, // in event
+			{250, 300, 0.03}, // after the event: real, NOT the premium
+		}
+		for i, w := range want {
+			assert.Equal(t, w.start, out[i].Start.Unix(), "slot %d start", i)
+			assert.Equal(t, w.end, out[i].End.Unix(), "slot %d end", i)
+			assert.Equal(t, w.value, out[i].Value, "slot %d value", i)
+		}
+	})
 }

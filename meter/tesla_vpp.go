@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -307,22 +308,60 @@ func currentOrNextEvent(events []vppEvent, now time.Time) (vppEvent, bool) {
 // its APIs, so it is a hard-coded default (PG&E DSGS ≈ $2/kWh) until configurable.
 const vppPremiumDefault = 2.0
 
-// applyVPPPremium overlays the VPP export premium onto feed-in rates for slots
-// overlapping an opted-in event window, so the optimizer values export during the
-// event at the program payout — driving it to pre-charge for and discharge into
-// the event. It only raises a slot's value (never lowers one already worth more).
+// applyVPPPremium overlays the VPP export premium onto feed-in rates for the parts
+// that fall inside an opted-in event window, so the optimizer values export during
+// the event at the program payout (pre-charge + plan discharge). It splits a rate
+// slot at the event boundaries so the premium is applied ONLY to the in-event
+// portion — a slot straddling the event edge keeps its real rate outside it (else
+// the optimizer sees a phantom high-value slot after the event and defers discharge
+// past it). It only raises a value, never lowers one already worth more.
 func applyVPPPremium(rates api.Rates, events []vppEvent, premium float64) api.Rates {
-	for i := range rates {
-		for _, e := range events {
-			if !e.OptedIn {
-				continue
-			}
-			// slot [Start,End) overlaps event [Start,End)
-			if rates[i].Start.Before(e.End) && rates[i].End.After(e.Start) {
-				rates[i].Value = max(rates[i].Value, premium)
-				break
+	var wins []vppEvent
+	for _, e := range events {
+		if e.OptedIn {
+			wins = append(wins, e)
+		}
+	}
+	if len(wins) == 0 {
+		return rates
+	}
+	out := make(api.Rates, 0, len(rates))
+	for _, r := range rates {
+		out = append(out, splitRateByEvents(r, wins, premium)...)
+	}
+	return out
+}
+
+// splitRateByEvents cuts a rate slot at every event boundary that falls inside it
+// and raises the value of the resulting sub-slots that lie within an event to the
+// premium. A slot with no interior boundary is returned unchanged (possibly with a
+// raised value if it sits wholly inside an event).
+func splitRateByEvents(r api.Rate, events []vppEvent, premium float64) api.Rates {
+	// split points: the slot bounds plus any event edge strictly inside the slot
+	points := []time.Time{r.Start, r.End}
+	for _, e := range events {
+		for _, edge := range []time.Time{e.Start, e.End} {
+			if edge.After(r.Start) && edge.Before(r.End) {
+				points = append(points, edge)
 			}
 		}
 	}
-	return rates
+	sort.Slice(points, func(i, j int) bool { return points[i].Before(points[j]) })
+
+	out := make(api.Rates, 0, len(points))
+	for i := 0; i+1 < len(points); i++ {
+		if !points[i].Before(points[i+1]) {
+			continue // dedup coincident boundaries
+		}
+		seg := api.Rate{Start: points[i], End: points[i+1], Value: r.Value}
+		mid := seg.Start.Add(seg.End.Sub(seg.Start) / 2)
+		for _, e := range events {
+			if e.active(mid) {
+				seg.Value = max(seg.Value, premium)
+				break
+			}
+		}
+		out = append(out, seg)
+	}
+	return out
 }

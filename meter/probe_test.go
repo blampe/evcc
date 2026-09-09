@@ -589,20 +589,29 @@ func TestProbeVPPRates(t *testing.T) {
 	rates, err := fa.Rates()
 	require.NoError(t, err)
 
-	// print the feed-in rates around the event window and check the premium landed
-	var premiumSlots, total int
+	// print the feed-in rates around the event window (±1h) so the boundary is
+	// visible, and assert: in-event slots carry the premium, out-of-event slots do
+	// NOT (the split must stop the premium exactly at the event edges).
+	from, to := ev.Start.Add(-time.Hour), ev.End.Add(time.Hour)
+	var inEvent, inEventPremium int
 	for _, r := range rates {
-		if !r.End.After(ev.Start) || !r.Start.Before(ev.End) {
-			continue // outside the event
+		if !r.End.After(from) || !r.Start.Before(to) {
+			continue
 		}
-		total++
-		if r.Value >= 2.0 {
-			premiumSlots++
+		mid := r.Start.Add(r.End.Sub(r.Start) / 2)
+		within := !mid.Before(ev.Start) && mid.Before(ev.End)
+		t.Logf("  slot %s-%s value=%.3f  in-event=%v", r.Start.Format("15:04"), r.End.Format("15:04"), r.Value, within)
+		if within {
+			inEvent++
+			if r.Value >= 2.0 {
+				inEventPremium++
+			}
+		} else {
+			assert.Less(t, r.Value, 2.0, "out-of-event slot %s-%s must not carry the premium", r.Start.Format("15:04"), r.End.Format("15:04"))
 		}
-		t.Logf("  slot %s-%s value=%.3f", r.Start.Format("15:04"), r.End.Format("15:04"), r.Value)
 	}
-	require.Positive(t, total, "no feed-in slots overlap the event window")
-	assert.Equal(t, total, premiumSlots, "every in-event feed-in slot should carry the $2 premium")
+	require.Positive(t, inEvent, "no feed-in slots inside the event window")
+	assert.Equal(t, inEvent, inEventPremium, "every in-event slot should carry the $2 premium")
 }
 
 // recoverReal reconstructs the real tariff from a leftover sell-only synthetic
