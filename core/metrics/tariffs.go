@@ -74,6 +74,30 @@ func DeleteTariffs(from, to time.Time, usage string) (int64, error) {
 	return res.RowsAffected, err
 }
 
+// GridPrice is a persisted import-price sample at a 15min boundary.
+type GridPrice struct {
+	Start time.Time
+	Value float64
+}
+
+// QueryGridPrices returns the persisted import (grid) tariff prices in [from,to),
+// i.e. the rates actually in effect, for valuing metered history without hard-
+// coding a rate table. Ordered by time.
+func QueryGridPrices(from, to time.Time) ([]GridPrice, error) {
+	var rows []tariffValue
+	if err := db.Instance.
+		Where("ts >= ? AND ts < ? AND grid IS NOT NULL", from.Unix(), to.Unix()).
+		Order("ts").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	out := make([]GridPrice, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, GridPrice{Start: time.Unix(r.Timestamp, 0), Value: *r.Grid})
+	}
+	return out, nil
+}
+
 // PersistTariffs stores the tariff values at the given 15min boundary, nil values omitted
 func PersistTariffs(ts time.Time, grid, feedin, co2, temperature *float64) error {
 	if grid == nil && feedin == nil && co2 == nil && temperature == nil {

@@ -698,8 +698,15 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 	solarTariff := site.GetTariff(api.TariffUsageSolar)
 	solar := currentRates(solarTariff)
 
-	grid := currentRates(site.GetTariff(api.TariffUsageGrid))
-	feedIn := currentRates(site.GetTariff(api.TariffUsageFeedIn))
+	// value import at its realized NEM3 marginal cost: for a net-generation exporter
+	// the generation half of an import voids surplus at NSC, not retail, so full
+	// retail overstates import cost and the TOU arbitrage spread (see realizedImport).
+	// Optimizer-only: the published/persisted grid price stays the real retail rate.
+	grid := site.realizedImportRates(currentRates(site.GetTariff(api.TariffUsageGrid)))
+	// value export at its realized NEM3 worth (delivery EEC + net-position/NSC
+	// generation), the single export rate also shown in the UI and written back to
+	// the Powerwall — see realizedFeedInRates.
+	feedIn := site.realizedFeedInRates()
 
 	minLen := lo.Min([]int{len(grid), len(feedIn)})
 	// exclude empty solar forecast from minLen

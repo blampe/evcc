@@ -215,6 +215,42 @@ func (site *Site) batteryMaxSocReached(dev config.Device[api.Meter]) (bool, erro
 	return false, nil
 }
 
+// exportTariffController is implemented by battery meters (Tesla) that can write a
+// realized export sell tariff back to the device. Core injects the export
+// realization inputs - the PG&E delivery EEC schedule and the net-position factors,
+// derived from metered history the meter package can't reach - so the device app
+// shows evcc's realized export value instead of the utility's inflated ACC.
+type exportTariffController interface {
+	SetExportRealization(eec api.Rates, rDelivery, rGen float64)
+	MaintainExportTariff() error
+}
+
+// syncExportRealization injects the export realization into each battery meter that
+// supports it and lets the meter proactively write evcc's realized export value as
+// the device sell tariff, so the app reflects it without waiting for a battery-mode
+// change. Runs every update cycle (both inputs are day-cached, the write is
+// rate-limited meter-side), decoupled from battery-mode application.
+func (site *Site) syncExportRealization() {
+	rDelivery, rGen, ok := site.realization()
+	if !ok {
+		return
+	}
+	eec, err := deliveryEECSchedule()
+	if err != nil {
+		return
+	}
+	for _, dev := range site.batteryMeters {
+		ctrl, ok := api.Cap[exportTariffController](dev.Instance())
+		if !ok {
+			continue
+		}
+		ctrl.SetExportRealization(eec, rDelivery, rGen)
+		if err := ctrl.MaintainExportTariff(); err != nil {
+			site.log.DEBUG.Printf("maintain export tariff: %v", err)
+		}
+	}
+}
+
 // applyBatteryMode applies the mode to each battery. boost indicates the
 // optimizer is draining the pack into a car this cycle, which pins normal mode's
 // reserve to the plan's target SoC.

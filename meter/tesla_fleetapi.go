@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/api/implement"
+	"github.com/evcc-io/evcc/core/cleanpowersf"
 	"github.com/evcc-io/evcc/server/db/settings"
 	"github.com/evcc-io/evcc/tariff/fixed"
 	"github.com/evcc-io/evcc/util"
@@ -48,6 +50,18 @@ type fleetAPIProvider struct {
 	// writes the synthetic tariff) and the Tariff reader (which must keep
 	// reporting real prices) see the same state.
 	guard *tariffGuard
+
+	// export realization injected by core (which alone can read the metered
+	// true-up-year history it's derived from): the PG&E delivery EEC schedule and
+	// the two NEM3 realization factors. They let the meter replace the Powerwall's
+	// inflated ACC sell tariff with evcc's realized export value (correctedTariff).
+	// Guarded because the control loop injects while tariff writes read.
+	exportMu             sync.Mutex
+	exportEEC            api.Rates
+	exportRDelivery      float64
+	exportRGen           float64
+	exportRealizationSet bool
+	lastMaintain         time.Time // last proactive corrected-baseline write (rate-limits MaintainExportTariff)
 }
 
 // FleetAPI is a Tesla Fleet API meter for Powerwall 3.
@@ -195,7 +209,7 @@ func getOrCreateProvider(clientID, clientSecret string, token *oauth2.Token, ene
 		p.liveStatusG = util.Cached(p.getLiveStatus, cacheDur)
 		p.siteInfoG = util.Cached(func() (*teslaclient.EnergySite, error) {
 			return p.client.EnergySite(p.energySiteID)
-		}, 15*time.Minute)
+		}, siteInfoCacheTTL)
 
 		if _, err := p.siteInfoG(); err != nil {
 			return nil, fmt.Errorf("failed to connect to Tesla Fleet API: %w", err)
@@ -446,7 +460,7 @@ func (m *FleetAPI) restoreTariff() error {
 		return nil
 	}
 	if t := m.provider.guard.peek(); t != nil {
-		return m.apiWrite("raw tariff → restore real", func() error { return m.provider.site.SetRawTariff(*t) })
+		return m.writeBaselineTariff("restore real buy + realized export sell", t)
 	}
 
 	site, err := m.provider.client.EnergySite(m.provider.energySiteID)
@@ -454,10 +468,16 @@ func (m *FleetAPI) restoreTariff() error {
 		return retryable("restore tariff: read site", err)
 	}
 	if !isSyntheticTariff(site.TariffContentV2) {
-		return nil // already on a real tariff, nothing to restore
+		// already on the user's real tariff; capture it, then overlay our realized
+		// export sell so the app shows it instead of the raw ACC (no-op sell change
+		// until core injects the realization inputs).
+		return m.ensureCorrectedBaseline("realized export sell overlay", site.TariffContentV2)
 	}
 
-	// prefer the fully-labeled plan from the catalog (looked up by configured name)
+	// no snapshot and stranded on a synthetic tariff: reconstruct the real one.
+	// Prefer the fully-labeled plan from the catalog (looked up by configured name).
+	// This cold-start self-heal restores the genuine (v1) plan uncorrected; the next
+	// normal restore re-applies the corrected v2 baseline once a snapshot exists.
 	if name := m.provider.tariffPlanName; name != "" {
 		if plan, err := m.provider.client.RateTariff(name); err == nil && plan != nil {
 			return m.apiWrite("tariff → restore by name (catalog)", func() error { return m.provider.site.SetTariffContent(*plan) })
@@ -466,8 +486,29 @@ func (m *FleetAPI) restoreTariff() error {
 		}
 	}
 
-	real := unspikeTariff(site.TariffContentV2)
-	return m.apiWrite("raw tariff → unspike stranded synthetic", func() error { return m.provider.site.SetRawTariff(*real) })
+	return m.writeBaselineTariff("unspike stranded synthetic + realized export sell", unspikeTariff(site.TariffContentV2))
+}
+
+// writeBaselineTariff writes the non-spiked baseline tariff to the Powerwall: the
+// real BUY side untouched and the SELL side replaced by evcc's realized export
+// value (correctedTariff). Until core injects the realization inputs it writes the
+// real tariff unchanged, so a cold start never strands the pack.
+func (m *FleetAPI) writeBaselineTariff(what string, real *teslaclient.TariffContentV2) error {
+	if real == nil {
+		return nil
+	}
+	return m.apiWrite("raw tariff → "+what, func() error { return m.provider.site.SetRawTariff(*m.correctedTariff(real)) })
+}
+
+// ensureCorrectedBaseline captures the genuine tariff (so the guard can restore it)
+// then overlays the corrected baseline (real buy + realized export sell). It's the
+// shared "we're on a genuine tariff → snapshot and overlay" step used by both the
+// mode-change restore and the proactive maintainer (MaintainExportTariff).
+func (m *FleetAPI) ensureCorrectedBaseline(what string, genuine *teslaclient.TariffContentV2) error {
+	if m.provider.guard != nil {
+		m.provider.guard.remember(genuine) // capture the genuine before overlaying
+	}
+	return m.writeBaselineTariff(what, genuine)
 }
 
 // setDischargeTariff writes the sell-only export spike built from the user's real
@@ -491,14 +532,18 @@ func (m *FleetAPI) setDischargeTariff() error {
 	}
 
 	now := time.Now()
-	t := spikeTariff(real, now)
+	// spike the realized-export baseline (real buy + realized sell), not the raw ACC
+	// tariff, so leaving the spike restores the corrected sell and the app never
+	// falls back to ACC.
+	base := m.correctedTariff(real)
+	t := spikeTariff(base, now)
 
 	// probe: confirm the +bump lands on sell (buy stays real) at the current hour
-	buyBefore, _ := rateAtV2(real.Seasons, real.EnergyCharges, now)
+	buyBefore, _ := rateAtV2(base.Seasons, base.EnergyCharges, now)
 	buyAfter, _ := rateAtV2(t.Seasons, t.EnergyCharges, now)
 	var sellBefore, sellAfter float64
-	if real.SellTariff != nil {
-		sellBefore, _ = rateAtV2(real.SellTariff.Seasons, real.SellTariff.EnergyCharges, now)
+	if base.SellTariff != nil {
+		sellBefore, _ = rateAtV2(base.SellTariff.Seasons, base.SellTariff.EnergyCharges, now)
 	}
 	if t.SellTariff != nil {
 		sellAfter, _ = rateAtV2(t.SellTariff.Seasons, t.SellTariff.EnergyCharges, now)
@@ -552,6 +597,206 @@ func (m *FleetAPI) effectiveTariff(site *teslaclient.EnergySite) *teslaclient.Ta
 		}
 	}
 	return unspikeTariff(t)
+}
+
+// correctedTariffName labels the baseline tariff evcc writes (real buy + realized
+// export sell). Cosmetic; the EVCC utility marker is what the guard keys on.
+const correctedTariffName = "Custom (evcc realized export)"
+
+// cpsfLocation is CleanPowerSF's tariff timezone; representative TOU-period times
+// are built here so the CleanPowerSF hour-of-day lands correctly across DST.
+var cpsfLocation, _ = time.LoadLocation("America/Los_Angeles")
+
+// monthByName maps Tesla's month-named tariff seasons (the sell tariff uses one
+// season per month) to a month number, since those seasons carry no from/to month.
+var monthByName = map[string]time.Month{
+	"january": time.January, "february": time.February, "march": time.March,
+	"april": time.April, "may": time.May, "june": time.June, "july": time.July,
+	"august": time.August, "september": time.September, "october": time.October,
+	"november": time.November, "december": time.December,
+}
+
+// siteInfoCacheTTL is how long site info (including the live tariff) is cached.
+const siteInfoCacheTTL = 15 * time.Minute
+
+// maintainExportInterval rate-limits the proactive baseline write to at most once
+// per site-info cache period: siteInfoG is cached for siteInfoCacheTTL, so a
+// just-written tariff still reads back stale for that long and we must not re-write
+// it every control cycle. Derived from the cache TTL so the two can't diverge.
+const maintainExportInterval = siteInfoCacheTTL
+
+// MaintainExportTariff proactively ensures the Powerwall carries the corrected
+// baseline (real buy + realized export sell) so the app shows evcc's export value
+// without waiting for a battery-mode change to trigger restoreTariff. It no-ops
+// while the pack already carries a synthetic tariff (our corrected baseline or an
+// active discharge spike - both tagged EVCC), until core injects the realization
+// inputs, and within maintainExportInterval of the last successful write.
+func (m *FleetAPI) MaintainExportTariff() error {
+	p := m.provider
+	if p.siteInfoG == nil {
+		return nil
+	}
+	p.exportMu.Lock()
+	set := p.exportRealizationSet
+	recent := !p.lastMaintain.IsZero() && time.Since(p.lastMaintain) < maintainExportInterval
+	p.exportMu.Unlock()
+	if !set || recent {
+		return nil
+	}
+	site, err := p.siteInfoG()
+	if err != nil {
+		return nil // best-effort; a read failure must not disrupt control
+	}
+	if isSyntheticTariff(site.TariffContentV2) {
+		return nil // already ours (corrected baseline or active spike) - leave it
+	}
+	if err := m.ensureCorrectedBaseline("maintain realized export sell", site.TariffContentV2); err != nil {
+		return err
+	}
+	p.exportMu.Lock()
+	p.lastMaintain = time.Now()
+	p.exportMu.Unlock()
+	return nil
+}
+
+// SetExportRealization injects the export-realization inputs computed by core
+// (which alone can read the metered true-up-year history behind them): the PG&E
+// delivery EEC schedule and the delivery/generation realization factors. They let
+// the meter build the realized export sell tariff written back to the Powerwall
+// (correctedTariff). Safe to call every control cycle.
+func (m *FleetAPI) SetExportRealization(eec api.Rates, rDelivery, rGen float64) {
+	p := m.provider
+	p.exportMu.Lock()
+	defer p.exportMu.Unlock()
+	p.exportEEC = eec
+	p.exportRDelivery = rDelivery
+	p.exportRGen = rGen
+	p.exportRealizationSet = true
+}
+
+// realizedSellRate returns the realized NEM3 export value at t - the PG&E delivery
+// EEC scaled by R_delivery, plus CleanPowerSF generation floored at Net Surplus
+// Compensation and climbing to the retail rate by R_gen. It hand-mirrors core's
+// realizedExportAt (KEEP IN SYNC) - the formula can't be shared because meter can't
+// import core (import cycle). ok is false until core injects the realization inputs,
+// so the meter never writes a half-built sell tariff.
+func (m *FleetAPI) realizedSellRate(t time.Time) (float64, bool) {
+	p := m.provider
+	p.exportMu.Lock()
+	eec, rDel, rGen, set := p.exportEEC, p.exportRDelivery, p.exportRGen, p.exportRealizationSet
+	p.exportMu.Unlock()
+	if !set {
+		return 0, false
+	}
+	genRetail := cleanpowersf.GenerationRate(t)
+	nsc := cleanpowersf.NetSurplusCompensation(t)
+	realizedGen := nsc + (genRetail-nsc)*rGen
+	return rateAtSorted(eec, t)*rDel + realizedGen, true
+}
+
+// rateAtSorted returns the value of the start-sorted rate slot covering t, or 0.
+func rateAtSorted(rates api.Rates, t time.Time) float64 {
+	i := sort.Search(len(rates), func(i int) bool { return rates[i].End.After(t) })
+	if i < len(rates) && !t.Before(rates[i].Start) && t.Before(rates[i].End) {
+		return rates[i].Value
+	}
+	return 0
+}
+
+// correctedTariff returns the user's real tariff with the SELL side replaced by the
+// realized NEM3 export value (realizedSellRate) - the rate evcc believes export is
+// actually worth - so the Powerwall app stops showing Tesla's inflated ACC sell
+// tariff. The BUY side is left exactly as-is (real retail import), which bounds the
+// risk: import behaviour is untouched. Tagged EVCC so the guard keeps snapshotting
+// and restoring the user's genuine tariff and never mistakes this for real. Returns
+// the input unchanged until core injects the realization inputs (never write a
+// half-built sell tariff) or when there is no sell tariff to correct.
+//
+// It shares the EVCC marker with the (reversible) discharge spike even though the
+// sell overwrite is lossy, which is safe: this builder always RECOMPUTES the sell
+// from the injected realization (it never trusts an input's sell), so a stranded
+// corrected tariff fed back through the self-heal path is re-derived correctly; and
+// the guard refuses to snapshot any EVCC-tagged tariff as real, so realized rates
+// can't be mistaken for the utility's genuine ACC. The genuine tariff is captured
+// (guard.remember) before it's ever overwritten.
+func (m *FleetAPI) correctedTariff(genuine *teslaclient.TariffContentV2) *teslaclient.TariffContentV2 {
+	if genuine == nil || genuine.SellTariff == nil {
+		return genuine
+	}
+	p := m.provider
+	p.exportMu.Lock()
+	set := p.exportRealizationSet
+	p.exportMu.Unlock()
+	if !set {
+		return genuine
+	}
+
+	out := *genuine
+	out.Utility = syntheticTariffUtility
+	out.Name = correctedTariffName
+	out.Version = 2
+	sell := *genuine.SellTariff
+	sell.Seasons, sell.EnergyCharges = m.realizedSellSeasons(genuine.SellTariff.Seasons, genuine.SellTariff.EnergyCharges)
+	out.SellTariff = &sell
+	return &out
+}
+
+// realizedSellSeasons returns copies of the sell tariff's seasons (structure kept
+// as-is) and energy charges with every rate replaced by the realized export value
+// sampled at a time representative of that season/period (season month, period hour
+// and weekday). A season whose month can't be resolved keeps its original rates, so
+// the worst case is leaving the ACC value rather than writing a wrong one. Inputs
+// are never mutated.
+func (m *FleetAPI) realizedSellSeasons(seasons map[string]teslaclient.TariffSeasonV2, charges map[string]teslaclient.TariffRates) (map[string]teslaclient.TariffSeasonV2, map[string]teslaclient.TariffRates) {
+	outSeasons := make(map[string]teslaclient.TariffSeasonV2, len(seasons))
+	maps.Copy(outSeasons, seasons)
+	outCharges := make(map[string]teslaclient.TariffRates, len(charges))
+
+	for name, season := range seasons {
+		newRates := make(map[string]float64, len(charges[name].Rates))
+		maps.Copy(newRates, charges[name].Rates) // default: keep original (e.g. season month unresolved)
+
+		if month, ok := seasonMonth(name, season); ok {
+			for periodName, tou := range season.TOUPeriods {
+				if len(tou.Periods) == 0 {
+					continue
+				}
+				p0 := tou.Periods[0]
+				if v, ok := m.realizedSellRate(representativeTime(month, p0.FromDayOfWeek, p0.FromHour)); ok {
+					newRates[periodName] = v
+				}
+			}
+		}
+		outCharges[name] = teslaclient.TariffRates{Rates: newRates}
+	}
+	return outSeasons, outCharges
+}
+
+// seasonMonth resolves a sell-tariff season to a representative month: its
+// FromMonth when set, else its month name. Tesla's month-named sell seasons often
+// arrive with FromMonth=0, so the name is the fallback, not the primary path.
+func seasonMonth(name string, season teslaclient.TariffSeasonV2) (time.Month, bool) {
+	if season.FromMonth >= 1 && season.FromMonth <= 12 {
+		return time.Month(season.FromMonth), true
+	}
+	if mth, ok := monthByName[strings.ToLower(strings.TrimSpace(name))]; ok {
+		return mth, true
+	}
+	return 0, false
+}
+
+// representativeTime returns a concrete instant for sampling a repeating TOU period:
+// the given hour on a mid-month day whose weekday matches the Tesla day-of-week code
+// (0=Mon..6=Sun), in the next occurrence of the month, in CleanPowerSF's timezone.
+func representativeTime(month time.Month, teslaDow, hour int) time.Time {
+	now := time.Now().In(cpsfLocation)
+	year := now.Year()
+	if month < now.Month() {
+		year++ // month already passed this year -> use next year's occurrence
+	}
+	want := time.Weekday((teslaDow + 1) % 7) // Tesla 0=Mon..6=Sun -> Go 0=Sun..6=Sat
+	day := time.Date(year, month, 15, hour, 0, 0, 0, cpsfLocation)
+	return day.AddDate(0, 0, (int(want)-int(day.Weekday())+7)%7) // nearest matching weekday on/after the 15th
 }
 
 // retryable marks a mutating Fleet API failure as api.ErrMustRetry so the state
@@ -855,36 +1100,32 @@ func NewFleetAPITariffFromConfig(other map[string]any) (api.Tariff, error) {
 
 // Rates implements the api.Tariff interface.
 func (m *FleetAPI) Rates() (api.Rates, error) {
-	site, err := m.provider.siteInfoG()
-	if err != nil {
-		return nil, err
-	}
 	isFeedIn := m.usage == "feedin" || m.usage == "solar"
 
 	var rates api.Rates
-	if tc := m.effectiveTariff(site); tc != nil {
-		if isFeedIn {
-			if tc.SellTariff == nil {
-				return nil, api.ErrNotAvailable
-			}
-			rates, err = ratesFromV2(tc.SellTariff.Seasons, tc.SellTariff.EnergyCharges)
-		} else {
-			rates, err = ratesFromV2(tc.Seasons, tc.EnergyCharges)
-		}
-	} else if site.TariffContent != nil {
-		if isFeedIn {
-			if site.TariffContent.SellTariff == nil {
-				return nil, api.ErrNotAvailable
-			}
-			rates, err = ratesFromV1(site.TariffContent.SellTariff.Seasons, site.TariffContent.SellTariff.EnergyCharges)
-		} else {
-			rates, err = ratesFromV1(site.TariffContent.Seasons, site.TariffContent.EnergyCharges)
-		}
+	if isFeedIn {
+		// Export credit uses the CleanPowerSF generation rate (retail net metering),
+		// NOT the Tesla sell_tariff. sell_tariff reports the NBT/ACC total, which
+		// overstates export for a CCA customer whose generation is retail-netted. The
+		// PG&E delivery EEC and the net-position / NSC realization are layered on in
+		// core (they need metered history the meter package can't reach). Independent
+		// of the Tesla tariff, so no site-info call on the export path.
+		rates = cleanPowerSFGenerationRates()
 	} else {
-		return nil, api.ErrNotAvailable
-	}
-	if err != nil {
-		return nil, err
+		site, err := m.provider.siteInfoG()
+		if err != nil {
+			return nil, err
+		}
+		if tc := m.effectiveTariff(site); tc != nil {
+			rates, err = ratesFromV2(tc.Seasons, tc.EnergyCharges)
+		} else if site.TariffContent != nil {
+			rates, err = ratesFromV1(site.TariffContent.Seasons, site.TariffContent.EnergyCharges)
+		} else {
+			return nil, api.ErrNotAvailable
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// overlay the VPP export premium on feed-in slots that fall inside a scheduled
@@ -898,6 +1139,20 @@ func (m *FleetAPI) Rates() (api.Rates, error) {
 		}
 	}
 	return rates, nil
+}
+
+// cleanPowerSFGenerationRates builds a 7-day hourly forecast of the CleanPowerSF
+// retail generation rate - the export credit basis for a CleanPowerSF NEM customer.
+// core (realizedExport) layers on the PG&E delivery EEC and the net-position / NSC
+// realization, which require metered history unavailable to the meter package.
+func cleanPowerSFGenerationRates() api.Rates {
+	start := time.Now().Truncate(time.Hour)
+	rates := make(api.Rates, 0, 7*24)
+	for i := range 7 * 24 {
+		s := start.Add(time.Duration(i) * time.Hour)
+		rates = append(rates, api.Rate{Start: s, End: s.Add(time.Hour), Value: cleanpowersf.GenerationRate(s)})
+	}
+	return rates
 }
 
 // enableVPP turns on VPP event auto-detection for this (feed-in) meter: it polls

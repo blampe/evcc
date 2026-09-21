@@ -107,6 +107,8 @@ type Site struct {
 	collectors map[string]*metrics.Collector // keyed by meter ref
 	tariffSlot time.Time                     // last persisted tariff slot
 
+	realizationG func() (realizationFactors, error) // cached export realization factors (see realization), wired in NewSite
+
 	batterySocEstimators map[string]*soc.BatteryEstimator // per-battery soc interpolators, keyed by meter ref
 
 	// cached state
@@ -388,8 +390,8 @@ func (site *Site) Boot(log *util.Logger, loadpoints []*Loadpoint, tariffs *tarif
 // NewSite creates a Site with sane defaults
 func NewSite() *Site {
 	site := &Site{
-		log:        util.NewLogger("site"),
-		Voltage:    230, // V
+		log:                  util.NewLogger("site"),
+		Voltage:              230, // V
 		collectors:           make(map[string]*metrics.Collector),
 		forecasts:            make(map[string]forecastEntry),
 		consumption:          make(map[string]consumptionEntry),
@@ -404,6 +406,12 @@ func NewSite() *Site {
 		}
 		return scale, err
 	}, 24*time.Hour)
+
+	// export realization is a true-up-year aggregate; cache it (see realizationTTL)
+	site.realizationG = util.Cached(func() (realizationFactors, error) {
+		rD, rG, ok := site.exportRealization(time.Now())
+		return realizationFactors{rD, rG, ok}, nil
+	}, realizationTTL)
 
 	return site
 }
@@ -1334,6 +1342,10 @@ func (site *Site) update(lp updater) {
 		}
 
 		site.publishTariffs(greenShareHome, greenShareLoadpoints)
+
+		// keep the device's export sell tariff synced to evcc's realized value (off the
+		// synchronous prepare() path, which also calls publishTariffs)
+		site.syncExportRealization()
 
 		if telemetry.Enabled() && totalChargePower > standbyPower {
 			go telemetry.UpdateChargeProgress(site.log, totalChargePower, greenShareLoadpoints)

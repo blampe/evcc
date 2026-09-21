@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/core/cleanpowersf"
 	teslaclient "github.com/evcc-io/tesla-proxy-client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -221,59 +222,118 @@ func TestCarveWindow(t *testing.T) {
 }
 
 func TestFleetAPIFeedinRates(t *testing.T) {
-	site := &teslaclient.EnergySite{
-		TariffContentV2: &teslaclient.TariffContentV2{
-			Seasons: map[string]teslaclient.TariffSeasonV2{
-				"Summer": {
-					FromMonth: 6, ToMonth: 9,
-					TOUPeriods: map[string]teslaclient.TariffSeasonV2TOUPeriods{
-						"ON_PEAK":  {Periods: []teslaclient.TariffTOUPeriod{{ToDayOfWeek: 6, FromHour: 16, ToHour: 21}}},
-						"OFF_PEAK": {Periods: []teslaclient.TariffTOUPeriod{{ToDayOfWeek: 6, FromHour: 0, ToHour: 16}}},
-					},
-				},
-				"Winter": {
-					FromMonth: 10, ToMonth: 5,
-					TOUPeriods: map[string]teslaclient.TariffSeasonV2TOUPeriods{
-						"OFF_PEAK": {Periods: []teslaclient.TariffTOUPeriod{{ToDayOfWeek: 6}}},
-					},
-				},
-			},
-			EnergyCharges: map[string]teslaclient.TariffRates{
-				"Summer": {Rates: map[string]float64{"ON_PEAK": 0.579, "OFF_PEAK": 0.361}},
-				"Winter": {Rates: map[string]float64{"OFF_PEAK": 0.312}},
-			},
-			SellTariff: &teslaclient.TariffSellTariffV2{
-				Seasons: map[string]teslaclient.TariffSeasonV2{
-					"All": {
-						FromMonth: 1, ToMonth: 12,
-						TOUPeriods: map[string]teslaclient.TariffSeasonV2TOUPeriods{
-							"hour_0_all": {Periods: []teslaclient.TariffTOUPeriod{{ToDayOfWeek: 6, FromHour: 0, ToHour: 1}}},
-							"hour_1_all": {Periods: []teslaclient.TariffTOUPeriod{{ToDayOfWeek: 6, FromHour: 1, ToHour: 2}}},
-						},
-					},
-				},
-				EnergyCharges: map[string]teslaclient.TariffRates{
-					"All": {Rates: map[string]float64{"hour_0_all": 0.078, "hour_1_all": 0.077}},
-				},
-			},
-		},
-	}
-
-	m := &FleetAPI{
-		usage: "feedin",
-		provider: &fleetAPIProvider{
-			siteInfoG: func() (*teslaclient.EnergySite, error) { return site, nil },
-		},
-	}
+	// Feed-in returns the CleanPowerSF retail generation rate (net metering), NOT the
+	// Tesla sell_tariff (which reported the inflated NBT/ACC total). It is independent
+	// of the Tesla tariff, so no site-info call is made on the export path.
+	m := &FleetAPI{usage: "feedin"}
 
 	rates, err := m.Rates()
 	require.NoError(t, err)
-	require.NotEmpty(t, rates, "feedin rates should use sell_tariff.seasons, not main tariff seasons")
+	require.Len(t, rates, 7*24) // 7 days, hourly
 
 	for _, r := range rates {
 		assert.Equal(t, time.Hour, r.End.Sub(r.Start))
+		assert.Equal(t, cleanpowersf.GenerationRate(r.Start), r.Value)
+		assert.Positive(t, r.Value)
 	}
-	assert.Len(t, rates, 14) // 7 days * 2 periods/day
+}
+
+func TestSeasonMonth(t *testing.T) {
+	// month-named sell seasons (no from/to month) resolve by name, case/space-insensitive
+	m, ok := seasonMonth("July", teslaclient.TariffSeasonV2{})
+	assert.True(t, ok)
+	assert.Equal(t, time.July, m)
+	m, ok = seasonMonth("  september ", teslaclient.TariffSeasonV2{})
+	assert.True(t, ok)
+	assert.Equal(t, time.September, m)
+	// an explicit FromMonth wins
+	m, ok = seasonMonth("Summer", teslaclient.TariffSeasonV2{FromMonth: 6})
+	assert.True(t, ok)
+	assert.Equal(t, time.June, m)
+	// unresolvable
+	_, ok = seasonMonth("Summer", teslaclient.TariffSeasonV2{})
+	assert.False(t, ok)
+}
+
+func TestRepresentativeTime(t *testing.T) {
+	// Tesla dow 0=Mon -> a Monday, in the given month, at the given hour
+	got := representativeTime(time.July, 0, 18)
+	assert.Equal(t, time.July, got.Month())
+	assert.Equal(t, 18, got.Hour())
+	assert.Equal(t, time.Monday, got.Weekday())
+	// Tesla dow 5=Sat -> a Saturday
+	got = representativeTime(time.January, 5, 9)
+	assert.Equal(t, time.Saturday, got.Weekday())
+	assert.Equal(t, 9, got.Hour())
+}
+
+// TestCorrectedTariff verifies the baseline tariff evcc writes back to the Powerwall:
+// the real BUY side untouched, the SELL side replaced by the realized export value
+// (delivery EEC + net-position/NSC generation), tagged EVCC, and a no-op until the
+// realization inputs are injected.
+func TestCorrectedTariff(t *testing.T) {
+	genuine := &teslaclient.TariffContentV2{
+		Utility: "Clean Power SF",
+		Name:    "Real Plan",
+		Seasons: map[string]teslaclient.TariffSeasonV2{
+			"Summer": {FromMonth: 6, ToMonth: 9, TOUPeriods: map[string]teslaclient.TariffSeasonV2TOUPeriods{
+				"ON_PEAK": {Periods: []teslaclient.TariffTOUPeriod{{FromDayOfWeek: 0, ToDayOfWeek: 6, FromHour: 16, ToHour: 21}}},
+			}},
+		},
+		EnergyCharges: map[string]teslaclient.TariffRates{
+			"Summer": {Rates: map[string]float64{"ON_PEAK": 0.579}},
+		},
+		SellTariff: &teslaclient.TariffSellTariffV2{
+			Seasons: map[string]teslaclient.TariffSeasonV2{
+				"July": {TOUPeriods: map[string]teslaclient.TariffSeasonV2TOUPeriods{
+					"hour_18_weekday": {Periods: []teslaclient.TariffTOUPeriod{{FromDayOfWeek: 0, ToDayOfWeek: 4, FromHour: 18, ToHour: 19}}},
+					"hour_2_weekday":  {Periods: []teslaclient.TariffTOUPeriod{{FromDayOfWeek: 0, ToDayOfWeek: 4, FromHour: 2, ToHour: 3}}},
+				}},
+			},
+			EnergyCharges: map[string]teslaclient.TariffRates{
+				// the inflated ACC values we want gone
+				"July": {Rates: map[string]float64{"hour_18_weekday": 0.35, "hour_2_weekday": 0.08}},
+			},
+		},
+	}
+
+	m := &FleetAPI{provider: &fleetAPIProvider{}}
+
+	// before core injects the realization inputs: never write a half-built sell tariff
+	assert.Same(t, genuine, m.correctedTariff(genuine))
+
+	// inject: delivery EEC = $0.05 across the whole window, net generation exporter
+	// (R_gen=0) with delivery headroom (R_delivery=1)
+	eec := api.Rates{{
+		Start: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		End:   time.Date(2029, 1, 1, 0, 0, 0, 0, time.UTC),
+		Value: 0.05,
+	}}
+	m.SetExportRealization(eec, 1, 0)
+
+	got := m.correctedTariff(genuine)
+	require.NotSame(t, genuine, got)
+
+	// BUY side untouched, tagged so the guard treats it as ours
+	assert.Equal(t, genuine.Seasons, got.Seasons)
+	assert.Equal(t, genuine.EnergyCharges, got.EnergyCharges)
+	assert.Equal(t, syntheticTariffUtility, got.Utility)
+	assert.True(t, isSyntheticTariff(got))
+
+	// SELL side: net exporter -> delivery + NSC (retail generation drops out at R_gen=0)
+	nsc := cleanpowersf.NetSurplusCompensation(representativeTime(time.July, 0, 18))
+	assert.InDelta(t, 0.05+nsc, got.SellTariff.EnergyCharges["July"].Rates["hour_18_weekday"], 1e-9)
+	assert.InDelta(t, 0.05+nsc, got.SellTariff.EnergyCharges["July"].Rates["hour_2_weekday"], 1e-9)
+
+	// the original tariff is never mutated
+	assert.Equal(t, 0.35, genuine.SellTariff.EnergyCharges["July"].Rates["hour_18_weekday"])
+
+	// net generation importer (R_gen=1): generation climbs to the CleanPowerSF RETAIL
+	// rate (never Tesla's ACC), still plus realized delivery
+	m.SetExportRealization(eec, 1, 1)
+	got = m.correctedTariff(genuine)
+	gen18 := cleanpowersf.GenerationRate(representativeTime(time.July, 0, 18))
+	assert.InDelta(t, 0.05+gen18, got.SellTariff.EnergyCharges["July"].Rates["hour_18_weekday"], 1e-9)
 }
 
 func TestFleetAPIImportRates(t *testing.T) {

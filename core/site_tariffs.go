@@ -80,17 +80,17 @@ func (site *Site) greenShare(powerFrom float64, powerTo float64) float64 {
 	return share
 }
 
-// effectivePrice calculates the real energy price based on self-produced and grid-imported energy.
+// effectivePrice calculates the real energy price based on self-produced and
+// grid-imported energy, using the realized NEM3 grid/feed-in rates (the same values
+// the optimizer decides on), not the sticker retail rate.
 func (site *Site) effectivePrice(greenShare float64) *float64 {
-	if grid, err := tariff.Now(site.GetTariff(api.TariffUsageGrid)); err == nil {
-		feedin, err := tariff.Now(site.GetTariff(api.TariffUsageFeedIn))
-		if err != nil {
-			feedin = 0
-		}
-		effPrice := grid*(1-greenShare) + feedin*greenShare
-		return &effPrice
+	grid, ok := site.realizedGridNow()
+	if !ok {
+		return nil
 	}
-	return nil
+	feedin := site.realizedFeedInNow()
+	effPrice := grid*(1-greenShare) + feedin*greenShare
+	return &effPrice
 }
 
 // effectiveCo2 calculates the amount of emitted co2 based on self-produced and grid-imported energy.
@@ -106,10 +106,17 @@ func (site *Site) publishTariffs(greenShareHome float64, greenShareLoadpoints fl
 	site.publish(keys.GreenShareHome, greenShareHome)
 	site.publish(keys.GreenShareLoadpoints, greenShareLoadpoints)
 
-	if v, err := tariff.Now(site.GetTariff(api.TariffUsageGrid)); err == nil {
+	// grid and feed-in are shown at their realized NEM3 worth - the same numbers the
+	// optimizer decides on and evcc writes back to the Powerwall - so the UI reflects
+	// what evcc actually optimizes (your annual-netted bill), not the sticker retail
+	// rate. The raw retail price is kept only as the persisted net-position input.
+	// See realizedImportRates / realizedFeedInRates.
+	realizedGrid := site.realizedImportRates(currentRates(site.GetTariff(api.TariffUsageGrid)))
+	realizedFeedIn := site.realizedFeedInRates()
+	if v, ok := rateAt(realizedGrid, time.Now()); ok {
 		site.publish(keys.TariffGrid, v)
 	}
-	if v, err := tariff.Now(site.GetTariff(api.TariffUsageFeedIn)); err == nil {
+	if v, ok := rateAt(realizedFeedIn, time.Now()); ok {
 		site.publish(keys.TariffFeedIn, v)
 	}
 	if v, err := tariff.Now(site.GetTariff(api.TariffUsageCo2)); err == nil {
@@ -143,9 +150,9 @@ func (site *Site) publishTariffs(greenShareHome float64, greenShareLoadpoints fl
 		Temperature forecastSeries `json:"temperature,omitempty"`
 	}{
 		Co2:         forecastRates(tariff.Rates(site.GetTariff(api.TariffUsageCo2))),
-		FeedIn:      forecastRates(tariff.Rates(site.GetTariff(api.TariffUsageFeedIn))),
+		FeedIn:      forecastRates(realizedFeedIn),
 		Planner:     forecastRates(tariff.Rates(site.GetTariff(api.TariffUsagePlanner))),
-		Grid:        forecastRates(tariff.Rates(site.GetTariff(api.TariffUsageGrid))),
+		Grid:        forecastRates(realizedGrid),
 		Temperature: forecastRates(tariff.Rates(site.GetTariff(api.TariffUsageTemperature))),
 	}
 
@@ -156,12 +163,15 @@ func (site *Site) publishTariffs(greenShareHome float64, greenShareLoadpoints fl
 
 	site.publish(keys.Forecast, util.NewSharder(keys.Forecast, fc))
 
-	site.persistTariffs()
+	site.persistTariffs(realizedFeedIn)
 }
 
 // persistTariffs stores tariff values once per 15min boundary. Like the meter
 // collectors it is driven by the update loop, skipping the partial boot slot.
-func (site *Site) persistTariffs() {
+// realizedFeedIn is the realized export forecast (see realizedFeedInRates) so the
+// persisted feed-in history matches the realized value shown in the UI, not the
+// raw generation rate.
+func (site *Site) persistTariffs(realizedFeedIn api.Rates) {
 	slot := time.Now().Truncate(tariff.SlotDuration)
 
 	last := site.tariffSlot
@@ -179,9 +189,21 @@ func (site *Site) persistTariffs() {
 		return nil
 	}
 
+	// INVARIANT: the grid column persists the RAW RETAIL price, never the realized
+	// one - exportRealization reads it back (QueryGridPrices/buyLookup) as the
+	// net-position input, so persisting the realized value would feed R into itself.
+	// Do NOT "make this consistent" with the realized feed-in below.
+	retailGrid := value(api.TariffUsageGrid)
+
+	// feed-in persists the realized export value (matches the UI; not an R input)
+	var feedin *float64
+	if v, ok := rateAt(realizedFeedIn, slot); ok {
+		feedin = &v
+	}
+
 	if err := metrics.PersistTariffs(slot,
-		value(api.TariffUsageGrid),
-		value(api.TariffUsageFeedIn),
+		retailGrid,
+		feedin,
 		value(api.TariffUsageCo2),
 		value(api.TariffUsageTemperature),
 	); err != nil {
