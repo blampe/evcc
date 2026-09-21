@@ -314,11 +314,17 @@ func TestCorrectedTariff(t *testing.T) {
 	got := m.correctedTariff(genuine)
 	require.NotSame(t, genuine, got)
 
-	// BUY side untouched, tagged so the guard treats it as ours
+	// season/period STRUCTURE preserved (only the rate values change), tagged ours
 	assert.Equal(t, genuine.Seasons, got.Seasons)
-	assert.Equal(t, genuine.EnergyCharges, got.EnergyCharges)
 	assert.Equal(t, syntheticTariffUtility, got.Utility)
 	assert.True(t, isSyntheticTariff(got))
+
+	// BUY side: full retail discounted by the generation premium a net exporter never
+	// pays (R_gen=0), sampled at the Summer ON_PEAK representative time
+	buyT := representativeTime(time.June, 0, 16) // Summer season FromMonth=6, ON_PEAK FromHour=16
+	buyGen := cleanpowersf.GenerationRate(buyT)
+	buyNsc := cleanpowersf.NetSurplusCompensation(buyT)
+	assert.InDelta(t, 0.579-(buyGen-buyNsc), got.EnergyCharges["Summer"].Rates["ON_PEAK"], 1e-9)
 
 	// SELL side: net exporter -> delivery + NSC (retail generation drops out at R_gen=0)
 	nsc := cleanpowersf.NetSurplusCompensation(representativeTime(time.July, 0, 18))
@@ -326,12 +332,14 @@ func TestCorrectedTariff(t *testing.T) {
 	assert.InDelta(t, 0.05+nsc, got.SellTariff.EnergyCharges["July"].Rates["hour_2_weekday"], 1e-9)
 
 	// the original tariff is never mutated
+	assert.Equal(t, 0.579, genuine.EnergyCharges["Summer"].Rates["ON_PEAK"])
 	assert.Equal(t, 0.35, genuine.SellTariff.EnergyCharges["July"].Rates["hour_18_weekday"])
 
-	// net generation importer (R_gen=1): generation climbs to the CleanPowerSF RETAIL
-	// rate (never Tesla's ACC), still plus realized delivery
+	// net generation importer (R_gen=1): no discount on buy, generation climbs to the
+	// CleanPowerSF RETAIL rate on sell (never Tesla's ACC), still plus realized delivery
 	m.SetExportRealization(eec, 1, 1)
 	got = m.correctedTariff(genuine)
+	assert.InDelta(t, 0.579, got.EnergyCharges["Summer"].Rates["ON_PEAK"], 1e-9)
 	gen18 := cleanpowersf.GenerationRate(representativeTime(time.July, 0, 18))
 	assert.InDelta(t, 0.05+gen18, got.SellTariff.EnergyCharges["July"].Rates["hour_18_weekday"], 1e-9)
 }

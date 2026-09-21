@@ -694,6 +694,24 @@ func (m *FleetAPI) realizedSellRate(t time.Time) (float64, bool) {
 	return rateAtSorted(eec, t)*rDel + realizedGen, true
 }
 
+// realizedBuyRate discounts a retail import price to its realized marginal cost at
+// t: the CleanPowerSF generation premium a net exporter never pays (retail gen above
+// NSC) is removed, scaled by how far the position is from net-generation exporter
+// (rGen). Mirrors core's realizedImportAt (KEEP IN SYNC). ok is false until core
+// injects the realization inputs.
+func (m *FleetAPI) realizedBuyRate(t time.Time, retail float64) (float64, bool) {
+	p := m.provider
+	p.exportMu.Lock()
+	rGen, set := p.exportRGen, p.exportRealizationSet
+	p.exportMu.Unlock()
+	if !set {
+		return 0, false
+	}
+	genRetail := cleanpowersf.GenerationRate(t)
+	nsc := cleanpowersf.NetSurplusCompensation(t)
+	return retail - max(0, genRetail-nsc)*(1-rGen), true
+}
+
 // rateAtSorted returns the value of the start-sorted rate slot covering t, or 0.
 func rateAtSorted(rates api.Rates, t time.Time) float64 {
 	i := sort.Search(len(rates), func(i int) bool { return rates[i].End.After(t) })
@@ -703,22 +721,26 @@ func rateAtSorted(rates api.Rates, t time.Time) float64 {
 	return 0
 }
 
-// correctedTariff returns the user's real tariff with the SELL side replaced by the
-// realized NEM3 export value (realizedSellRate) - the rate evcc believes export is
-// actually worth - so the Powerwall app stops showing Tesla's inflated ACC sell
-// tariff. The BUY side is left exactly as-is (real retail import), which bounds the
-// risk: import behaviour is untouched. Tagged EVCC so the guard keeps snapshotting
-// and restoring the user's genuine tariff and never mistakes this for real. Returns
-// the input unchanged until core injects the realization inputs (never write a
-// half-built sell tariff) or when there is no sell tariff to correct.
+// correctedTariff returns the user's real tariff with both sides replaced by their
+// realized NEM3 marginal values - the buy discounted to the marginal import cost
+// (realizedBuyRate) and the sell to the realized export value (realizedSellRate),
+// the same basis evcc optimizes on - so the Powerwall (its app and its own onboard
+// optimizer) stops using Tesla's inflated ACC sell and the sticker retail buy, which
+// for a net-metered customer are not the marginal prices that move the annual-netted
+// bill. Tagged EVCC so the guard keeps snapshotting and restoring the user's genuine
+// tariff and never mistakes this for real. Returns the input unchanged until core
+// injects the realization inputs (never write a half-built tariff) or when there is
+// no sell tariff to correct.
 //
 // It shares the EVCC marker with the (reversible) discharge spike even though the
-// sell overwrite is lossy, which is safe: this builder always RECOMPUTES the sell
-// from the injected realization (it never trusts an input's sell), so a stranded
+// overwrite is lossy, which is safe: this builder always RECOMPUTES both sides from
+// the injected realization (it never trusts an input's rates), so a stranded
 // corrected tariff fed back through the self-heal path is re-derived correctly; and
 // the guard refuses to snapshot any EVCC-tagged tariff as real, so realized rates
-// can't be mistaken for the utility's genuine ACC. The genuine tariff is captured
-// (guard.remember) before it's ever overwritten.
+// can't be mistaken for the utility's genuine ones. The genuine tariff is captured
+// (guard.remember) before it's ever overwritten. evcc's own grid/feed-in reads go
+// through effectiveTariff, which returns the genuine snapshot while ours is live -
+// so evcc never double-realizes.
 func (m *FleetAPI) correctedTariff(genuine *teslaclient.TariffContentV2) *teslaclient.TariffContentV2 {
 	if genuine == nil || genuine.SellTariff == nil {
 		return genuine
@@ -735,34 +757,38 @@ func (m *FleetAPI) correctedTariff(genuine *teslaclient.TariffContentV2) *teslac
 	out.Utility = syntheticTariffUtility
 	out.Name = correctedTariffName
 	out.Version = 2
+	// buy = realized marginal import cost; sell = realized export value (same basis)
+	out.Seasons, out.EnergyCharges = m.realizedSeasons(genuine.Seasons, genuine.EnergyCharges, m.realizedBuyRate)
 	sell := *genuine.SellTariff
-	sell.Seasons, sell.EnergyCharges = m.realizedSellSeasons(genuine.SellTariff.Seasons, genuine.SellTariff.EnergyCharges)
+	sell.Seasons, sell.EnergyCharges = m.realizedSeasons(sell.Seasons, sell.EnergyCharges,
+		func(t time.Time, _ float64) (float64, bool) { return m.realizedSellRate(t) })
 	out.SellTariff = &sell
 	return &out
 }
 
-// realizedSellSeasons returns copies of the sell tariff's seasons (structure kept
-// as-is) and energy charges with every rate replaced by the realized export value
+// realizedSeasons returns copies of a tariff's seasons (structure kept as-is) and
+// energy charges with each rate replaced by rate(representative-time, current-rate),
 // sampled at a time representative of that season/period (season month, period hour
-// and weekday). A season whose month can't be resolved keeps its original rates, so
-// the worst case is leaving the ACC value rather than writing a wrong one. Inputs
-// are never mutated.
-func (m *FleetAPI) realizedSellSeasons(seasons map[string]teslaclient.TariffSeasonV2, charges map[string]teslaclient.TariffRates) (map[string]teslaclient.TariffSeasonV2, map[string]teslaclient.TariffRates) {
+// and weekday). A season whose month can't be resolved, or a period whose rate()
+// declines, keeps its original value - worst case leaves the genuine rate rather
+// than a wrong one. Inputs are never mutated. Shared by the buy and sell corrections.
+func (m *FleetAPI) realizedSeasons(seasons map[string]teslaclient.TariffSeasonV2, charges map[string]teslaclient.TariffRates, rate func(t time.Time, retail float64) (float64, bool)) (map[string]teslaclient.TariffSeasonV2, map[string]teslaclient.TariffRates) {
 	outSeasons := make(map[string]teslaclient.TariffSeasonV2, len(seasons))
 	maps.Copy(outSeasons, seasons)
 	outCharges := make(map[string]teslaclient.TariffRates, len(charges))
 
 	for name, season := range seasons {
 		newRates := make(map[string]float64, len(charges[name].Rates))
-		maps.Copy(newRates, charges[name].Rates) // default: keep original (e.g. season month unresolved)
+		maps.Copy(newRates, charges[name].Rates) // default: keep original (month unresolved / rate declined)
 
 		if month, ok := seasonMonth(name, season); ok {
 			for periodName, tou := range season.TOUPeriods {
-				if len(tou.Periods) == 0 {
+				retail, has := charges[name].Rates[periodName]
+				if !has || len(tou.Periods) == 0 {
 					continue
 				}
 				p0 := tou.Periods[0]
-				if v, ok := m.realizedSellRate(representativeTime(month, p0.FromDayOfWeek, p0.FromHour)); ok {
+				if v, ok := rate(representativeTime(month, p0.FromDayOfWeek, p0.FromHour), retail); ok {
 					newRates[periodName] = v
 				}
 			}
