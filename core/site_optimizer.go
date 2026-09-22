@@ -800,12 +800,13 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 
 	// self-consumption is no longer forced with a near-zero import cap. On true
 	// prices it falls out of cost minimization (covering the home from the battery
-	// beats importing whenever import > export), and the case a cap used to force -
+	// beats importing whenever import > export). The case a cap used to force -
 	// keeping enough battery for the home instead of dumping it at an export peak -
-	// is handled honestly by the load-aware backup reserve (ReserveForLoad on the
-	// home battery, see batteryRequest), which self-sizes to the load and solar
-	// forecast. Only a real physical import limit (the circuit cap above) sets
-	// PMaxImp now; ordinary home import is priced at the true grid price.
+	// no longer arises now that export is valued at its realized worth (~NSC, see
+	// realizedFeedInRates): the pack exports only when that genuinely beats holding,
+	// so no blanket reserve is needed (see batteryRequest). Only a real physical
+	// import limit (the circuit cap above) sets PMaxImp now; ordinary home import is
+	// priced at the true grid price.
 
 	// static grid export limit configured in the UI: export is capped at this
 	// power, excess PV is curtailed instead of exported
@@ -1374,22 +1375,27 @@ func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measureme
 		SCapacity: float32(*b.Capacity * 1e3),         // Wh
 		SInitial:  float32(*b.Capacity * *b.Soc * 10), // Wh
 		// PA:       pa,
-		// the home battery holds a load-aware backup reserve: enough to cover the
-		// home from now until PV catches up, self-sized from the load and solar
-		// forecast. This is what keeps it from dumping the home's overnight energy
-		// at an export peak, now that the near-zero import cap is gone.
-		ReserveForLoad: true,
+		// No load-aware backup reserve. It was a workaround for the overvalued
+		// sell_tariff: it fenced the home's overnight energy off so the pack would not
+		// dump it at a fake export peak and re-import. But it self-sizes to the whole
+		// night at dusk, which pins the pack and forces the home to IMPORT through the
+		// evening peak while the reserve is drained overnight (cheap) - the opposite of
+		// what we want. With export now valued at its realized worth (~NSC, see
+		// realizedFeedInRates) self-consumption falls out of cost minimization on its
+		// own: the pack discharges at the expensive peak and re-imports overnight when
+		// cheap, exporting only when export genuinely beats that (a VPP event, or a
+		// summer-evening delivery-EEC peak). MinSoc still floors backup. Defaults false.
 	}
 
 	instance := dev.Instance()
 
 	controllable := api.HasCap[api.BatteryController](instance)
 	if controllable {
-		// Full grid flexibility: the PW3 may charge from and discharge to grid.
-		// The load-aware reserve (ReserveForLoad above) is what keeps enough battery
-		// for the home, so with DischargeToGrid on the optimizer dumps only the
-		// SURPLUS above that reserve at an export peak; the energy the home will need
-		// before PV catches up is held back, not dumped-and-reimported.
+		// Full grid flexibility: the PW3 may charge from and discharge to grid. With
+		// export priced at its realized worth, the optimizer dumps to grid only when
+		// that genuinely beats serving the home or holding (a VPP event, or a
+		// summer-evening delivery-EEC peak); on ordinary evenings self-consumption
+		// wins and the pack covers the home instead of importing at peak.
 		bat.ChargeFromGrid = true
 		bat.DischargeToGrid = true
 	}
