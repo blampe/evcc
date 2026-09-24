@@ -1057,6 +1057,15 @@ func (lp *Loadpoint) connected() bool {
 	return status == api.StatusB || status == api.StatusC
 }
 
+// connectedAfter reports whether the vehicle's current connection began strictly
+// after t. Used to drop optimizer suggestions computed while the car was still
+// disconnected, which would otherwise pause a just-plugged-in car.
+func (lp *Loadpoint) connectedAfter(t time.Time) bool {
+	lp.RLock()
+	defer lp.RUnlock()
+	return lp.connectedTime.After(t)
+}
+
 // charging returns the EVs charging state
 func (lp *Loadpoint) charging() bool {
 	return lp.GetStatus() == api.StatusC

@@ -282,6 +282,14 @@ func (site *Site) setSuggestions(suggestions map[string]types.Suggestion) {
 	site.suggestions = suggestions
 }
 
+// suggestionComputedAt returns when the current suggestions' input snapshot was
+// taken, or the zero time when suggestions were set outside an optimizer run.
+func (site *Site) suggestionComputedAt() time.Time {
+	site.RLock()
+	defer site.RUnlock()
+	return site.suggestionsComputedAt
+}
+
 // suggestion returns the optimizer suggestion for the given device key.
 // The actionable flag is evaluated on read against the device's current
 // action since that changes between optimizer runs.
@@ -349,6 +357,15 @@ func (site *Site) loadpointOptimizerAction(id int) (string, float64, string) {
 	}
 	s := site.suggestion(loadpointKey(id), loadpointCurrentAction(lp))
 	if s == nil {
+		return "", 0, ""
+	}
+
+	// Ignore a suggestion computed before the car connected: it reflects the
+	// disconnected loadpoint (zero current-slot availability -> "stop") and would
+	// pause a car that just plugged in until the connect-triggered re-optimization
+	// lands. Falling through to no action lets normal PV/welcome charging run in the
+	// meantime; the next run (reflecting the connection) supersedes it.
+	if computedAt := site.suggestionComputedAt(); !computedAt.IsZero() && lp.connectedAfter(computedAt) {
 		return "", 0, ""
 	}
 
@@ -901,6 +918,11 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 }
 
 func (site *Site) optimizerUpdate(battery []types.Measurement) error {
+	// stamp the input snapshot time before building the request: a suggestion
+	// computed before a car connected does not describe the connected loadpoint
+	// (see loadpointOptimizerAction).
+	computedAt := time.Now()
+
 	req, details, err := site.optimizerRequest(battery)
 	if err != nil {
 		return err
@@ -951,7 +973,7 @@ func (site *Site) optimizerUpdate(battery []types.Measurement) error {
 		return errors.New(string(status))
 	}
 
-	site.applyOptimizerResult(req, details.BatteryDetails, *resp.JSON200)
+	site.applyOptimizerResult(req, details.BatteryDetails, *resp.JSON200, computedAt)
 
 	return nil
 }
@@ -976,7 +998,7 @@ func gridImportAt(res optimizer.OptimizationResult, j int) float32 {
 
 // applyOptimizerResult maps the optimizer response onto suggestions, battery
 // forecast and notifications
-func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details []batteryDetail, res optimizer.OptimizationResult) {
+func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details []batteryDetail, res optimizer.OptimizationResult, computedAt time.Time) {
 	dt := req.TimeSeries.Dt
 	slotHours := (time.Duration(dt[0]) * time.Second).Hours()
 	gridImporting := gridImportAt(res, 0) > 0
@@ -1080,6 +1102,9 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 	}
 
 	site.setSuggestions(suggestions)
+	site.Lock()
+	site.suggestionsComputedAt = computedAt
+	site.Unlock()
 	site.setBatterySchedules(schedules)
 	site.battery.Forecast = site.addBatteryForecastTotals(req.Batteries, res.Batteries)
 
@@ -1087,6 +1112,19 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 
 	// publish for all loadpoints so suggestions of dropped-out loadpoints clear
 	site.publishSuggestions()
+
+	// The optimizer runs asynchronously, so a just-computed suggestion would
+	// otherwise wait for the next control tick (up to the site interval) to be
+	// applied - notably a connect-triggered run would not charge until then. Poke
+	// the modelled loadpoints so the fresh suggestion is consumed promptly.
+	for _, detail := range details {
+		if detail.loadpoint == nil {
+			continue
+		}
+		if lp := site.loadpoints[*detail.loadpoint]; lp != nil {
+			lp.requestUpdate()
+		}
+	}
 
 	// notify on actionable suggestion changes (advisory only, see #31903)
 	for _, ev := range site.diffSuggestions(site.pendingSuggestions(details)) {

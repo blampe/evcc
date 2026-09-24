@@ -644,6 +644,54 @@ func TestLoadpointOptimizerAction(t *testing.T) {
 	assert.Empty(t, source)
 }
 
+// TestLoadpointOptimizerActionStale drops a suggestion computed before the car
+// connected: a disconnected loadpoint's stored "stop" must not pause a car that
+// just plugged in before the connect-triggered re-optimization lands. A stop
+// computed after the connection is a real defer and is still honored.
+func TestLoadpointOptimizerActionStale(t *testing.T) {
+	site := &Site{loadpoints: []*Loadpoint{
+		NewLoadpoint(util.NewLogger("lp0"), nil),
+	}}
+
+	connectedAt := time.Now()
+	site.loadpoints[0].connectedTime = connectedAt
+
+	site.setSuggestions(map[string]types.Suggestion{
+		loadpointKey(0): {Action: actionStop},
+	})
+
+	// suggestion computed before the connection => ignored, so the just-connected
+	// car falls through to normal PV/welcome charging instead of stopping
+	site.suggestionsComputedAt = connectedAt.Add(-time.Minute)
+	action, power, source := site.loadpointOptimizerAction(0)
+	assert.Empty(t, action, "pre-connect suggestion is ignored")
+	assert.Zero(t, power)
+	assert.Empty(t, source)
+
+	// a fresh run reflecting the connection is applied
+	site.setSuggestions(map[string]types.Suggestion{
+		loadpointKey(0): {Action: actionCharge, Charge: 9600, Source: sourceGrid},
+	})
+	site.suggestionsComputedAt = connectedAt.Add(time.Minute)
+	action, power, source = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionCharge, action, "post-connect suggestion is applied")
+	assert.Equal(t, 9600.0, power)
+	assert.Equal(t, sourceGrid, source)
+
+	// a legit stop computed after the connection is a real defer, not stale
+	site.setSuggestions(map[string]types.Suggestion{
+		loadpointKey(0): {Action: actionStop},
+	})
+	site.suggestionsComputedAt = connectedAt.Add(time.Minute)
+	action, _, _ = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionStop, action, "post-connect stop is honored")
+
+	// suggestions set outside an optimizer run (zero computedAt) are never stale
+	site.suggestionsComputedAt = time.Time{}
+	action, _, _ = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionStop, action, "unstamped suggestion is applied")
+}
+
 // TestBatteryBoostReserveGate stops a battery-sourced boost once the home
 // battery reaches its planned reserve, so the car doesn't keep charging from the
 // grid at peak prices. It trips when the pack soc reaches the target, or in real
