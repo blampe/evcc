@@ -934,9 +934,45 @@ func (lp *Loadpoint) syncCharger() error {
 	case shouldBeConsistent && (enabled || lp.connected()):
 		// ignore disabled state if vehicle was disconnected (!lp.enabled && !lp.connected)
 		lp.log.WARN.Printf("charger out of sync: expected %vd, got %vd", status[lp.enabled], status[enabled])
+
+		if enabled {
+			lp.adoptChargerCurrent()
+		}
 	}
 
 	return nil
+}
+
+// adoptChargerCurrent takes over the current of a charger that is charging
+// although evcc did not enable it - a charger that starts the session itself
+// when the car is plugged in. The deferred setAndPublishEnabled adopts the
+// enabled state; without adopting the current with it, offeredCurrent stays at
+// the 0 that disabling left behind, so effectiveCurrent reports a car pulling
+// several kW as drawing nothing. PV mode then reads the car's own draw as a
+// site deficit, computes no surplus and - with the pv timer elapsed on connect -
+// stops the fresh charge on the spot, only to restart it an enable delay later.
+//
+// Unlike the regular sync this is not a charger logic error: evcc never set this
+// current, so a deviation is expected rather than a symptom of a slow interval.
+func (lp *Loadpoint) adoptChargerCurrent() {
+	// measured phase currents, falling back to offeredCurrent when unmeasured
+	current := lp.GetMaxPhaseCurrent()
+
+	if cg, ok := api.Cap[api.CurrentGetter](lp.charger); ok {
+		if c, err := cg.GetMaxCurrent(); err == nil {
+			current = c
+		} else if !loadpoint.AcceptableError(err) {
+			lp.log.ERROR.Printf("charger get max current: %v", err)
+		}
+	}
+
+	if current <= 0 || math.Abs(current-lp.offeredCurrent) <= 0.23 {
+		return
+	}
+
+	lp.log.DEBUG.Printf("adopting charger current: %.3gA", current)
+	lp.offeredCurrent = current
+	lp.bus.Publish(evChargeCurrent, current)
 }
 
 // coarseCurrent returns true if charger or vehicle require full amp steps

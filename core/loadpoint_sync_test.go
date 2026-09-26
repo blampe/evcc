@@ -222,3 +222,107 @@ func TestSyncChargerPhasesByMeasurement(t *testing.T) {
 		assert.Equal(t, tc.outPhases, lp.phases)
 	}
 }
+
+// TestSyncChargerAdoptsCurrent covers a charger that starts the session itself
+// when the car is plugged in: evcc adopts the enabled state and must adopt the
+// charger's current with it. Disabling resets offeredCurrent to 0, which would
+// otherwise make effectiveCurrent report the running car as drawing nothing.
+func TestSyncChargerAdoptsCurrent(t *testing.T) {
+	tc := []struct {
+		name                      string
+		status                    api.ChargeStatus
+		chargerEnabled, lpEnabled bool
+		actual, offered, expected float64
+	}{
+		// charger energized the car on plug-in, evcc still thinks it is disabled
+		{"plug and charge", api.StatusC, true, false, 32, 0, 32},
+		// nothing to adopt in the other direction: the charger offers no current
+		{"charger disabled", api.StatusB, false, true, 0, 16, 16},
+	}
+
+	for _, tc := range tc {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+
+			ch := api.NewMockCharger(ctrl)
+			cg := api.NewMockCurrentGetter(ctrl)
+
+			charger := struct {
+				api.Charger
+				api.CurrentGetter
+			}{
+				ch, cg,
+			}
+
+			ch.EXPECT().Enabled().Return(tc.chargerEnabled, nil)
+			if tc.chargerEnabled {
+				cg.EXPECT().GetMaxCurrent().Return(tc.actual, nil)
+			}
+
+			lp := &Loadpoint{
+				log:            util.NewLogger("foo"),
+				bus:            evbus.New(),
+				clock:          clock.New(),
+				charger:        charger,
+				status:         tc.status,
+				enabled:        tc.lpEnabled,
+				phases:         1,
+				offeredCurrent: tc.offered,
+			}
+
+			require.NoError(t, lp.syncCharger())
+			assert.Equal(t, tc.chargerEnabled, lp.enabled, "enabled state adopted")
+			assert.Equal(t, tc.expected, lp.offeredCurrent)
+		})
+	}
+}
+
+// TestPlugAndChargeKeepsCharging is the regression for a car that the charger
+// energizes on plug-in while pv mode is active. Connecting elapses the pv timer,
+// so the very first evaluation decides immediately - and it must decide on the
+// car's actual draw. Before the current was adopted the loadpoint saw the car's
+// own consumption as a site deficit with nothing charging, disabled the charger
+// and only re-enabled it an enable delay later.
+func TestPlugAndChargeKeepsCharging(t *testing.T) {
+	Voltage = 100
+
+	ctrl := gomock.NewController(t)
+
+	ch := api.NewMockCharger(ctrl)
+	cg := api.NewMockCurrentGetter(ctrl)
+
+	charger := struct {
+		api.Charger
+		api.CurrentGetter
+	}{
+		ch, cg,
+	}
+
+	// the charger started the session on its own at 16A
+	ch.EXPECT().Enabled().Return(true, nil)
+	cg.EXPECT().GetMaxCurrent().Return(maxA, nil)
+
+	lp := &Loadpoint{
+		log:            util.NewLogger("foo"),
+		bus:            evbus.New(),
+		clock:          clock.New(),
+		charger:        charger,
+		status:         api.StatusC,
+		enabled:        false, // evcc did not enable the charger
+		offeredCurrent: 0,     // reset when the charger was last disabled
+		minCurrent:     minA,
+		maxCurrent:     maxA,
+		phases:         1,
+		measuredPhases: 1,
+	}
+
+	// connecting the car allows pv mode to act without waiting out the timer
+	lp.elapsePVTimer()
+
+	require.NoError(t, lp.syncCharger())
+
+	// car draws 16A (1600W) against a 1000W surplus, so 600W is imported -
+	// pv mode ramps the charge down to the surplus instead of stopping it
+	sitePower := maxA*Voltage - 1000
+	assert.Equal(t, 10.0, lp.pvMaxCurrent(api.ModePV, sitePower, 0, false, false))
+}
