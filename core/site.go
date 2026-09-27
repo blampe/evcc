@@ -127,6 +127,7 @@ type Site struct {
 	batterySpikeSlot         time.Time                   // 15-min slot the export spike was last (re)written for
 	batteryBoostSlot         time.Time                   // 15-min slot the battery-boost reserve was last pinned for (zero = not boosting)
 	batteryBoostReserveSlot  time.Time                   // 15-min slot a battery boost hit the pack's reserve (latches the car stop, zero = not tripped)
+	interval                 time.Duration               // control-loop cadence (set in Run), for deriving reaction-lag margins
 	suggestionActions        map[string]string           // last notified actionable optimizer action by device key
 
 	optimizerMu      sync.Mutex                  // guards optimizer runs
@@ -1518,6 +1519,8 @@ func (site *Site) loopLoadpoints(next chan<- updater) {
 // Run is the main control loop. It reacts to trigger events by
 // updating measurements and executing control logic.
 func (site *Site) Run(stopC chan struct{}, interval time.Duration) {
+	site.interval = interval
+
 	if max := 30 * time.Second; interval < max {
 		site.log.INFO.Printf("interval <%.0fs can lead to unexpected behavior, see https://docs.evcc.io/docs/reference/configuration/interval", max.Seconds())
 	}

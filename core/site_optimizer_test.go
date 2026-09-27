@@ -755,6 +755,25 @@ func TestBatteryBoostReserveGate(t *testing.T) {
 	action, _, _ = site.loadpointOptimizerAction(0)
 	assert.Equal(t, actionStop, action, "latched for the slot")
 
+	// preemptive margin: with pack capacity and the control interval known, the boost
+	// stops a lookahead-margin ABOVE the raw reserve so the pack never crosses it mid-
+	// cycle and spills to the grid. At 9600W over 2×90s on an 11kWh pack the margin is
+	// ~4.4% SoC, so a boost is stopped by ~59.4% even though the reserve is 55%.
+	site = newSite()
+	site.battery.Capacity = 11 // kWh
+	site.interval = 90 * time.Second
+	site.battery.Soc = 58 // above the 55% reserve but within the reaction-lag margin
+	action, _, _ = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionStop, action, "within the reaction-lag margin: boost stops before the pack crosses the reserve")
+
+	// comfortably above reserve+margin => still charging (margin doesn't stop it early)
+	site = newSite()
+	site.battery.Capacity = 11
+	site.interval = 90 * time.Second
+	site.battery.Soc = 62
+	action, _, _ = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionCharge, action, "well above reserve+margin: boost keeps charging")
+
 	// a grid-sourced charge is never gated by the home battery reserve
 	site = newSite()
 	site.battery.Soc = 10 // well below any reserve

@@ -385,18 +385,25 @@ func (site *Site) loadpointOptimizerAction(id int) (string, float64, string) {
 	return action, s.Charge, s.Source
 }
 
+// boostReserveLagCycles is how many control cycles of boost draw the reserve trip
+// looks ahead. The guard sees cycle-stale soc/grid readings (the action is computed
+// before the meters refresh) and the charger takes ~a further cycle to ramp down, so
+// without a margin the pack crosses the reserve and the car's draw spills to the grid
+// for ~this long. Two cycles ≈ the observed stale-read + charger-ramp latency.
+const boostReserveLagCycles = 2
+
 // batteryBoostReserveReached reports whether an active battery boost has driven
 // the home battery to its planned reserve, so the boost must stop charging the
 // car instead of importing from the grid to keep it going. requestedPower is the
 // boost's requested power, actualPower the car's measured charge power.
 //
 // It trips when the (power-integrated) pack soc has reached the plan's target
-// reserve, or - to react even if the soc estimate reads a hair above the reserve
-// while the pack already refuses to discharge below it - when the boost's own
-// draw is spilling to the grid. It latches for the current slot once tripped: at
-// the reserve the pack won't recover within the slot, so re-enabling the car
-// would only oscillate it on and off around the boundary (car off -> grid import
-// clears -> car on -> pack still at reserve -> grid import ...).
+// reserve plus a reaction-lag margin (so the car stops before the pack crosses the
+// reserve, not a cycle after it has already spilled to the grid), or - as a real-
+// time backstop - when the boost's own draw is already spilling to the grid. It
+// latches for the current slot once tripped: at the reserve the pack won't recover
+// within the slot, so re-enabling the car would only oscillate it on and off around
+// the boundary (car off -> grid import clears -> car on -> pack still at reserve ...).
 //
 // Reads last-cycle gridPower/soc/chargePower (meters refresh later in sitePower);
 // a one-cycle reaction is acceptable and dampens the oscillation.
@@ -408,13 +415,25 @@ func (site *Site) batteryBoostReserveReached(requestedPower, actualPower float64
 
 	tripped := false
 
-	// pack soc reached the plan's reserve target
+	// Stop the boost a lookahead-margin ABOVE the plan's reserve, not exactly at it.
+	// The soc/grid readings the guard sees are a cycle stale (the action is computed
+	// before the meters refresh) and the charger takes ~a further cycle to ramp down,
+	// so waiting for soc <= target lets the pack cross the reserve mid-cycle and the
+	// car's draw spill to the grid at (peak) prices for ~a cycle. The margin is the SoC
+	// the boost pulls over that reaction lag - derived from the boost power, pack
+	// capacity and loop cadence, so it self-scales instead of being a fixed offset - so
+	// the pack coasts down to the reserve only after the car is already off.
 	soc := site.battery.Soc
+	var margin float64
+	if capacity := site.battery.Capacity; capacity > 0 && requestedPower > 0 && site.interval > 0 {
+		lag := boostReserveLagCycles * site.interval
+		margin = requestedPower * lag.Hours() / (capacity * 1e3) * 100 // Wh drawn -> SoC points
+	}
 	for _, dev := range site.batteryMeters {
 		if dev == nil {
 			continue
 		}
-		if target := site.optimizerBatteryTargetSoc(dev.Config().Name); target > 0 && soc <= target {
+		if target := site.optimizerBatteryTargetSoc(dev.Config().Name); target > 0 && soc <= target+margin {
 			tripped = true
 			break
 		}
