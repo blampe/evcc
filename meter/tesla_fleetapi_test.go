@@ -467,10 +467,12 @@ func TestFleetAPIBatteryController(t *testing.T) {
 			wantGridChg: false,
 		},
 		{
-			name:        "hold sets backup and current SOC reserve",
+			// self_consumption, not backup: backup diverts all PV into the pack and
+			// puts the whole house load on the grid (see holdOperatingMode)
+			name:        "hold sets self_consumption and current SOC reserve",
 			mode:        api.BatteryHold,
 			soc:         65,
-			wantMode:    "backup",
+			wantMode:    "self_consumption",
 			wantReserve: 65,
 			wantGridChg: false,
 		},
@@ -478,7 +480,7 @@ func TestFleetAPIBatteryController(t *testing.T) {
 			name:        "hold clamps to min SOC when below",
 			mode:        api.BatteryHold,
 			soc:         10,
-			wantMode:    "backup",
+			wantMode:    "self_consumption",
 			wantReserve: 20,
 			wantGridChg: false,
 		},
@@ -532,14 +534,15 @@ func TestFleetAPIBatteryController(t *testing.T) {
 					if err != nil {
 						return err
 					}
-					reserve := min(100.0, max(soc, limits.MinSoc))
-					if err := mock.SetOperatingMode("backup"); err != nil {
+					// use the production mode/reserve decision so this test pins it
+					// instead of restating it
+					if err := mock.SetOperatingMode(holdOperatingMode); err != nil {
 						return err
 					}
 					if err := mock.SetGridCharging(false); err != nil {
 						return err
 					}
-					return mock.SetBatteryReserve(uint64(reserve))
+					return mock.SetBatteryReserve(holdReserve(soc, limits.MinSoc))
 
 				case api.BatteryCharge:
 					if err := mock.SetOperatingMode("self_consumption"); err != nil {
@@ -611,6 +614,26 @@ func TestHoldChargeReserve(t *testing.T) {
 	// combined with clampReserve: an soc in (80,100) snaps the reserve to 80
 	assert.Equal(t, uint64(80), clampReserve(holdChargeReserve(90, 20)))
 	assert.Equal(t, uint64(55), clampReserve(holdChargeReserve(60, 20)))
+}
+
+// TestHoldMode covers the BatteryHold decision: the reserve sits at the current SoC
+// (never below min soc) so the pack cannot discharge below where it is, and the
+// operating mode is self_consumption so solar still serves the house first.
+func TestHoldMode(t *testing.T) {
+	// backup is not an idle mode - it charges the pack ahead of the house, diverting
+	// all PV into the pack and putting the whole house load on the grid
+	assert.Equal(t, "self_consumption", holdOperatingMode)
+	assert.NotEqual(t, "backup", holdOperatingMode)
+
+	assert.Equal(t, uint64(65), holdReserve(65, 20), "pinned at the current soc")
+	assert.Equal(t, uint64(20), holdReserve(10, 20), "never below min soc")
+
+	// the reserve truncates, so an soc of 11.7 holds at 11 - a fraction of a percent
+	// of slack, not the extra point the rounded log line suggests
+	assert.Equal(t, uint64(11), holdReserve(11.7, 10))
+
+	// an soc in the PW3-rejected (80,100) band snaps to the 80 floor
+	assert.Equal(t, uint64(80), holdReserve(90, 20))
 }
 
 func TestFleetAPITariffType(t *testing.T) {

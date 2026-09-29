@@ -927,6 +927,22 @@ func holdChargeReserve(soc, minSoc float64) float64 {
 	return max(soc-holdChargeReserveMargin, minSoc)
 }
 
+// holdOperatingMode is the Tesla operating mode BatteryHold applies.
+//
+// self_consumption, deliberately NOT backup. Backup-only is not an idle mode: it
+// charges the pack for standby and takes priority over the house, so the Powerwall
+// absorbs the entire PV output while the house and car draw their whole load from the
+// grid. self_consumption serves the house from solar first and banks only the
+// surplus. The reserve, not the operating mode, is what withholds discharge.
+const holdOperatingMode = "self_consumption"
+
+// holdReserve is the reserve BatteryHold pins: the current SoC, never below min soc.
+// Sitting the reserve at where the pack already is blocks any further discharge,
+// which is the whole of what hold means.
+func holdReserve(soc, minSoc float64) uint64 {
+	return clampReserve(max(soc, minSoc))
+}
+
 // SetBatteryModeSoc maps an evcc battery mode to Tesla Fleet API commands,
 // pinning the reserve to the optimizer's target SoC where it matters (see
 // dischargeReserve). It implements api.BatteryModeController; SetBatteryMode
@@ -988,8 +1004,19 @@ func (m *FleetAPI) SetBatteryModeSoc(mode api.BatteryMode, targetSoc float64) er
 		return m.apiWrite(fmt.Sprintf("battery reserve → %d%%", reserve), func() error { return site.SetBatteryReserve(reserve) })
 
 	case api.BatteryHold:
-		// idle while importing: withhold discharge. Backup mode + reserve at
-		// the current SoC keeps the pack from discharging below where it is.
+		// idle while importing: withhold discharge, and nothing more. The reserve at
+		// the current SoC is what blocks discharge; the operating mode only decides
+		// who gets the solar.
+		//
+		// This used to ask for backup mode, which is not "idle": Backup-only charges
+		// the pack for standby and takes priority over the house, so the PW3 absorbed
+		// the whole PV output while the house and car drew their entire load from the
+		// grid (observed: pv 1720W == pack charge 1720W, grid == house + car). Holding
+		// discharge cost ~1.7kW of import that way.
+		//
+		// self_consumption serves the house from solar first and only banks the
+		// surplus, so the reserve still blocks discharge but PV is no longer diverted.
+		// Grid charging stays off, so the pack can only take genuine surplus.
 		if err := m.restoreTariff(); err != nil {
 			return err
 		}
@@ -997,9 +1024,9 @@ func (m *FleetAPI) SetBatteryModeSoc(mode api.BatteryMode, targetSoc float64) er
 		if err != nil {
 			return err
 		}
-		reserve := clampReserve(max(soc, limits.MinSoc))
-		m.provider.log.DEBUG.Printf("hold: soc %.0f%% → backup, holding reserve at %d%%", soc, reserve)
-		if err := m.apiWrite("operating mode → backup", func() error { return site.SetOperatingMode("backup") }); err != nil {
+		reserve := holdReserve(soc, limits.MinSoc)
+		m.provider.log.DEBUG.Printf("hold: soc %.1f%% → %s, holding reserve at %d%%", soc, holdOperatingMode, reserve)
+		if err := m.apiWrite("operating mode → "+holdOperatingMode, func() error { return site.SetOperatingMode(holdOperatingMode) }); err != nil {
 			return err
 		}
 		if err := m.apiWrite("grid charging → off", func() error { return site.SetGridCharging(false) }); err != nil {
