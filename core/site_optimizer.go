@@ -1500,6 +1500,15 @@ func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measureme
 		// own: the pack discharges at the expensive peak and re-imports overnight when
 		// cheap, exporting only when export genuinely beats that (a VPP event, or a
 		// summer-evening delivery-EEC peak). MinSoc still floors backup. Defaults false.
+
+		// Of schedules that cost the same, prefer the one where the home battery feeds the
+		// house and the grid feeds the car. On a night at one flat price, the pack charging
+		// the car now while the house imports at dawn costs exactly what the grid charging
+		// the car while the pack carries the house does, so money cannot choose - and the
+		// car's early-charge priority used to pick the first, leaving the house on the grid
+		// (and a grid outage finding the pack empty) before PV takes over. A pure tie break:
+		// it never trades money, so energy the house does not need still goes to the car.
+		ServeHomeFirst: true,
 	}
 
 	instance := dev.Instance()

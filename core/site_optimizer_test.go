@@ -388,6 +388,25 @@ func TestBatteryRequestGridCharge(t *testing.T) {
 	assert.True(t, req.ChargeFromGrid, "no capability -> grid charging unchanged")
 }
 
+// TestBatteryRequestServeHomeFirst: the home battery always asks the optimizer to break
+// cost ties toward feeding the house rather than the car, and a car never does.
+func TestBatteryRequestServeHomeFirst(t *testing.T) {
+	site := &Site{log: util.NewLogger("foo")}
+	capacity, soc := 10.0, 50.0
+	m := types.Measurement{Capacity: &capacity, Soc: &soc}
+
+	plain := config.NewStaticDevice(config.Named{}, api.Meter(&struct{ api.Meter }{}))
+	req, _ := site.batteryRequest(plain, m, nil, 8, 15*time.Minute)
+	assert.True(t, req.ServeHomeFirst, "home battery serves the house first")
+
+	controllable := config.NewStaticDevice(config.Named{}, api.Meter(&struct {
+		api.Meter
+		batteryControllerStub
+	}{}))
+	req, _ = site.batteryRequest(controllable, m, nil, 8, 15*time.Minute)
+	assert.True(t, req.ServeHomeFirst, "independent of battery control")
+}
+
 // charge goal for vehicles with and without known capacity/soc, see #32890
 func TestLoadpointRequestChargeGoal(t *testing.T) {
 	site := &Site{log: util.NewLogger("foo")}
@@ -434,6 +453,7 @@ func TestLoadpointRequestChargeGoal(t *testing.T) {
 
 			assert.Equal(t, tc.wantInitial, req.SInitial)
 			assert.Equal(t, tc.wantSMax, req.SMax)
+			assert.False(t, req.ServeHomeFirst, "a car is fed, it does not serve the house")
 		})
 	}
 }
