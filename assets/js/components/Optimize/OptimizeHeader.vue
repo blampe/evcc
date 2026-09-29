@@ -140,9 +140,9 @@ const STATUS_TOOLTIP =
 	"<strong>Not solved</strong>: optimization hasn't finished yet.";
 
 const COST_TOOLTIP =
-	"Forecasted net grid cost over the optimization window: energy bought minus sold, " +
-	"with leftover battery charge credited at the lowest price. Lower is better, " +
-	"positive means you pay the grid, negative means you receive a credit.";
+	"Forecasted net grid cost over the optimization window: what the imported energy costs " +
+	"minus what the exported energy earns. Energy left in the batteries is not counted. " +
+	"Lower is better, positive means you pay the grid, negative means you receive a credit.";
 
 export default defineComponent({
 	name: "OptimizeHeader",

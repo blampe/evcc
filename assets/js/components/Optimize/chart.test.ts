@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vite-plus/test";
-import { disconnectedSlots, expandSlots, isMidnight, slotXAxis } from "./chart";
+import { disconnectedSlots, expandSlots, isMidnight, netGridCost, slotXAxis } from "./chart";
 
 // 15min slots starting at the given local hour
 function times(startHour: number, count: number): number[] {
@@ -74,5 +74,22 @@ describe("expandSlots", () => {
       [200, 3],
       [300, 3],
     ]);
+  });
+});
+
+describe("netGridCost", () => {
+  test("import cost minus export revenue, per step prices", () => {
+    // 1 kWh bought at 0.30, 2 kWh sold at 0.10 then 0.05
+    const cost = netGridCost([1000, 0], [0, 2000], [0.0003, 0.0003], [0.0001, 0.00005]);
+    expect(cost).toBeCloseTo(0.3 - 0.1);
+  });
+
+  test("no import and some export is a credit", () => {
+    expect(netGridCost([0, 0], [1000, 1000], [0.0003, 0.0003], [0.0001, 0.0001])).toBeCloseTo(-0.2);
+  });
+
+  test("missing series count as nothing", () => {
+    expect(netGridCost(undefined, undefined, undefined, undefined)).toBe(0);
+    expect(netGridCost([1000], [1000], undefined, undefined)).toBe(0);
   });
 });

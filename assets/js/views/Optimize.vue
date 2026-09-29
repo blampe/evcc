@@ -28,9 +28,9 @@
 					>
 						<p class="m-3 text-muted">
 							No plan to show — the optimizer returned
-							<strong>{{ evopt.res?.status || "no result" }}</strong>. Its constraints
-							could not all be met this run, so there is no schedule. The request and
-							response below remain available for debugging.
+							<strong>{{ evopt.res?.status || "no result" }}</strong
+							>. Its constraints could not all be met this run, so there is no
+							schedule. The request and response below remain available for debugging.
 						</p>
 					</Card>
 
@@ -161,7 +161,7 @@ import ChargeChart from "../components/Optimize/ChargeChart.vue";
 import TimeSeriesDataTable from "../components/Optimize/TimeSeriesDataTable.vue";
 import CopyButton from "../components/Optimize/CopyButton.vue";
 import { formatCompactJson } from "../components/Optimize/compactJson";
-import { loadpointTitle } from "../components/Optimize/chart";
+import { loadpointTitle, netGridCost } from "../components/Optimize/chart";
 import api from "../api";
 import store from "../store";
 import formatter from "../mixins/formatter";
@@ -212,8 +212,11 @@ export default defineComponent({
 		optimizerChargingStrategy(): string {
 			return store.state.optimizerChargingStrategy || "";
 		},
+		// money with the grid only: import cost minus export revenue (see netGridCost)
 		netCost(): number {
-			return (this.evopt?.res?.objective_value || 0) * -1;
+			const ts = this.evopt?.req?.time_series;
+			const res = this.evopt?.res;
+			return netGridCost(res?.grid_import, res?.grid_export, ts?.p_N, ts?.p_E);
 		},
 		horizonHours(): number {
 			const dt = this.evopt?.req?.time_series?.dt;

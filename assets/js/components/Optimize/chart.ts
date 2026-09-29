@@ -92,3 +92,20 @@ export function expandSlots(
   }
   return out;
 }
+
+// netGridCost is the plan's money with the grid: what the imported energy costs minus
+// what the exported energy earns, over the whole horizon (positive = you pay). Energy
+// stored in the batteries at the end is left out on purpose - the optimizer's
+// objective_value credits it, which also counts a car's charge as value and made a
+// plan with no import at all read as a cost once the car drove more than it recharged.
+export function netGridCost(
+  gridImport: number[] | undefined,
+  gridExport: number[] | undefined,
+  priceImport: number[] | undefined,
+  priceExport: number[] | undefined
+): number {
+  let cost = 0;
+  (gridImport || []).forEach((wh, i) => (cost += wh * (priceImport?.[i] || 0)));
+  (gridExport || []).forEach((wh, i) => (cost -= wh * (priceExport?.[i] || 0)));
+  return cost;
+}
