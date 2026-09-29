@@ -560,6 +560,42 @@ const slotsPerHour = float64(time.Hour / tariff.SlotDuration)
 // startup); the slot gate is left open so the next cycle retries.
 var errOptimizerNotReady = errors.New("battery measurements not ready")
 
+// batteriesReported returns errOptimizerNotReady until every configured battery meter
+// with a soc has reported one at least once. Planning without a pack that simply hasn't
+// been read yet - typically right after startup, when a car's soc arrives before the
+// pack's - produces a plan with no schedule for that pack, and that plan then stands
+// for a whole slot until the next run. Retrying each cycle instead costs a few seconds.
+//
+// Only the first report is waited for: a pack that has reported before and drops out
+// later (e.g. its cloud API is down) is left out of the plan as before, rather than
+// holding the optimizer - and the house's stale suggestions - hostage for the outage.
+// A meter without a soc can never report one, so it is not waited for.
+//
+// Must be called under optimizerMu.
+func (site *Site) batteriesReported(battery []types.Measurement) error {
+	if site.batteriesSeen == nil {
+		site.batteriesSeen = make(map[string]bool)
+	}
+
+	var missing []string
+	for i, dev := range site.batteryMeters {
+		name := dev.Config().Name
+		if i < len(battery) && battery[i].Soc != nil {
+			site.batteriesSeen[name] = true
+			continue
+		}
+		if !site.batteriesSeen[name] && api.HasCap[api.Battery](dev.Instance()) {
+			missing = append(missing, name)
+		}
+	}
+
+	if len(missing) > 0 {
+		site.log.DEBUG.Printf("optimizer: waiting for battery soc: %s", strings.Join(missing, ", "))
+		return errOptimizerNotReady
+	}
+	return nil
+}
+
 // frontRunScheduleSlots caps how many upcoming plan slots are retained per
 // battery for front-running. The optimizer re-runs at least every tariff slot
 // (plus on vehicle/setting changes), so a handful covers the current slot plus
@@ -905,6 +941,10 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 		for i, v := range prorate(load, firstSlotDuration) {
 			req.TimeSeries.Gt[i] += v
 		}
+	}
+
+	if err := site.batteriesReported(battery); err != nil {
+		return req, details, err
 	}
 
 	for i, dev := range site.batteryMeters {

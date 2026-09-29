@@ -1457,3 +1457,31 @@ func TestVehicleAvailability(t *testing.T) {
 		ctrl.Finish()
 	}
 }
+
+// socMeterStub is a battery meter that can report a soc
+type socMeterStub struct{ api.Meter }
+
+func (socMeterStub) Soc() (float64, error) { return 50, nil }
+
+// TestBatteriesReported covers the startup gate: the optimizer waits until every battery
+// with a soc has reported one, instead of planning without it for a whole slot. Once a
+// battery has reported, dropping out later no longer holds the optimizer.
+func TestBatteriesReported(t *testing.T) {
+	pack := config.NewStaticDevice(config.Named{Name: "pack"}, api.Meter(socMeterStub{}))
+	noSoc := config.NewStaticDevice(config.Named{Name: "nosoc"}, api.Meter(&struct{ api.Meter }{}))
+	site := &Site{log: util.NewLogger("foo"), batteryMeters: []config.Device[api.Meter]{pack, noSoc}}
+
+	soc := 50.0
+	reported := []types.Measurement{{Soc: &soc}, {}}
+	pending := []types.Measurement{{}, {}}
+
+	// the pack has not reported yet (no soc, or its measurement not in yet): not ready
+	assert.ErrorIs(t, site.batteriesReported(pending), errOptimizerNotReady, "pack soc missing at startup")
+	assert.ErrorIs(t, site.batteriesReported(nil), errOptimizerNotReady, "measurements lag the meters")
+
+	// a meter that cannot report a soc is never waited for
+	require.NoError(t, site.batteriesReported(reported), "pack reported, soc-less meter not awaited")
+
+	// the pack drops out after having reported: planned without it rather than blocking
+	assert.NoError(t, site.batteriesReported(pending), "a later outage does not block the optimizer")
+}

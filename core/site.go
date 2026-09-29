@@ -134,6 +134,7 @@ type Site struct {
 	optimizerUpdated time.Time                   // last optimizer run, guarded by optimizerMu
 	forecasts        map[string]forecastEntry    // cached hybrid forecasts by collector ref, refit daily under optimizerMu
 	consumption      map[string]consumptionEntry // cached vehicle driving forecasts by loadpoint title, refit daily under optimizerMu
+	batteriesSeen    map[string]bool             // battery meters that have reported a soc since startup, under optimizerMu
 
 	solarScaleCached func() (float64, error) // util.Cached wrapper around querySolarScale
 }
