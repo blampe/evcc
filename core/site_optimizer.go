@@ -37,10 +37,19 @@ const (
 	batteryPower = 6000
 )
 
-// optimizerChargingStrategies are the valid grid charging strategies; the first
+// optimizerStrategyServeHomeFirst is the "serve home first" secondary goal. It is not an
+// optimizer charging strategy but evcc's own: the optimizer gets no charging strategy
+// ("none") and every home battery asks for the serve_home_first tie break instead - of
+// schedules that cost the same, the pack feeds the house and the grid the car (see
+// batteryRequest).
+const optimizerStrategyServeHomeFirst = "serve_home_first"
+
+// optimizerChargingStrategies are the valid secondary goals (the UI's "secondary goal"
+// dropdown): the optimizer's grid charging strategies plus serve home first. The first
 // entry is the default and preserves the previous hard-coded behavior.
 var optimizerChargingStrategies = []string{
 	string(optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport),
+	optimizerStrategyServeHomeFirst,
 	string(optimizer.OptimizerStrategyChargingStrategyAttenuateDemandPeaks),
 	string(optimizer.OptimizerStrategyChargingStrategyAttenuateFeedinPeaks),
 	string(optimizer.OptimizerStrategyChargingStrategyAttenuateGridPeaks),
@@ -842,7 +851,7 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 
 	req = optimizer.OptimizationInput{
 		Strategy: optimizer.OptimizerStrategy{
-			ChargingStrategy:    optimizer.OptimizerStrategyChargingStrategy(site.GetOptimizerChargingStrategy()),
+			ChargingStrategy:    site.optimizerRequestChargingStrategy(),
 			DischargingStrategy: optimizer.OptimizerStrategyDischargingStrategyDischargeBeforeImport,
 		},
 		EtaC: eta,
@@ -1517,6 +1526,21 @@ func (site *Site) evChargePriority() int {
 	return 0
 }
 
+// optimizerRequestChargingStrategy maps the selected secondary goal onto the optimizer's
+// charging strategy: serve home first is evcc's own goal, carried by the batteries'
+// serve_home_first flag, so the optimizer itself gets none.
+func (site *Site) optimizerRequestChargingStrategy() optimizer.OptimizerStrategyChargingStrategy {
+	if site.optimizerServeHomeFirst() {
+		return optimizer.OptimizerStrategyChargingStrategyNone
+	}
+	return optimizer.OptimizerStrategyChargingStrategy(site.GetOptimizerChargingStrategy())
+}
+
+// optimizerServeHomeFirst reports whether the serve home first secondary goal is selected.
+func (site *Site) optimizerServeHomeFirst() bool {
+	return site.GetOptimizerChargingStrategy() == optimizerStrategyServeHomeFirst
+}
+
 // optimizerChargeFirst reports whether the charge-before-export ("battery first")
 // strategy is active.
 func (site *Site) optimizerChargeFirst() bool {
@@ -1541,14 +1565,15 @@ func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measureme
 		// cheap, exporting only when export genuinely beats that (a VPP event, or a
 		// summer-evening delivery-EEC peak). MinSoc still floors backup. Defaults false.
 
-		// Of schedules that cost the same, prefer the one where the home battery feeds the
-		// house and the grid feeds the car. On a night at one flat price, the pack charging
-		// the car now while the house imports at dawn costs exactly what the grid charging
-		// the car while the pack carries the house does, so money cannot choose - and the
-		// car's early-charge priority used to pick the first, leaving the house on the grid
-		// (and a grid outage finding the pack empty) before PV takes over. A pure tie break:
-		// it never trades money, so energy the house does not need still goes to the car.
-		ServeHomeFirst: true,
+		// Serve home first (a secondary goal): of schedules that cost the same, prefer the
+		// one where the home battery feeds the house and the grid feeds the car. On a night
+		// at one flat price, the pack charging the car now while the house imports at dawn
+		// costs exactly what the grid charging the car while the pack carries the house
+		// does, so money cannot choose - and the car's early-charge priority (fill battery
+		// first) picks the first, leaving the house on the grid (and a grid outage finding
+		// the pack empty) before PV takes over. A pure tie break: it never trades money, so
+		// energy the house does not need still goes to the car.
+		ServeHomeFirst: site.optimizerServeHomeFirst(),
 	}
 
 	instance := dev.Instance()

@@ -388,23 +388,56 @@ func TestBatteryRequestGridCharge(t *testing.T) {
 	assert.True(t, req.ChargeFromGrid, "no capability -> grid charging unchanged")
 }
 
-// TestBatteryRequestServeHomeFirst: the home battery always asks the optimizer to break
-// cost ties toward feeding the house rather than the car, and a car never does.
+// TestBatteryRequestServeHomeFirst: the home battery asks the optimizer to break cost ties
+// toward feeding the house exactly when "serve home first" is the selected secondary goal.
 func TestBatteryRequestServeHomeFirst(t *testing.T) {
-	site := &Site{log: util.NewLogger("foo")}
 	capacity, soc := 10.0, 50.0
 	m := types.Measurement{Capacity: &capacity, Soc: &soc}
-
 	plain := config.NewStaticDevice(config.Named{}, api.Meter(&struct{ api.Meter }{}))
-	req, _ := site.batteryRequest(plain, m, nil, 8, 15*time.Minute)
-	assert.True(t, req.ServeHomeFirst, "home battery serves the house first")
-
 	controllable := config.NewStaticDevice(config.Named{}, api.Meter(&struct {
 		api.Meter
 		batteryControllerStub
 	}{}))
+
+	site := &Site{log: util.NewLogger("foo"), optimizerChargingStrategy: optimizerStrategyServeHomeFirst}
+	req, _ := site.batteryRequest(plain, m, nil, 8, 15*time.Minute)
+	assert.True(t, req.ServeHomeFirst, "serve home first selected")
 	req, _ = site.batteryRequest(controllable, m, nil, 8, 15*time.Minute)
 	assert.True(t, req.ServeHomeFirst, "independent of battery control")
+
+	for _, strategy := range []optimizer.OptimizerStrategyChargingStrategy{
+		optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport,
+		optimizer.OptimizerStrategyChargingStrategyAttenuateGridPeaks,
+		optimizer.OptimizerStrategyChargingStrategyNone,
+	} {
+		site := &Site{log: util.NewLogger("foo"), optimizerChargingStrategy: string(strategy)}
+		req, _ := site.batteryRequest(plain, m, nil, 8, 15*time.Minute)
+		assert.False(t, req.ServeHomeFirst, "%s: other secondary goals leave the tie unordered", strategy)
+	}
+}
+
+// TestOptimizerRequestChargingStrategy: serve home first is evcc's own secondary goal, not
+// an optimizer charging strategy, so the optimizer gets none; every other goal passes
+// through unchanged.
+func TestOptimizerRequestChargingStrategy(t *testing.T) {
+	assert.Equal(t, optimizer.OptimizerStrategyChargingStrategyNone,
+		(&Site{optimizerChargingStrategy: optimizerStrategyServeHomeFirst}).optimizerRequestChargingStrategy())
+
+	for _, strategy := range []optimizer.OptimizerStrategyChargingStrategy{
+		optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport,
+		optimizer.OptimizerStrategyChargingStrategyAttenuateDemandPeaks,
+		optimizer.OptimizerStrategyChargingStrategyNone,
+	} {
+		assert.Equal(t, strategy, (&Site{optimizerChargingStrategy: string(strategy)}).optimizerRequestChargingStrategy())
+	}
+
+	// serve home first gives the car no early-charge priority to fight the tie break with
+	assert.Equal(t, 0, (&Site{optimizerChargingStrategy: optimizerStrategyServeHomeFirst}).evChargePriority())
+
+	// and it is a valid, selectable goal
+	site := &Site{log: util.NewLogger("foo")}
+	require.NoError(t, site.SetOptimizerChargingStrategy(optimizerStrategyServeHomeFirst))
+	assert.Equal(t, optimizerStrategyServeHomeFirst, site.GetOptimizerChargingStrategy())
 }
 
 // charge goal for vehicles with and without known capacity/soc, see #32890

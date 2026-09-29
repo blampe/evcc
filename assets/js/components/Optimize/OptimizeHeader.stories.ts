@@ -16,6 +16,7 @@ const base = {
   currency: CURRENCY.EUR,
   chargingStrategies: [
     "charge_before_export",
+    "serve_home_first",
     "attenuate_demand_peaks",
     "attenuate_feedin_peaks",
     "attenuate_grid_peaks",
