@@ -1019,6 +1019,139 @@ func TestGridImportAt(t *testing.T) {
 	assert.Equal(t, float32(8), gridImportAt(res2, 1))
 }
 
+// TestChosenImportAt covers stripping the import a battery's indivisible minimum
+// charge power forced out of the slot's grid import. The cases are the four import
+// shapes observed in a live plan: a car held at its 1840W minimum against three
+// different surpluses, and a slot where the plan pushed the car above its minimum.
+func TestChosenImportAt(t *testing.T) {
+	// slot geometry: the first slot is a partial 828s, the rest full quarter hours
+	const (
+		partial = 828
+		full    = 900
+	)
+
+	for _, tc := range []struct {
+		name          string
+		dt            int
+		solar, home   float32 // Wh in the slot
+		evCharge      float32 // Wh the plan charges the car
+		gridImport    float32 // Wh
+		wantChosenW   float64
+		wantImporting bool
+	}{
+		// The car's 1840W minimum outruns the surplus, so the shortfall has to be
+		// imported - the plan did not choose it. Import and forced amount agree to
+		// within the solver's rounding, leaving nothing chosen.
+		{"forced by ev minimum, partial slot", partial, 472, 135, 423, 87, 4.3, false},
+		{"forced by ev minimum", full, 695, 261, 460, 26, 0, false},
+		{"forced by ev minimum, exact", full, 575, 174, 460, 59, 0, false},
+
+		// Same order of magnitude of import as the case above, but here the plan put
+		// the car well above its minimum with surplus to spare: the import is a
+		// genuine choice and must survive.
+		{"chosen while charging above the minimum", full, 997, 199, 855, 58, 232, true},
+
+		// Nothing charging, so no minimum forces anything: the whole import is the
+		// plan choosing grid over the pack.
+		{"nothing charging", full, 0, 114, 0, 114, 456, true},
+
+		// Surplus covers the minimum outright, so an import alongside it is chosen.
+		{"surplus covers the minimum", full, 2000, 200, 460, 120, 480, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := optimizer.OptimizationInput{
+				TimeSeries: optimizer.TimeSeries{
+					Dt: []int{tc.dt},
+					Ft: []float32{tc.solar},
+					Gt: []float32{tc.home},
+				},
+				Batteries: []optimizer.BatteryConfig{
+					{CMin: 1840}, // vehicle
+					{CMin: 0},    // home battery, no minimum
+				},
+			}
+			res := optimizer.OptimizationResult{
+				GridImport: []float32{tc.gridImport},
+				Batteries: []optimizer.BatteryResult{
+					{ChargingPower: []float32{tc.evCharge}},
+					{ChargingPower: []float32{0}},
+				},
+			}
+
+			chosen := chosenImportAt(req, res, 0)
+			assert.InDelta(t, tc.wantChosenW, chosen, 1, "chosen import")
+			assert.Equal(t, tc.wantImporting, chosen > suggestionThreshold, "reads as importing")
+		})
+	}
+}
+
+// TestChosenImportAtBounds covers the out-of-range and degenerate inputs.
+func TestChosenImportAtBounds(t *testing.T) {
+	req := optimizer.OptimizationInput{
+		TimeSeries: optimizer.TimeSeries{Dt: []int{900}, Ft: []float32{0}, Gt: []float32{500}},
+	}
+	res := optimizer.OptimizationResult{GridImport: []float32{500}}
+
+	assert.Equal(t, float64(2000), chosenImportAt(req, res, 0), "no batteries: nothing forced")
+	assert.Zero(t, chosenImportAt(req, res, 1), "slot past the horizon")
+	assert.Zero(t, chosenImportAt(req, res, -1), "negative slot")
+
+	// a zero-length slot can't be converted to power
+	zero := optimizer.OptimizationInput{TimeSeries: optimizer.TimeSeries{Dt: []int{0}}}
+	assert.Zero(t, chosenImportAt(zero, res, 0))
+
+	// missing forecast series must not panic or over-credit surplus
+	bare := optimizer.OptimizationInput{
+		TimeSeries: optimizer.TimeSeries{Dt: []int{900}},
+		Batteries:  []optimizer.BatteryConfig{{CMin: 1840}},
+	}
+	bareRes := optimizer.OptimizationResult{
+		GridImport: []float32{460},
+		Batteries:  []optimizer.BatteryResult{{ChargingPower: []float32{460}}},
+	}
+	assert.Zero(t, chosenImportAt(bare, bareRes, 0), "all of it forced with no surplus known")
+}
+
+// TestChosenImportEvSource is the circularity this guards: a car pinned at its own
+// minimum charge power manufactures the slot's import, and reading that import back
+// as "the plan imports" would classify the car as grid-fed - which makes PV mode hold
+// it at that minimum regardless of the surplus actually available.
+func TestChosenImportEvSource(t *testing.T) {
+	// the live slot: 1840W car minimum, 472Wh solar, 135Wh home, 87Wh imported
+	req := optimizer.OptimizationInput{
+		TimeSeries: optimizer.TimeSeries{Dt: []int{828}, Ft: []float32{472}, Gt: []float32{135}},
+		Batteries:  []optimizer.BatteryConfig{{CMin: 1840}},
+	}
+	res := optimizer.OptimizationResult{
+		GridImport: []float32{87},
+		Batteries: []optimizer.BatteryResult{
+			{ChargingPower: []float32{423}, DischargingPower: []float32{0}},
+		},
+	}
+	slotHours := 828.0 / 3600
+
+	// raw import is nonzero, so the unfiltered flag would say "importing"
+	require.Positive(t, gridImportAt(res, 0))
+
+	importing := chosenImportAt(req, res, 0) > suggestionThreshold
+	assert.False(t, importing, "an ev-minimum-forced import is not a chosen import")
+
+	s := currentSlotSuggestion(batteryDetail{Type: batteryTypeVehicle},
+		res.Batteries[0], 0, importing, false, false, slotHours)
+	assert.Equal(t, actionCharge, s.Action)
+	assert.Equal(t, sourceSurplus, s.Source, "surplus-fed, not a grid fast charge")
+
+	// the same slot with the car pushed above its minimum is a real import and still
+	// classifies as grid-fed
+	res.Batteries[0].ChargingPower[0] = 855
+	res.GridImport[0] = 300
+	importing = chosenImportAt(req, res, 0) > suggestionThreshold
+	assert.True(t, importing, "import beyond the forced part is a choice")
+	s = currentSlotSuggestion(batteryDetail{Type: batteryTypeVehicle},
+		res.Batteries[0], 0, importing, false, false, slotHours)
+	assert.Equal(t, sourceGrid, s.Source)
+}
+
 // TestBatteryModePlanImportOvershoot verifies that import booked entirely into
 // the overshoot field (a grid import limit exceeded) is still recognised as
 // importing: an idle pack while importing must HOLD, not read as idle-balanced

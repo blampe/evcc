@@ -1015,6 +1015,55 @@ func gridImportAt(res optimizer.OptimizationResult, j int) float32 {
 	return v
 }
 
+// chosenImportAt returns slot j's grid import in W, net of the import the optimizer
+// had no discretion over because a battery it charged was pinned at its minimum
+// charge power.
+//
+// c_min is indivisible: a battery the plan charges draws at least that much or
+// nothing at all. Where the minimum exceeds the slot's solar surplus, the difference
+// has to come from the grid - the plan did not choose to import, the minimum chose
+// for it. Reading the raw import as "the plan imports" then classifies the car's
+// charge source as grid rather than surplus, which is circular: the car's own
+// minimum manufactures the import that reclassifies the car as grid-fed, and
+// sourceGrid makes PV mode hold the car at that minimum regardless of the surplus
+// actually available (see optimizerFastCharge in loadpoint.go).
+//
+// Import beyond the forced part is a genuine choice and still reads as import, so a
+// slot that pushes a battery above its minimum - or that imports with nothing
+// charging at all - is unaffected.
+func chosenImportAt(req optimizer.OptimizationInput, res optimizer.OptimizationResult, j int) float64 {
+	if j < 0 || j >= len(req.TimeSeries.Dt) {
+		return 0
+	}
+	slotHours := (time.Duration(req.TimeSeries.Dt[j]) * time.Second).Hours()
+	if slotHours <= 0 {
+		return 0
+	}
+
+	// solar left for the batteries after the home load
+	var surplus float64
+	if j < len(req.TimeSeries.Ft) && j < len(req.TimeSeries.Gt) {
+		surplus = max(0, float64(req.TimeSeries.Ft[j]-req.TimeSeries.Gt[j]))
+	}
+
+	// the indivisible part of what the plan charges in this slot
+	var atMinimum float64
+	for i, b := range req.Batteries {
+		if b.CMin <= 0 || i >= len(res.Batteries) {
+			continue
+		}
+		charge := res.Batteries[i].ChargingPower
+		if j >= len(charge) || charge[j] <= 0 {
+			continue
+		}
+		atMinimum += min(float64(charge[j]), float64(b.CMin)*slotHours)
+	}
+
+	forced := max(0, atMinimum-surplus)
+
+	return max(0, float64(gridImportAt(res, j))-forced) / slotHours
+}
+
 // applyOptimizerResult maps the optimizer response onto suggestions, battery
 // forecast and notifications
 func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details []batteryDetail, res optimizer.OptimizationResult, computedAt time.Time) {
@@ -1096,8 +1145,16 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 			continue
 		}
 
+		// A car pinned at its own minimum charge power is not grid-fed just because
+		// that minimum outran the surplus (see chosenImportAt). The home battery keeps
+		// the raw reading: its reserve, not this flag, is what bounds its discharge.
+		importing := gridImporting
+		if importing && detail.Type != batteryTypeBattery {
+			importing = chosenImportAt(req, res, 0) > suggestionThreshold
+		}
+
 		// current-slot advisory, for the UI and notifications
-		if s := currentSlotSuggestion(detail, batRes, 0, gridImporting, gridExporting, noGridImport, slotHours); s.Action != "" {
+		if s := currentSlotSuggestion(detail, batRes, 0, importing, gridExporting, noGridImport, slotHours); s.Action != "" {
 			if detail.Type == batteryTypeVehicle && s.Action == actionCharge {
 				s.Source = evChargeSource(s.Source, batteryDischarging, gridExporting)
 			}
@@ -1115,7 +1172,8 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 	site.publish("evopt-batteries", batteries)
 
 	// log the current-slot suggestions so it's visible what the optimizer wants
-	site.log.DEBUG.Printf("optimizer suggestions: gridImport=%t gridExport=%t", gridImporting, gridExporting)
+	site.log.DEBUG.Printf("optimizer suggestions: gridImport=%t (chosen %.0fW of %.0fW) gridExport=%t",
+		gridImporting, chosenImportAt(req, res, 0), float64(gridImportAt(res, 0))/slotHours, gridExporting)
 	for key, s := range suggestions {
 		site.log.DEBUG.Printf("optimizer %q: %s (charge %.0fW discharge %.0fW)", key, s.Action, s.Charge, s.Discharge)
 	}
