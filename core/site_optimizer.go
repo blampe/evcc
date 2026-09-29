@@ -375,9 +375,9 @@ func (site *Site) loadpointOptimizerAction(id int) (string, float64, string) {
 	// reaches the plan's reserve it stops discharging, so continuing to charge at
 	// the requested power would import from the grid at (peak) prices - the boost
 	// is only ever meant to consume the pack's surplus above the reserve. Stop the
-	// car there, but keep the source as "battery" so the pack's reserve stays
-	// pinned (optimizerBatteryBoostActive) and it holds at the target instead of
-	// draining further.
+	// car there. The stopped car also releases the pack's reserve pin
+	// (optimizerBatteryBoostActive), so the pack goes on serving the house instead
+	// of holding at the target while the house imports.
 	if action == actionCharge && s.Source == sourceBattery && site.batteryBoostReserveReached(s.Charge, lp.GetChargePower()) {
 		action = actionStop
 	}

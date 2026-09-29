@@ -112,12 +112,23 @@ func (site *Site) updateBatteryMode(batteryGridChargeActive bool, rate api.Rate)
 }
 
 // optimizerBatteryBoostActive reports whether the optimizer is boosting a car
-// from the home battery this cycle (any loadpoint charging from source
+// from the home battery this cycle (any loadpoint told to charge from source
 // "battery"). During a boost the pack's discharge reserve is pinned to the plan's
 // target SoC (in normal mode) so it stops there instead of draining to MinSoc.
+//
+// Only while the car is actually told to charge. Once the reserve guard stops it
+// (batteryBoostReserveReached turns the action into "stop", source still "battery")
+// the pin has nothing left to protect and only strands the house: with the pack
+// held at the slot's end-of-slot target, the house - and the car's draw while the
+// charger ramps down - comes from the grid for the rest of the slot (observed:
+// pack 0W at 64% soc, grid 4kW then the whole house load, at peak). Dropping the
+// pin restores the MinSoc reserve, so the pack keeps serving the house, which the
+// plan counted on anyway. The same holds at a slot boundary: the guard re-evaluates
+// against the new target before the pin would be written, so a pack the car has
+// already pulled below it is never pinned there.
 func (site *Site) optimizerBatteryBoostActive() bool {
 	for _, lp := range site.loadpoints {
-		if lp != nil && lp.optimizerChargeSource == sourceBattery {
+		if lp != nil && lp.optimizerChargeSource == sourceBattery && lp.optimizerAction == actionCharge {
 			return true
 		}
 	}

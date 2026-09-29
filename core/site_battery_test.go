@@ -10,6 +10,7 @@ import (
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/config"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/mock/gomock"
 )
 
@@ -349,8 +350,13 @@ func TestOptimizerBatteryBoostActive(t *testing.T) {
 	s.loadpoints = []*Loadpoint{{optimizerChargeSource: sourceSurplus}, {optimizerChargeSource: sourceGrid}}
 	assert.False(t, s.optimizerBatteryBoostActive(), "surplus/grid are not a battery boost")
 
-	s.loadpoints = []*Loadpoint{{optimizerChargeSource: sourceSurplus}, {optimizerChargeSource: sourceBattery}}
-	assert.True(t, s.optimizerBatteryBoostActive(), "any loadpoint sourcing from the battery is a boost")
+	s.loadpoints = []*Loadpoint{{optimizerChargeSource: sourceSurplus}, {optimizerAction: actionCharge, optimizerChargeSource: sourceBattery}}
+	assert.True(t, s.optimizerBatteryBoostActive(), "any loadpoint charging from the battery is a boost")
+
+	// the reserve guard stopped the car: the source stays "battery" but nothing is
+	// drawn from the pack any more, so there is no boost left to pin the reserve for
+	s.loadpoints = []*Loadpoint{{optimizerAction: actionStop, optimizerChargeSource: sourceBattery}}
+	assert.False(t, s.optimizerBatteryBoostActive(), "a stopped car is not boosting")
 }
 
 // recordingBatteryController implements Meter + BatteryController +
@@ -400,7 +406,7 @@ func TestBatteryBoostReservePin(t *testing.T) {
 	// updateBatteryMode: a boost starting while already in normal pins the reserve
 	// without a mode change, and records the slot
 	site = newSite()
-	site.loadpoints = []*Loadpoint{{optimizerChargeSource: sourceBattery}}
+	site.loadpoints = []*Loadpoint{{optimizerAction: actionCharge, optimizerChargeSource: sourceBattery}}
 	site.updateBatteryMode(false, api.Rate{})
 	assert.Equal(t, 55.0, ctrl.soc, "boost start pins the reserve in normal mode")
 	assert.False(t, site.batteryBoostSlot.IsZero(), "boost slot recorded")
@@ -411,4 +417,50 @@ func TestBatteryBoostReservePin(t *testing.T) {
 	site.updateBatteryMode(false, api.Rate{})
 	assert.Zero(t, ctrl.soc, "boost end restores the MinSoc reserve")
 	assert.True(t, site.batteryBoostSlot.IsZero(), "boost slot cleared")
+}
+
+// TestBatteryBoostTripReleasesPin covers the house being stranded on the grid after
+// a boost: once the reserve guard stops the car, the pack's reserve must drop back
+// to MinSoc so the pack keeps serving the house, instead of staying pinned at the
+// slot's target for the rest of the slot while the house imports.
+func TestBatteryBoostTripReleasesPin(t *testing.T) {
+	ctrl := &recordingBatteryController{}
+	lp := &Loadpoint{}
+	site := &Site{
+		log:           util.NewLogger("foo"),
+		batteryMeters: []config.Device[api.Meter]{config.NewStaticDevice(config.Named{Name: "home"}, api.Meter(ctrl))},
+		batteryMode:   api.BatteryNormal,
+		batterySchedules: map[string][]batterySlot{
+			batteryKey("home"): {{until: time.Now().Add(time.Hour), action: "normal", soc: 55}},
+		},
+		loadpoints: []*Loadpoint{lp},
+	}
+	site.setSuggestions(map[string]types.Suggestion{
+		loadpointKey(0): {Action: actionCharge, Charge: 7000, Source: sourceBattery},
+	})
+
+	// the site loop: the loadpoint's action first, then the battery mode
+	cycle := func() {
+		lp.optimizerAction, lp.optimizerChargePower, lp.optimizerChargeSource = site.loadpointOptimizerAction(0)
+		site.updateBatteryMode(false, api.Rate{})
+	}
+
+	// well above the target: boost runs and the reserve is pinned to the target
+	site.battery.Soc = 70
+	cycle()
+	require.Equal(t, actionCharge, lp.optimizerAction)
+	assert.Equal(t, 55.0, ctrl.soc, "boosting pins the reserve at the plan target")
+
+	// the pack reaches the target: the guard stops the car and the pin is released
+	site.battery.Soc = 55
+	cycle()
+	require.Equal(t, actionStop, lp.optimizerAction, "guard stops the car at the reserve")
+	assert.Equal(t, sourceBattery, lp.optimizerChargeSource, "source is still battery")
+	assert.Zero(t, ctrl.soc, "stopped car releases the reserve to MinSoc so the pack serves the house")
+	assert.True(t, site.batteryBoostSlot.IsZero(), "boost slot cleared")
+
+	// the guard stays latched for the slot, and so does the release
+	cycle()
+	assert.Equal(t, actionStop, lp.optimizerAction)
+	assert.Zero(t, ctrl.soc, "no re-pin within the tripped slot")
 }
