@@ -141,12 +141,10 @@ type TimeSeriesData struct {
 type Settings struct {
 	// GapAbs is the absolute MIP gap of the cost stage in currency units, nil solves to optimality
 	GapAbs *float64
-	// ProbeSeconds for the joint solve, nil derives it from TimeLimit
+	// ProbeSeconds for the joint solve, nil derives it from the time limit
 	ProbeSeconds *float64
 	// PreferenceBudget is the money the preference stage may spend
 	PreferenceBudget float64
-	// TimeLimit of the whole optimization in seconds, nil for none
-	TimeLimit *float64
 }
 
 // DefaultSettings are the OptimizerSettings defaults
@@ -193,7 +191,9 @@ type variables struct {
 
 // Optimizer is the Optimizer class
 type Optimizer struct {
-	settings   Settings
+	settings Settings
+	// timeLimit of the whole optimization in seconds (the context's deadline at Solve), nil for none
+	timeLimit  *float64
 	strategy   OptimizationStrategy
 	grid       GridConfig
 	batteries  []BatteryConfig
@@ -935,7 +935,7 @@ func (o *Optimizer) solvePreferences(ctx context.Context, deadline *time.Time) e
 			o.preferenceStage = "no time"
 			return nil
 		}
-		r = pyMin(r, float64(*o.settings.TimeLimit*preferenceTimeShare))
+		r = pyMin(r, float64(*o.timeLimit*preferenceTimeShare))
 		rem = &r
 	}
 
@@ -1001,8 +1001,8 @@ func (o *Optimizer) probeThenSplit(ctx context.Context, deadline *time.Time) err
 	o.problem.setObjective(plusAny(o.costObjective, o.preferenceObjective).mul(o.objectiveScale))
 
 	probe := o.settings.ProbeSeconds
-	if probe == nil && o.settings.TimeLimit != nil {
-		probe = fptr(float64(*o.settings.TimeLimit * probeShare))
+	if probe == nil && o.timeLimit != nil {
+		probe = fptr(float64(*o.timeLimit * probeShare))
 	}
 	probing := probe == nil || *probe != 0
 	if probing {
@@ -1114,9 +1114,13 @@ func (o *Optimizer) Solve(ctx context.Context) (res Result, err error) {
 		o.CreateModel()
 	}
 
+	// The service's OPTIMIZER_TIME_LIMIT is the context's deadline here: the whole
+	// optimization shares it, and each stage gets its share as Python passes -sec.
 	var deadline *time.Time
-	if o.settings.TimeLimit != nil {
-		d := time.Now().Add(time.Duration(*o.settings.TimeLimit * float64(time.Second)))
+	o.timeLimit = nil
+	if d, ok := ctx.Deadline(); ok {
+		limit := time.Until(d).Seconds()
+		o.timeLimit = &limit
 		deadline = &d
 	}
 

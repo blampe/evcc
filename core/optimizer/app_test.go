@@ -189,7 +189,9 @@ func TestReserveFloorHoldsAtScale(t *testing.T) {
 	b, err := os.ReadFile("testdata/data/discharge_to_grid_full_request.json")
 	require.NoError(t, err)
 
-	res, err := OptimizeJSON(context.Background(), b, WithTimeLimit(5*time.Second))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := OptimizeJSON(ctx, b)
 	require.NoError(t, err)
 	require.Contains(t, []string{"Optimal", "Feasible"}, res.Status)
 

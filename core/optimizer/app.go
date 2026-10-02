@@ -19,7 +19,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	client "github.com/evcc-io/optimizer/client"
 )
@@ -47,12 +46,6 @@ func (e *Error) Error() string {
 
 // Option configures a solve
 type Option func(*Settings)
-
-// WithTimeLimit is the service's OPTIMIZER_TIME_LIMIT: the wall clock all solve stages share. Each
-// stage gets its share as a context deadline, as the Python passes it as CBC's -sec.
-func WithTimeLimit(d time.Duration) Option {
-	return func(s *Settings) { s.TimeLimit = fptr(d.Seconds()) }
-}
 
 // WithSettings replaces the settings wholesale
 func WithSettings(settings Settings) Option {

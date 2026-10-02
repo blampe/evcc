@@ -567,7 +567,7 @@ func optimizerURI() string {
 
 const (
 	// optimizerTimeLimit is the solver time limit of the hosted optimizer service
-	// (OPTIMIZER_TIME_LIMIT), shared by the stages of an in-process solve the same way
+	// (OPTIMIZER_TIME_LIMIT): the deadline of an in-process solve, whose stages share it
 	optimizerTimeLimit = 10 * time.Second
 
 	// optimizerTimeout bounds a whole optimizer run, as the HTTP client's timeout did
@@ -1044,14 +1044,15 @@ func (site *Site) optimizerUpdate(battery []types.Measurement) error {
 // optimize solves the request with the optimizer service configured with OPTIMIZER_URI, or in
 // process with the port of that service when none is configured
 func (site *Site) optimize(req optimizer.OptimizationInput) (optimizer.OptimizationResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), optimizerTimeout)
-	defer cancel()
-
 	if uri := optimizerURI(); uri != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), optimizerTimeout)
+		defer cancel()
 		return site.optimizeRemote(ctx, uri, req)
 	}
 
-	return evopt.Optimize(ctx, req, evopt.WithTimeLimit(optimizerTimeLimit))
+	ctx, cancel := context.WithTimeout(context.Background(), optimizerTimeLimit)
+	defer cancel()
+	return evopt.Optimize(ctx, req)
 }
 
 // optimizeRemote posts the request to the optimizer service at uri
