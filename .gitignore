@@ -53,3 +53,6 @@ asset-stats.html
 *storybook.log
 /graphify-out/
 .graphifyignore
+
+# optimizer port goldens
+!core/optimizer/testdata/**
