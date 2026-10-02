@@ -7,7 +7,7 @@
 - `scenarios.sha256` holds the same hashes for the solves of the ported scenario tests
   (`tests/*.py`), keyed by the Python test id.
 
-Recorded with pulp 3.3.2 and cbc-go's `cmd/cbc` (github.com/blampe/cbc) as the service's CBC,
+Recorded with pulp 3.3.2 and cbc-go's `cmd/cbc` (github.com/blampe/cbc, cedb61d) as the service's CBC,
 through cbc-go's `scripts/pulp_shim.sh`, which keeps a copy of every model:
 
     go build -o /tmp/cbc-go ./cmd/cbc                       # in the cbc-go checkout
