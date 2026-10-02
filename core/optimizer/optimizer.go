@@ -228,6 +228,9 @@ type Optimizer struct {
 	peakSides  []string
 
 	serveHomeFirst []int
+
+	// probeThenSplitHook replaces probeThenSplit in tests
+	probeThenSplitHook func(ctx context.Context, deadline *time.Time) error
 }
 
 // NewOptimizer is Optimizer.__init__. It fails where the Python constructor raises.
@@ -1120,7 +1123,11 @@ func (o *Optimizer) Solve(ctx context.Context) (res Result, err error) {
 	if err := o.solveCommitments(ctx, deadline); err != nil {
 		return res, err
 	}
-	if err := o.probeThenSplit(ctx, deadline); err != nil {
+	probeThenSplit := o.probeThenSplit
+	if o.probeThenSplitHook != nil {
+		probeThenSplit = o.probeThenSplitHook
+	}
+	if err := probeThenSplit(ctx, deadline); err != nil {
 		return res, err
 	}
 

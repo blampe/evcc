@@ -313,7 +313,7 @@ func newProblem(name string, sense int) *lpProblem {
 		registered: make(map[*lpVar]bool),
 		status:     lpStatusNotSolved,
 		solStatus:  lpSolutionNoSolutionFound,
-		solve:      solveCBC,
+		solve:      solveFunc,
 	}
 }
 
@@ -538,6 +538,9 @@ func (p *lpProblem) solveWith(ctx context.Context, opts solverOptions) error {
 	defer p.restoreObjective(wasNone, dummy)
 	return p.solve(ctx, p, opts)
 }
+
+// solveFunc is the solver new problems use, replaced in tests
+var solveFunc = solveCBC
 
 // mpsHook, when set, receives every MPS file handed to CBC. Tests use it to compare the model
 // against the one PuLP writes.
