@@ -1,7 +1,6 @@
 package core
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,6 +15,7 @@ import (
 	"github.com/evcc-io/evcc/core/keys"
 	"github.com/evcc-io/evcc/core/loadpoint"
 	"github.com/evcc-io/evcc/core/metrics"
+	evopt "github.com/evcc-io/evcc/core/optimizer"
 	"github.com/evcc-io/evcc/core/types"
 	"github.com/evcc-io/evcc/hems/hems"
 	"github.com/evcc-io/evcc/messenger"
@@ -559,9 +559,20 @@ type optimizerBattery struct {
 	detail batteryDetail
 }
 
+// optimizerURI is the optimizer service configured with OPTIMIZER_URI. Without one the
+// optimizer runs in process (see optimize).
 func optimizerURI() string {
-	return cmp.Or(os.Getenv("OPTIMIZER_URI"), OPTIMIZER_URI)
+	return os.Getenv("OPTIMIZER_URI")
 }
+
+const (
+	// optimizerTimeLimit is the solver time limit of the hosted optimizer service
+	// (OPTIMIZER_TIME_LIMIT), shared by the stages of an in-process solve the same way
+	optimizerTimeLimit = 10 * time.Second
+
+	// optimizerTimeout bounds a whole optimizer run, as the HTTP client's timeout did
+	optimizerTimeout = 90 * time.Second
+)
 
 const slotsPerHour = float64(time.Hour / tariff.SlotDuration)
 
@@ -795,7 +806,8 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 		minLen = min(minLen, len(solar))
 	}
 
-	if optimizerURI() == OPTIMIZER_URI {
+	// the horizon of the hosted service, which the in-process optimizer shares
+	if uri := optimizerURI(); uri == "" || uri == OPTIMIZER_URI {
 		minLen = slotsUntil(grid, optimizerHorizon(time.Now()), minLen)
 	}
 
@@ -1005,26 +1017,9 @@ func (site *Site) optimizerUpdate(battery []types.Measurement) error {
 		return nil // nothing to optimize
 	}
 
-	httpClient := request.NewClient(site.log)
-	httpClient.Timeout = 90 * time.Second
-
-	apiClient, err := optimizer.NewClientWithResponses(optimizerURI(), optimizer.WithHTTPClient(httpClient))
+	res, err := site.optimize(req)
 	if err != nil {
 		return err
-	}
-
-	resp, err := apiClient.PostOptimizeChargeScheduleWithResponse(context.TODO(), req, func(_ context.Context, req *http.Request) error {
-		if sponsor.IsAuthorized() {
-			req.Header.Set("Authorization", "Bearer "+sponsor.Token)
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	if resp.StatusCode() != http.StatusOK {
-		return apiError(resp)
 	}
 
 	// publish before the status check so the optimizer page stays available
@@ -1032,18 +1027,58 @@ func (site *Site) optimizerUpdate(battery []types.Measurement) error {
 	site.publish("evopt", optimizerResult{
 		Updated: time.Now(),
 		Req:     req,
-		Res:     *resp.JSON200,
+		Res:     res,
 		Details: details,
 	})
 
 	// feasible results are usable, they are just not proven optimal
-	if status := resp.JSON200.Status; status != optimizer.Optimal && status != optimizer.Feasible {
+	if status := res.Status; status != optimizer.Optimal && status != optimizer.Feasible {
 		return errors.New(string(status))
 	}
 
-	site.applyOptimizerResult(req, details.BatteryDetails, *resp.JSON200, computedAt)
+	site.applyOptimizerResult(req, details.BatteryDetails, res, computedAt)
 
 	return nil
+}
+
+// optimize solves the request with the optimizer service configured with OPTIMIZER_URI, or in
+// process with the port of that service when none is configured
+func (site *Site) optimize(req optimizer.OptimizationInput) (optimizer.OptimizationResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), optimizerTimeout)
+	defer cancel()
+
+	if uri := optimizerURI(); uri != "" {
+		return site.optimizeRemote(ctx, uri, req)
+	}
+
+	return evopt.Optimize(ctx, req, evopt.WithTimeLimit(optimizerTimeLimit))
+}
+
+// optimizeRemote posts the request to the optimizer service at uri
+func (site *Site) optimizeRemote(ctx context.Context, uri string, req optimizer.OptimizationInput) (optimizer.OptimizationResult, error) {
+	httpClient := request.NewClient(site.log)
+	httpClient.Timeout = optimizerTimeout
+
+	apiClient, err := optimizer.NewClientWithResponses(uri, optimizer.WithHTTPClient(httpClient))
+	if err != nil {
+		return optimizer.OptimizationResult{}, err
+	}
+
+	resp, err := apiClient.PostOptimizeChargeScheduleWithResponse(ctx, req, func(_ context.Context, req *http.Request) error {
+		if sponsor.IsAuthorized() {
+			req.Header.Set("Authorization", "Bearer "+sponsor.Token)
+		}
+		return nil
+	})
+	if err != nil {
+		return optimizer.OptimizationResult{}, err
+	}
+
+	if resp.StatusCode() != http.StatusOK {
+		return optimizer.OptimizationResult{}, apiError(resp)
+	}
+
+	return *resp.JSON200, nil
 }
 
 // gridImportAt returns the total grid import at slot j in Wh: the regular
