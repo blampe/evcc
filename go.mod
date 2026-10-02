@@ -139,6 +139,7 @@ require (
 	github.com/azihsoyn/rijndael256 v0.0.0-20200316065338-d14eefa2b66b // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bitly/go-simplejson v0.5.1 // indirect
+	github.com/blampe/cbc v0.0.0
 	github.com/cenkalti/backoff/v5 v5.0.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/clipperhouse/displaywidth v0.10.0 // indirect
@@ -275,3 +276,5 @@ replace github.com/enbility/eebus-go => github.com/andig/eebus-go v0.0.0-2026072
 replace github.com/enbility/ship-go => github.com/andig/ship-go v0.6.1-0.20260818072438-bade5ec9fbd7
 
 replace github.com/evcc-io/optimizer => /Users/blampe/src/optimizer/.claude/worktrees/optimizer-redesign
+
+replace github.com/blampe/cbc => /Users/blampe/src/cbc-go
