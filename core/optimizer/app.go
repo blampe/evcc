@@ -1,3 +1,7 @@
+// Package optimizer is the evcc optimizer service (github.com/evcc-io/optimizer, a Python service
+// solving its MILP with PuLP and CBC) ported to Go: the same model, handed to the pure Go CBC port
+// github.com/blampe/cbc exactly as PuLP hands it to CBC, so a request gets the answer the service
+// gives. Optimize is the entry point.
 package optimizer
 
 // Port of src/optimizer/app.py: request validation and parsing, the solve, and the response the
