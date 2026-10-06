@@ -182,6 +182,7 @@ type variables struct {
 	zExpLim          []*lpVar
 	pMaxImpExc       *lpVar
 	dExcess          []*lpVar
+	homeImport       []*lpVar
 	peak             map[string]*lpVar
 	y                []*lpVar
 	zC               [][]*lpVar
@@ -453,6 +454,7 @@ func (o *Optimizer) setupVariables() {
 	}
 	if len(o.serveHomeFirst) > 0 {
 		v.dExcess = perSlot(nt, func(t int) *lpVar { return newVar(fmt.Sprintf("d_excess_%d", t), zero, nil) })
+		v.homeImport = perSlot(nt, func(t int) *lpVar { return newVar(fmt.Sprintf("home_import_%d", t), zero, nil) })
 	}
 
 	v.peak = make(map[string]*lpVar)
@@ -552,6 +554,21 @@ func (o *Optimizer) setupTargetFunction() {
 				w := 1 + float64(T-t)/float64(T)
 				iadd(&commitment, affine(v.pDemandPen[i][t]).mul(-o.prcGoal[i]).mul(w))
 			}
+		}
+	}
+
+	// serve_home_first: the home self-consumes ahead of money, so energy the house
+	// will need before the pack can refill is never sold, whatever the export price.
+	// Weighted below the reserve penalty (scaled by eta_d, the house gets eta_d Wh
+	// per stored Wh) so serving the house never justifies breaching s_min.
+	if len(o.serveHomeFirst) > 0 {
+		prcHome := math.Inf(1)
+		for _, i := range o.serveHomeFirst {
+			prcHome = min(prcHome, o.prcReserve[i])
+		}
+		prcHome *= 0.5
+		for t := range T {
+			iadd(&commitment, affine(v.homeImport[t]).mul(-prcHome))
 		}
 	}
 	o.commitmentObjective = commitment
@@ -752,6 +769,22 @@ func (o *Optimizer) addEnergyBalanceConstraints() {
 				discharge.addVar(v.d[i][t], 1)
 			}
 			p.add(ge(affine(v.dExcess[t]), discharge.copy().addConst(deficit, -1)), "")
+		}
+
+		// home_import >= import - charging of the other batteries (the cars): grid
+		// energy the house (or the home pack) takes, which an outage would cut off
+		home := make(map[int]bool, len(o.serveHomeFirst))
+		for _, i := range o.serveHomeFirst {
+			home[i] = true
+		}
+		for t := range o.t {
+			homeImport := affine(v.n[t])
+			for i := range o.batteries {
+				if !home[i] {
+					homeImport.addVar(v.c[i][t], -1)
+				}
+			}
+			p.add(ge(affine(v.homeImport[t]), homeImport), "")
 		}
 	}
 

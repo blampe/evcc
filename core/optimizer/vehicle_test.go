@@ -87,7 +87,7 @@ func TestServeHomeFirstBaselineDrainsThePackIntoTheCar(t *testing.T) {
 }
 
 func TestServeHomeFirstPackCarriesTheHouseAndTheGridTheCar(t *testing.T) {
-	pyTest(t, "test_serve_home_first.py::test_pack_carries_the_house_and_the_grid_the_car")
+	// no PuLP parity: serve_home_first adds an L1 home-import commitment the Python reference lacks
 	r := shfSolve(t, shfEnough, true, 2)
 	require.Equal(t, "Optimal", r.Status)
 	approx(t, shfSpareWh, shfPackToOtherLoads(r), 1)
@@ -96,7 +96,7 @@ func TestServeHomeFirstPackCarriesTheHouseAndTheGridTheCar(t *testing.T) {
 }
 
 func TestServeHomeFirstTieBreakCostsNothing(t *testing.T) {
-	pyTest(t, "test_serve_home_first.py::test_tie_break_costs_nothing")
+	// no PuLP parity: serve_home_first adds an L1 home-import commitment the Python reference lacks
 	off := shfSolve(t, shfEnough, false, 2)
 	on := shfSolve(t, shfEnough, true, 2)
 	approx(t, shfCost(off), shfCost(on), 1e-4)
@@ -104,14 +104,14 @@ func TestServeHomeFirstTieBreakCostsNothing(t *testing.T) {
 }
 
 func TestServeHomeFirstHoldsWithoutAChargePriority(t *testing.T) {
-	pyTest(t, "test_serve_home_first.py::test_holds_without_a_charge_priority")
+	// no PuLP parity: serve_home_first adds an L1 home-import commitment the Python reference lacks
 	r := shfSolve(t, shfEnough, true, 0)
 	require.Equal(t, "Optimal", r.Status)
 	approx(t, 0, shfHouseImport(r), 1)
 }
 
 func TestServeHomeFirstSpareEnergyStillGoesToTheCar(t *testing.T) {
-	pyTest(t, "test_serve_home_first.py::test_spare_energy_still_goes_to_the_car")
+	// no PuLP parity: serve_home_first adds an L1 home-import commitment the Python reference lacks
 	off := shfSolve(t, shfFullPack, false, 2)
 	on := shfSolve(t, shfFullPack, true, 2)
 	require.Equal(t, "Optimal", on.Status)
@@ -366,4 +366,37 @@ func TestCMaxTUniformMatchesTheScalar(t *testing.T) {
 	array := solveOK(t, cMaxTBuild(t, repeat(10000, 6)))
 	require.Equal(t, "Optimal", array.Status)
 	approxAll(t, f(scalar.Batteries[0].ChargingPower), f(array.Batteries[0].ChargingPower), 1)
+}
+
+// vppNight: a full pack ahead of a 2-slot export premium ($2/kWh), then a night of
+// house load at a cheap import price before PV refills the pack.
+func vppNight(t *testing.T, serveHomeFirst bool) Result {
+	const event, night = 2, 10
+	pack := shfHomePack(shfFullPack, serveHomeFirst)
+	pack.DischargeToGrid = true
+	return solveOK(t, newOptimizer(t, strat("none", "discharge_before_import"), GridConfig{},
+		[]BatteryConfig{pack},
+		TimeSeriesData{
+			Dt: repeat(3600, event+night+1),
+			Gt: repeat(500, event+night+1),
+			Ft: cat(repeat(0, event+night), []float64{5000}),
+			PN: repeat(0.0003, event+night+1),
+			PE: cat(repeat(0.002, event), repeat(0.00009, night+1)),
+		}, shfEta, shfEta))
+}
+
+func TestServeHomeFirstOffSellsTheNightToTheEvent(t *testing.T) {
+	r := vppNight(t, false)
+	require.Equal(t, "Optimal", r.Status)
+	// the premium beats the import price: the pack exports to s_min and the house imports all night
+	approx(t, 500*10, sum(f(r.GridImport)), 1)
+}
+
+func TestServeHomeFirstKeepsTheNightThroughAnEvent(t *testing.T) {
+	r := vppNight(t, true)
+	require.Equal(t, "Optimal", r.Status)
+	approx(t, 0, sum(f(r.GridImport)), 1, "the house self-consumes all night")
+	// everything beyond the house's need (event + night) still goes to the event
+	keep := 500 * 12 / shfEta
+	approxRel(t, (shfFullPack-1000-keep)*shfEta, sum(f(r.GridExport)[:2]), 0.01)
 }

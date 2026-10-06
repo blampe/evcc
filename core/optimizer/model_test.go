@@ -59,7 +59,7 @@ func TestConsolidateOneBlockBeatsTheSameEnergySplit(t *testing.T) {
 }
 
 func TestConsolidateSparePackEnergyGoesToTheCarInOneBlock(t *testing.T) {
-	pyTest(t, "test_consolidate_charging.py::test_spare_pack_energy_goes_to_the_car_in_one_block")
+	// no PuLP parity: serve_home_first adds an L1 home-import commitment the Python reference lacks
 	for _, shf := range []bool{false, true} {
 		r := solveOK(t, consolidateBuild(t, shf))
 		require.Equal(t, "Optimal", r.Status)
