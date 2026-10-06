@@ -628,6 +628,9 @@ func (lp *Loadpoint) evVehicleDisconnectHandler() {
 	// set default vehicle (may be nil)
 	lp.setActiveVehicle(lp.defaultVehicle)
 
+	// park the charger at minimum current
+	lp.parkChargerCurrent()
+
 	// soc update reset
 	lp.socUpdated = time.Time{}
 
@@ -648,6 +651,36 @@ func (lp *Loadpoint) evVehicleDisconnectHandler() {
 
 	// disconnect removes the loadpoint's demand
 	lp.triggerOptimizer()
+}
+
+// parkChargerCurrent drops the charger to minimum current after the vehicle
+// disconnects. Some chargers (e.g. ChargePoint) start a session on their own
+// when the next vehicle plugs in, at whatever limit they were left at; parking
+// at minimum bounds that unplanned draw until the control loop takes over (or
+// until a stop that the charger is slow to acknowledge finally lands).
+func (lp *Loadpoint) parkChargerCurrent() {
+	// switch sockets report a disconnect when turned off; there is no current to park
+	if lp.charger == nil || lp.chargerHasFeature(api.IntegratedDevice) {
+		return
+	}
+
+	// write the charger directly: setLimit would also enable it, and while
+	// disabled offeredCurrent doesn't track the charger's real limit anyway
+	current := lp.effectiveMinCurrent()
+
+	var err error
+	if charger, ok := api.Cap[api.ChargerEx](lp.charger); ok {
+		err = charger.MaxCurrentMillis(current)
+	} else {
+		err = lp.charger.MaxCurrent(int64(current))
+	}
+
+	if err != nil {
+		lp.log.WARN.Printf("park charger current %.3gA: %v", current, err)
+		return
+	}
+
+	lp.log.DEBUG.Printf("park charger current: %.3gA", current)
 }
 
 // triggerOptimizer re-runs the optimizer when the loadpoint's profile changed

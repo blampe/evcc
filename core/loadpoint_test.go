@@ -579,6 +579,7 @@ func TestSetModeAndSocAtDisconnect(t *testing.T) {
 	clock.Add(5 * time.Minute)
 	charger.EXPECT().Enabled().Return(lp.enabled, nil)
 	charger.EXPECT().Status().Return(api.StatusA, nil)
+	charger.EXPECT().MaxCurrent(int64(minA)).Return(nil) // parked on disconnect
 	charger.EXPECT().Enable(false).Return(nil)
 	lp.Update(-300, 0, nil, nil, false, false, 0, nil, nil, nil)
 
@@ -908,6 +909,7 @@ func TestConnectionDurationDropDetection(t *testing.T) {
 	lp.connectedTime = connectedTime
 
 	ct.EXPECT().ConnectionDuration().Return(0*time.Second, nil)
+	ch.EXPECT().MaxCurrent(int64(minA)).Return(nil) // parked on the detected disconnect
 	lp.Update(500, 0, nil, nil, false, false, 0, nil, nil, nil)
 	ctrl.Finish()
 

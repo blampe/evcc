@@ -483,6 +483,40 @@ func TestDisconnectIntegratedDeviceKeepsMode(t *testing.T) {
 	assert.Equal(t, api.ModeOff, lp.GetMode(), "integrated device disconnect must not reset mode")
 }
 
+// TestDisconnectParksChargerCurrent: a charger that starts a session on its own
+// at plug-in must not do so at the last session's high limit, so disconnect
+// drops it to minimum current — without enabling it.
+func TestDisconnectParksChargerCurrent(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"ok", nil},
+		{"write fails", errors.New("offline")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+
+			// gomock fails on any unexpected call, so this also asserts no Enable
+			charger := api.NewMockCharger(ctrl)
+			charger.EXPECT().MaxCurrent(int64(8)).Return(tc.err)
+
+			lp := NewLoadpoint(util.NewLogger("foo"), settings.NewDatabaseSettingsAdapter("foo"))
+			lp.charger = charger
+			lp.minCurrent = 8
+			lp.maxCurrent = 48
+
+			x, y, z := createChannels(t)
+			attachChannels(lp, x, y, z)
+
+			lp.evVehicleDisconnectHandler()
+
+			assert.False(t, lp.enabled)
+			assert.Equal(t, 0.0, lp.offeredCurrent, "model untouched so the next enable re-sends current")
+		})
+	}
+}
+
 func TestStartWakeUpTimerDisabled(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
