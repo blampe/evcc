@@ -67,6 +67,13 @@ export function whToKW(wh: number, dtSeconds: number): number {
   return wh / (dtSeconds / 3600) / 1000;
 }
 
+// per-slot net grid power (kW): import positive, export negative. Nets rather than
+// picking "import if nonzero": the solver leaves float noise (e.g. 1e-28 Wh) in the
+// idle direction, which would otherwise mask a real export.
+export function netGridKW(gridImport: number[], gridExport: number[], dt: number[]): number[] {
+  return gridImport.map((imp, i) => whToKW(imp - (gridExport[i] || 0), dt[i] || 0));
+}
+
 // per-slot flag: the car is expected to be disconnected in slots where its per-slot
 // charge cap c_max_t is 0. An absent c_max_t (e.g. a home battery) is never disconnected.
 export function disconnectedSlots(cMaxT: number[] | undefined, length: number): boolean[] {

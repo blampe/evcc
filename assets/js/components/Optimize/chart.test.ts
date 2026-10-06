@@ -1,5 +1,12 @@
 import { describe, expect, test } from "vite-plus/test";
-import { disconnectedSlots, expandSlots, isMidnight, netGridCost, slotXAxis } from "./chart";
+import {
+  disconnectedSlots,
+  expandSlots,
+  isMidnight,
+  netGridCost,
+  netGridKW,
+  slotXAxis,
+} from "./chart";
 
 // 15min slots starting at the given local hour
 function times(startHour: number, count: number): number[] {
@@ -91,5 +98,26 @@ describe("netGridCost", () => {
   test("missing series count as nothing", () => {
     expect(netGridCost(undefined, undefined, undefined, undefined)).toBe(0);
     expect(netGridCost([1000], [1000], undefined, undefined)).toBe(0);
+  });
+});
+
+describe("netGridKW", () => {
+  const dt = [900, 900, 900];
+
+  test("solver noise on import does not mask export", () => {
+    // live plan 14:30: 4.5e-28 Wh import alongside 798 Wh export
+    const [kw] = netGridKW([4.48e-28], [798.46], [900]);
+    expect(kw).toBeCloseTo(-3.19, 2);
+  });
+
+  test("import positive, export negative, idle zero", () => {
+    const kw = netGridKW([500, 0, 0], [0, 250, 0], dt);
+    expect(kw[0]).toBeCloseTo(2);
+    expect(kw[1]).toBeCloseTo(-1);
+    expect(kw[2]).toBe(0);
+  });
+
+  test("missing export entries count as zero", () => {
+    expect(netGridKW([250], [], [900])[0]).toBeCloseTo(1);
   });
 });

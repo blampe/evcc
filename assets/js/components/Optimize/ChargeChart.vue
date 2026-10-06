@@ -21,7 +21,7 @@ import echartsChart from "@/mixins/echartsChart";
 import colors from "@/colors";
 import LegendList from "../Sessions/LegendList.vue";
 import type { Legend } from "../Sessions/types";
-import { slotTimes, slotXAxis, formatSlotRange, whToKW, loadpointTitle } from "./chart";
+import { slotTimes, slotXAxis, formatSlotRange, whToKW, netGridKW, loadpointTitle } from "./chart";
 
 const GRID_LABEL = "Grid Power";
 const SOLAR_LABEL = "Solar Forecast";
@@ -69,13 +69,11 @@ export default defineComponent({
 			return slotTimes(this.timestamp, this.evopt.req.time_series.dt);
 		},
 		gridPower(): number[] {
-			const gridImport = this.evopt.res.grid_import || [];
-			const gridExport = this.evopt.res.grid_export || [];
-			return gridImport.map((imp, i) => {
-				const importKW = this.toKW(imp, i);
-				const exportKW = this.toKW(gridExport[i] || 0, i);
-				return importKW > 0 ? importKW : -exportKW;
-			});
+			return netGridKW(
+				this.evopt.res.grid_import || [],
+				this.evopt.res.grid_export || [],
+				this.evopt.req.time_series.dt
+			);
 		},
 		chartSeries(): Record<string, unknown>[] {
 			const series: Record<string, unknown>[] = [
