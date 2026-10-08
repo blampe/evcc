@@ -343,20 +343,24 @@ func TestRequiredBatteryModeOptimizer(t *testing.T) {
 	assert.Equal(t, api.BatteryUnknown, s.requiredBatteryMode(false, api.Rate{}))
 }
 
-func TestOptimizerBatteryBoostActive(t *testing.T) {
+func TestOptimizerReservePinned(t *testing.T) {
 	s := &Site{}
-	assert.False(t, s.optimizerBatteryBoostActive(), "no loadpoints")
+	assert.False(t, s.optimizerReservePinned(), "no loadpoints")
 
-	s.loadpoints = []*Loadpoint{{optimizerChargeSource: sourceSurplus}, {optimizerChargeSource: sourceGrid}}
-	assert.False(t, s.optimizerBatteryBoostActive(), "surplus/grid are not a battery boost")
+	s.loadpoints = []*Loadpoint{{optimizerAction: actionCharge, optimizerChargeSource: sourceSurplus}}
+	assert.False(t, s.optimizerReservePinned(), "surplus charging is not pinned")
 
 	s.loadpoints = []*Loadpoint{{optimizerChargeSource: sourceSurplus}, {optimizerAction: actionCharge, optimizerChargeSource: sourceBattery}}
-	assert.True(t, s.optimizerBatteryBoostActive(), "any loadpoint charging from the battery is a boost")
+	assert.True(t, s.optimizerReservePinned(), "any loadpoint charging from the battery pins")
+
+	// the pack would otherwise feed a grid-planned charge down to MinSoc
+	s.loadpoints = []*Loadpoint{{optimizerAction: actionCharge, optimizerChargeSource: sourceGrid}}
+	assert.True(t, s.optimizerReservePinned(), "a grid-fed charge pins")
 
 	// the reserve guard stopped the car: the source stays "battery" but nothing is
 	// drawn from the pack any more, so there is no boost left to pin the reserve for
 	s.loadpoints = []*Loadpoint{{optimizerAction: actionStop, optimizerChargeSource: sourceBattery}}
-	assert.False(t, s.optimizerBatteryBoostActive(), "a stopped car is not boosting")
+	assert.False(t, s.optimizerReservePinned(), "a stopped car is not pinned")
 }
 
 // recordingBatteryController implements Meter + BatteryController +
@@ -417,6 +421,39 @@ func TestBatteryBoostReservePin(t *testing.T) {
 	site.updateBatteryMode(false, api.Rate{})
 	assert.Zero(t, ctrl.soc, "boost end restores the MinSoc reserve")
 	assert.True(t, site.batteryBoostSlot.IsZero(), "boost slot cleared")
+}
+
+// TestGridChargeKeepsReservePin covers a planned charge that the pack starts
+// (boost) and the grid finishes: the plan keeps the pack on a house-only drain
+// once the car switches to grid, so the reserve must stay pinned across the
+// source change instead of dropping to MinSoc and letting the Powerwall feed the
+// car to empty.
+func TestGridChargeKeepsReservePin(t *testing.T) {
+	ctrl := &recordingBatteryController{}
+	lp := &Loadpoint{optimizerAction: actionCharge, optimizerChargeSource: sourceBattery}
+	site := &Site{
+		log:           util.NewLogger("foo"),
+		batteryMeters: []config.Device[api.Meter]{config.NewStaticDevice(config.Named{Name: "home"}, api.Meter(ctrl))},
+		batteryMode:   api.BatteryNormal,
+		batterySchedules: map[string][]batterySlot{
+			batteryKey("home"): {{until: time.Now().Add(time.Hour), action: "normal", soc: 21}},
+		},
+		loadpoints: []*Loadpoint{lp},
+	}
+
+	site.updateBatteryMode(false, api.Rate{})
+	assert.Equal(t, 21.0, ctrl.soc, "boost pins the reserve")
+
+	lp.optimizerChargeSource = sourceGrid
+	ctrl.soc = -1 // detect any re-apply
+	site.updateBatteryMode(false, api.Rate{})
+	assert.Equal(t, -1.0, ctrl.soc, "switching to grid keeps the pin (no MinSoc restore)")
+	assert.False(t, site.batteryBoostSlot.IsZero(), "pin slot kept")
+
+	// the charge ends: the pack goes back to serving the house down to MinSoc
+	lp.optimizerAction = actionStop
+	site.updateBatteryMode(false, api.Rate{})
+	assert.Zero(t, ctrl.soc, "charge end restores the MinSoc reserve")
 }
 
 // TestBatteryBoostTripReleasesPin covers the house being stranded on the grid after

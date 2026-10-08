@@ -125,7 +125,7 @@ type Site struct {
 	suggestionsComputedAt    time.Time                   // when the current suggestions' input snapshot was taken (guarded by the site lock)
 	batterySchedules         map[string][]batterySlot    // per-battery optimizer mode plan, for front-running export transitions
 	batterySpikeSlot         time.Time                   // 15-min slot the export spike was last (re)written for
-	batteryBoostSlot         time.Time                   // 15-min slot the battery-boost reserve was last pinned for (zero = not boosting)
+	batteryBoostSlot         time.Time                   // 15-min slot the car-charge reserve pin was last written for (zero = not pinned)
 	batteryBoostReserveSlot  time.Time                   // 15-min slot a battery boost hit the pack's reserve (latches the car stop, zero = not tripped)
 	interval                 time.Duration               // control-loop cadence (set in Run), for deriving reaction-lag margins
 	suggestionActions        map[string]string           // last notified actionable optimizer action by device key

@@ -74,12 +74,12 @@ func (site *Site) updateBatteryMode(batteryGridChargeActive bool, rate api.Rate)
 		batteryMode = site.batteryMode
 	}
 
-	// battery boost: while a car charges from the home battery, normal mode pins
-	// the pack's reserve to the plan's per-slot target SoC (see applyBatteryMode)
-	// so it stops there instead of draining to MinSoc. Re-apply the (unchanged)
-	// normal mode when the boost starts or the slot advances so the pin tracks the
-	// plan, and once when it ends to restore the MinSoc reserve.
-	boostActive := site.optimizerBatteryBoostActive()
+	// while the optimizer has a car charging from the battery or the grid, normal
+	// mode pins the pack's reserve to the plan's per-slot target SoC (see
+	// applyBatteryMode) so it stops there instead of draining to MinSoc. Re-apply
+	// the (unchanged) normal mode when the charge starts or the slot advances so the
+	// pin tracks the plan, and once when it ends to restore the MinSoc reserve.
+	boostActive := site.optimizerReservePinned()
 	site.RLock()
 	boostSlot := site.batteryBoostSlot
 	site.RUnlock()
@@ -111,24 +111,29 @@ func (site *Site) updateBatteryMode(batteryGridChargeActive bool, rate api.Rate)
 	}
 }
 
-// optimizerBatteryBoostActive reports whether the optimizer is boosting a car
-// from the home battery this cycle (any loadpoint told to charge from source
-// "battery"). During a boost the pack's discharge reserve is pinned to the plan's
-// target SoC (in normal mode) so it stops there instead of draining to MinSoc.
+// optimizerReservePinned reports whether the optimizer has a car charging from
+// the home battery (a boost) or from the grid this cycle. The Powerwall serves
+// whatever the site draws in self-consumption, car included, so in both cases the
+// pack's discharge reserve is pinned to the plan's target SoC (in normal mode):
+// a boost stops at its planned reserve, and a grid-fed charge leaves the pack on
+// the plan's house-only drain instead of feeding the car down to MinSoc. Surplus
+// charging is not pinned: the pack is not expected to feed the car there, and a
+// pin would strand the house on the grid when solar falls short of the forecast.
 //
-// Only while the car is actually told to charge. Once the reserve guard stops it
-// (batteryBoostReserveReached turns the action into "stop", source still "battery")
-// the pin has nothing left to protect and only strands the house: with the pack
-// held at the slot's end-of-slot target, the house - and the car's draw while the
-// charger ramps down - comes from the grid for the rest of the slot (observed:
-// pack 0W at 64% soc, grid 4kW then the whole house load, at peak). Dropping the
-// pin restores the MinSoc reserve, so the pack keeps serving the house, which the
-// plan counted on anyway. The same holds at a slot boundary: the guard re-evaluates
-// against the new target before the pin would be written, so a pack the car has
-// already pulled below it is never pinned there.
-func (site *Site) optimizerBatteryBoostActive() bool {
+// Only while the car is actually told to charge. Once the reserve guard stops a
+// boost (batteryBoostReserveReached turns the action into "stop", source still
+// "battery") the pin has nothing left to protect and only strands the house: with
+// the pack held at the slot's end-of-slot target, the house - and the car's draw
+// while the charger ramps down - comes from the grid for the rest of the slot
+// (observed: pack 0W at 64% soc, grid 4kW then the whole house load, at peak).
+// Dropping the pin restores the MinSoc reserve, so the pack keeps serving the
+// house, which the plan counted on anyway. The same holds at a slot boundary: the
+// guard re-evaluates against the new target before the pin would be written, so a
+// pack the car has already pulled below it is never pinned there.
+func (site *Site) optimizerReservePinned() bool {
 	for _, lp := range site.loadpoints {
-		if lp != nil && lp.optimizerChargeSource == sourceBattery && lp.optimizerAction == actionCharge {
+		if lp != nil && lp.optimizerAction == actionCharge &&
+			(lp.optimizerChargeSource == sourceBattery || lp.optimizerChargeSource == sourceGrid) {
 			return true
 		}
 	}
@@ -300,8 +305,9 @@ func (site *Site) applyBatteryMode(mode api.BatteryMode, boost bool) error {
 			if ctrl, ok := api.Cap[api.BatteryModeController](meter); ok {
 				// target-aware controllers pin the reserve to the optimizer's
 				// planned SoC (e.g. stop a grid discharge at the target instead
-				// of draining to min soc). Normal mode only pins during a boost;
-				// plain self-consumption keeps the pack available down to MinSoc.
+				// of draining to min soc). Normal mode only pins while a car charges
+				// (see optimizerReservePinned); plain self-consumption keeps the
+				// pack available down to MinSoc.
 				target := site.optimizerBatteryTargetSoc(dev.Config().Name)
 				if mode == api.BatteryNormal && !boost {
 					target = 0

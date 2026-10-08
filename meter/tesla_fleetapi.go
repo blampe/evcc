@@ -865,9 +865,9 @@ func onOff(b bool) string {
 }
 
 // normalReserve is the self_consumption reserve: MinSoc normally, or the battery-
-// boost target SoC (never below MinSoc) when the optimizer is draining the pack
-// into a car and passes targetSoc > 0, so the discharge stops at the plan's
-// target instead of at MinSoc.
+// plan's target SoC (never below MinSoc) when the optimizer has a car charging
+// and passes targetSoc > 0, so the pack follows the plan instead of feeding the
+// car down to MinSoc.
 func normalReserve(minSoc, targetSoc float64) uint64 {
 	if targetSoc > 0 {
 		return clampReserve(max(targetSoc, minSoc))
