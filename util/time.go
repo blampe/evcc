@@ -43,3 +43,30 @@ func GetNextOccurrence(weekdays []int, timeStr string, tz string) (time.Time, er
 
 	return time.Time{}, fmt.Errorf("no valid weekday found")
 }
+
+// GetOccurrences returns every occurrence of the given time on the specified weekdays
+// in (from, until], in chronological order.
+func GetOccurrences(weekdays []int, timeStr string, tz string, from, until time.Time) ([]time.Time, error) {
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return nil, fmt.Errorf("invalid timezone: %w", err)
+	}
+
+	parsedTime, err := time.Parse("15:04", timeStr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid time format, expected HH:MM: %w", err)
+	}
+
+	from = from.In(loc)
+
+	var res []time.Time
+	for day := 0; ; day++ {
+		target := time.Date(from.Year(), from.Month(), from.Day()+day, parsedTime.Hour(), parsedTime.Minute(), 0, 0, loc)
+		if target.After(until) {
+			return res, nil
+		}
+		if target.After(from) && slices.Contains(weekdays, int(target.Weekday())) {
+			res = append(res, target)
+		}
+	}
+}

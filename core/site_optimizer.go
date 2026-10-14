@@ -2020,41 +2020,45 @@ func scaleAndPrune(rates api.Rates, scale float64, maxLen int) []float32 {
 	return res
 }
 
-// applyPlanGoal sets the optimizer charge goal (SGoal) from the loadpoint's
-// departure plan. Only a real in-horizon plan goal is applied - a hard target the
-// optimizer will pay grid or drain the home battery to reach. With no plan, no
-// goal is set: a plugged-in car is instead kept charged by its forecast-driving
-// commitment (SDrainT, see applyConsumption), so it covers its predicted trips
-// from PV surplus and the cheapest grid hours without ever being force-filled to
-// its ceiling off expensive grid.
+// applyPlanGoal sets the optimizer charge goals (SGoal) from the loadpoint's
+// departure plans. Every plan due within the horizon is applied, including ones the
+// vehicle meets right now: driving before a later deadline can still take it below
+// that plan. Each is a hard target the optimizer will pay grid or drain the home
+// battery to reach. With no plan, no goal is set: a plugged-in car is instead kept
+// charged by its forecast-driving commitment (SDrainT, see applyConsumption), so it
+// covers its predicted trips from PV surplus and the cheapest grid hours without
+// ever being force-filled to its ceiling off expensive grid.
 func (site *Site) applyPlanGoal(lp loadpoint.API, bat *optimizer.BatteryConfig, minLen int) {
-	goal, socBased := lp.GetPlanGoal()
-	if goal <= 0 {
-		return
-	}
+	goals, socBased := lp.GetPlanGoals(time.Now().Add(time.Duration(minLen) * tariff.SlotDuration))
 
 	// Convert to Wh
-	if vehicle := lp.GetVehicle(); socBased && vehicle != nil {
-		goal *= vehicle.Capacity() * 10
-	} else {
-		goal *= 1000 // Wh
+	scale := 1000.0
+	if vehicle := lp.GetVehicle(); socBased {
+		if vehicle == nil {
+			return
+		}
+		scale = vehicle.Capacity() * 10
 	}
 
-	ts := lp.EffectivePlanTime()
-	if ts.IsZero() {
-		return
-	}
+	for _, g := range goals {
+		goal := float32(g.Goal * scale)
+		if goal <= 0 {
+			continue
+		}
 
-	// TODO precise slot placement
-	slot := int(time.Until(ts) / tariff.SlotDuration)
-	if slot < 0 || slot >= minLen {
-		site.log.DEBUG.Printf("plan beyond forecast range or overrun: %.1f at %v slot %d", goal, ts.Round(time.Minute), slot)
-		return
-	}
+		// TODO precise slot placement
+		slot := int(time.Until(g.Time) / tariff.SlotDuration)
+		if slot < 0 || slot >= minLen {
+			site.log.DEBUG.Printf("plan beyond forecast range or overrun: %.1f at %v slot %d", goal, g.Time.Round(time.Minute), slot)
+			continue
+		}
 
-	bat.SGoal = make([]float32, minLen)
-	bat.SGoal[slot] = float32(goal)
-	bat.SMax = max(bat.SMax, float32(goal))
+		if bat.SGoal == nil {
+			bat.SGoal = make([]float32, minLen)
+		}
+		bat.SGoal[slot] = max(bat.SGoal[slot], goal)
+		bat.SMax = max(bat.SMax, goal)
+	}
 }
 
 // TODO remove once smart cost limit usage becomes obsolete

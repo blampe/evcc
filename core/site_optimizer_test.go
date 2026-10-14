@@ -480,7 +480,7 @@ func TestLoadpointRequestChargeGoal(t *testing.T) {
 			lp.EXPECT().GetStatus().Return(api.StatusB).AnyTimes()
 			lp.EXPECT().GetSmartCostLimit().Return(nil).AnyTimes()
 			lp.EXPECT().EffectivePlanStrategy().Return(api.PlanStrategy{}).AnyTimes()
-			lp.EXPECT().GetPlanGoal().Return(0.0, false).AnyTimes()
+			lp.EXPECT().GetPlanGoals(gomock.Any()).Return(nil, false).AnyTimes()
 
 			req, _ := site.loadpointRequest(lp, 8, 15*time.Minute, nil)
 
@@ -513,9 +513,13 @@ func TestApplyPlanGoal(t *testing.T) {
 		return lp, v
 	}
 
+	goalAt := func(d time.Duration, goal float64) loadpoint.PlanGoal {
+		return loadpoint.PlanGoal{Time: time.Now().Add(d), Goal: goal}
+	}
+
 	t.Run("no plan goal -> no goal (pulled by energy value instead)", func(t *testing.T) {
 		lp, _ := newLp(t)
-		lp.EXPECT().GetPlanGoal().Return(0.0, false).AnyTimes()
+		lp.EXPECT().GetPlanGoals(gomock.Any()).Return(nil, true).AnyTimes()
 
 		bat := &optimizer.BatteryConfig{SMax: 40000}
 		site.applyPlanGoal(lp, bat, minLen)
@@ -527,8 +531,7 @@ func TestApplyPlanGoal(t *testing.T) {
 	t.Run("in-horizon plan goal -> real slot, no horizon-end goal", func(t *testing.T) {
 		lp, _ := newLp(t)
 		// soc plan goal 80% -> 40000 Wh, due in ~1h1m so it lands squarely in slot 4
-		lp.EXPECT().GetPlanGoal().Return(80.0, true).AnyTimes()
-		lp.EXPECT().EffectivePlanTime().Return(time.Now().Add(time.Hour + time.Minute)).AnyTimes()
+		lp.EXPECT().GetPlanGoals(gomock.Any()).Return([]loadpoint.PlanGoal{goalAt(time.Hour+time.Minute, 80)}, true).AnyTimes()
 
 		bat := &optimizer.BatteryConfig{SMax: 10000}
 		site.applyPlanGoal(lp, bat, minLen)
@@ -539,11 +542,42 @@ func TestApplyPlanGoal(t *testing.T) {
 		assert.Equal(t, float32(40000), bat.SMax, "SMax bumped to the real goal")
 	})
 
+	t.Run("every in-horizon plan -> goal at each slot", func(t *testing.T) {
+		lp, _ := newLp(t)
+		// a nearer plan the car meets right now must still hold after a later, higher one
+		lp.EXPECT().GetPlanGoals(gomock.Any()).Return([]loadpoint.PlanGoal{
+			goalAt(time.Hour+time.Minute, 100),
+			goalAt(31*time.Minute, 60),
+			goalAt(91*time.Minute, 50),
+		}, true).AnyTimes()
+
+		bat := &optimizer.BatteryConfig{SMax: 10000}
+		site.applyPlanGoal(lp, bat, minLen)
+
+		require.Len(t, bat.SGoal, minLen)
+		assert.Equal(t, float32(30000), bat.SGoal[2])
+		assert.Equal(t, float32(50000), bat.SGoal[4])
+		assert.Equal(t, float32(25000), bat.SGoal[6])
+		assert.Equal(t, float32(50000), bat.SMax, "SMax bumped to the highest goal")
+	})
+
+	t.Run("plans in the same slot -> highest goal", func(t *testing.T) {
+		lp, _ := newLp(t)
+		lp.EXPECT().GetPlanGoals(gomock.Any()).Return([]loadpoint.PlanGoal{
+			goalAt(time.Hour+time.Minute, 80),
+			goalAt(time.Hour+2*time.Minute, 60),
+		}, true).AnyTimes()
+
+		bat := &optimizer.BatteryConfig{}
+		site.applyPlanGoal(lp, bat, minLen)
+
+		assert.Equal(t, float32(40000), bat.SGoal[4])
+	})
+
 	t.Run("plan deadline beyond horizon -> no goal", func(t *testing.T) {
 		lp, _ := newLp(t)
 		// soc plan goal 80%, but due in 24h -> slot 96 >> minLen
-		lp.EXPECT().GetPlanGoal().Return(80.0, true).AnyTimes()
-		lp.EXPECT().EffectivePlanTime().Return(time.Now().Add(24 * time.Hour)).AnyTimes()
+		lp.EXPECT().GetPlanGoals(gomock.Any()).Return([]loadpoint.PlanGoal{goalAt(24*time.Hour, 80)}, true).AnyTimes()
 
 		bat := &optimizer.BatteryConfig{SMax: 40000}
 		site.applyPlanGoal(lp, bat, minLen)
@@ -555,7 +589,7 @@ func TestApplyPlanGoal(t *testing.T) {
 	t.Run("no vehicle -> no fallback", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		lp := loadpoint.NewMockAPI(ctrl)
-		lp.EXPECT().GetPlanGoal().Return(0.0, false).AnyTimes()
+		lp.EXPECT().GetPlanGoals(gomock.Any()).Return(nil, false).AnyTimes()
 		lp.EXPECT().GetVehicle().Return(nil).AnyTimes()
 
 		bat := &optimizer.BatteryConfig{SMax: 40000}
@@ -565,20 +599,18 @@ func TestApplyPlanGoal(t *testing.T) {
 		assert.Equal(t, float32(40000), bat.SMax, "SMax untouched without a vehicle")
 	})
 
-	t.Run("energy limit without soc, no plan -> no goal", func(t *testing.T) {
+	t.Run("energy plan -> goal in Wh", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
-		v := api.NewMockVehicle(ctrl)
-		v.EXPECT().Capacity().Return(capacity).AnyTimes()
-
 		lp := loadpoint.NewMockAPI(ctrl)
-		lp.EXPECT().GetVehicle().Return(v).AnyTimes()
-		lp.EXPECT().GetPlanGoal().Return(0.0, false).AnyTimes()
+		lp.EXPECT().GetVehicle().Return(nil).AnyTimes()
+		lp.EXPECT().GetPlanGoals(gomock.Any()).Return([]loadpoint.PlanGoal{goalAt(time.Hour+time.Minute, 20)}, false).AnyTimes()
 
 		bat := &optimizer.BatteryConfig{SMax: 10000}
 		site.applyPlanGoal(lp, bat, minLen)
 
-		assert.Nil(t, bat.SGoal, "no plan, no goal")
-		assert.Equal(t, float32(10000), bat.SMax, "user energy limit preserved")
+		require.Len(t, bat.SGoal, minLen)
+		assert.Equal(t, float32(20000), bat.SGoal[4])
+		assert.Equal(t, float32(20000), bat.SMax)
 	})
 }
 

@@ -6,10 +6,12 @@ import (
 
 	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/core/keys"
+	"github.com/evcc-io/evcc/core/loadpoint"
 	"github.com/evcc-io/evcc/core/planner"
 	"github.com/evcc-io/evcc/core/soc"
 	"github.com/evcc-io/evcc/core/vehicle"
 	"github.com/evcc-io/evcc/tariff"
+	"github.com/evcc-io/evcc/util"
 )
 
 // TODO planActive is not guarded by mutex
@@ -103,6 +105,60 @@ func (lp *Loadpoint) GetPlanGoal() (float64, bool) {
 
 	_, limit := lp.getPlanEnergy()
 	return limit, false
+}
+
+// GetPlanGoals returns every plan goal due in (now, until], in % (true) or kWh (false).
+// Unlike GetPlanGoal it keeps plans the vehicle meets right now, since driving before
+// their deadline can still take it below them.
+func (lp *Loadpoint) GetPlanGoals(until time.Time) ([]loadpoint.PlanGoal, bool) {
+	lp.RLock()
+	defer lp.RUnlock()
+
+	now := lp.clock.Now()
+	inRange := func(ts time.Time) bool {
+		return ts.After(now) && !ts.After(until)
+	}
+
+	if !lp.socBasedPlanning() {
+		ts, energy := lp.getPlanEnergy()
+		if energy <= 0 || !inRange(ts) {
+			return nil, false
+		}
+		return []loadpoint.PlanGoal{{Time: ts, Goal: energy}}, false
+	}
+
+	var res []loadpoint.PlanGoal
+
+	// locked plan is past its deadline during overrun
+	if p := lp.planLocked; p.Id > 0 {
+		res = append(res, loadpoint.PlanGoal{Time: p.Time, Goal: float64(p.Soc)})
+	}
+
+	if v := lp.GetVehicle(); v != nil {
+		settings := vehicle.Settings(lp.log, v)
+
+		if ts, soc := settings.GetPlanSoc(); soc > 0 && inRange(ts) {
+			res = append(res, loadpoint.PlanGoal{Time: ts, Goal: float64(soc)})
+		}
+
+		for _, rp := range settings.GetRepeatingPlans() {
+			if !rp.Active || len(rp.Weekdays) == 0 || rp.Soc <= 0 {
+				continue
+			}
+
+			ts, err := util.GetOccurrences(rp.Weekdays, rp.Time, rp.Tz, now, until)
+			if err != nil {
+				lp.log.DEBUG.Printf("invalid repeating plan: weekdays=%v, time=%s, tz=%s, error=%v", rp.Weekdays, rp.Time, rp.Tz, err)
+				continue
+			}
+
+			for _, t := range ts {
+				res = append(res, loadpoint.PlanGoal{Time: t, Goal: float64(rp.Soc)})
+			}
+		}
+	}
+
+	return res, true
 }
 
 // GetPlan creates a charging plan for given time and duration

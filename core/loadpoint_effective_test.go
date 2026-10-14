@@ -7,6 +7,7 @@ import (
 	"github.com/benbjohnson/clock"
 	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/core/keys"
+	"github.com/evcc-io/evcc/core/loadpoint"
 	"github.com/evcc-io/evcc/server/db/settings"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/config"
@@ -213,6 +214,49 @@ func TestNextPlan(t *testing.T) {
 		require.NotNil(t, res, tc)
 		assert.Equal(t, tc.planId, res.Id)
 	}
+}
+
+func TestGetPlanGoals(t *testing.T) {
+	config.Reset()
+	t.Cleanup(config.Reset)
+
+	ctrl := gomock.NewController(t)
+	v := api.NewMockVehicle(ctrl)
+	v.EXPECT().Capacity().Return(50.0).AnyTimes()
+	v.EXPECT().Features().Return(nil).AnyTimes()
+	v.EXPECT().OnIdentified().Return(api.ActionConfig{}).AnyTimes()
+
+	const name = "vehicle"
+	require.NoError(t, config.Vehicles().Add(
+		config.NewStaticDevice(config.Named{Name: name}, api.Vehicle(v)),
+	))
+
+	loc, err := time.LoadLocation("America/Los_Angeles")
+	require.NoError(t, err)
+
+	plans := []api.RepeatingPlan{
+		{Weekdays: []int{2, 3, 4}, Time: "07:00", Tz: loc.String(), Soc: 60, Active: true},
+		{Weekdays: []int{1}, Time: "07:00", Tz: loc.String(), Soc: 100, Active: true},
+		{Weekdays: []int{5}, Time: "07:00", Tz: loc.String(), Soc: 50, Active: false},
+	}
+	require.NoError(t, settings.SetJson("vehicle."+name+"."+keys.RepeatingPlans, plans))
+
+	// Wednesday 09:00, car at 60%
+	clk := clock.NewMock()
+	clk.Set(time.Date(2026, 10, 14, 9, 0, 0, 0, loc))
+
+	lp := NewLoadpoint(util.NewLogger("foo"), nil)
+	lp.clock = clk
+	lp.vehicle = v
+	lp.vehicleSoc = 60
+
+	// the met 60% plan is still a goal: driving before Thursday can take the car below it
+	goals, socBased := lp.GetPlanGoals(clk.Now().Add(5 * 24 * time.Hour))
+	assert.True(t, socBased)
+	assert.Equal(t, []loadpoint.PlanGoal{
+		{Time: time.Date(2026, 10, 15, 7, 0, 0, 0, loc), Goal: 60},  // Thu
+		{Time: time.Date(2026, 10, 19, 7, 0, 0, 0, loc), Goal: 100}, // Mon
+	}, goals)
 }
 
 func TestPlanLocking(t *testing.T) {

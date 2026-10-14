@@ -8,6 +8,12 @@ import (
 
 //go:generate go tool mockgen -package loadpoint -destination mock.go -mock_names API=MockAPI github.com/evcc-io/evcc/core/loadpoint API
 
+// PlanGoal is a plan's target, in % or kWh, due at Time
+type PlanGoal struct {
+	Time time.Time
+	Goal float64
+}
+
 // Controller gives access to loadpoint
 type Controller interface {
 	LoadpointControl(API)
@@ -133,6 +139,8 @@ type API interface {
 	ClearPlanLock()
 	// GetPlanGoal returns the plan goal and if the goal is soc based
 	GetPlanGoal() (float64, bool)
+	// GetPlanGoals returns every plan goal due until the given time and if the goals are soc based
+	GetPlanGoals(until time.Time) ([]PlanGoal, bool)
 	// GetPlanRequiredDuration returns required duration of plan to reach the goal from current state
 	GetPlanRequiredDuration(goal, maxPower float64) time.Duration
 	// GetPlanStrategy returns the plan strategy
