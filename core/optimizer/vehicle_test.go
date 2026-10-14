@@ -4,7 +4,9 @@ package optimizer
 // test_driving_commitment.py and test_c_max_t.py.
 
 import (
+	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -399,4 +401,42 @@ func TestServeHomeFirstKeepsTheNightThroughAnEvent(t *testing.T) {
 	// everything beyond the house's need (event + night) still goes to the event
 	keep := 500 * 12 / shfEta
 	approxRel(t, (shfFullPack-1000-keep)*shfEta, sum(f(r.GridExport)[:2]), 0.01)
+}
+
+// a battery's own efficiencies override the global ones in its state equations
+func TestBatteryEfficiencyOverride(t *testing.T) {
+	run := func(etaD *float64) Result {
+		pack := shfHomePack(5000, false)
+		pack.EtaD = etaD
+		return solveOK(t, newOptimizer(t, strat("none", "discharge_before_import"), GridConfig{},
+			[]BatteryConfig{pack},
+			TimeSeriesData{Dt: repeat(3600, 2), Gt: repeat(500, 2), Ft: repeat(0, 2), PN: repeat(0.0003, 2), PE: repeat(0.00005, 2)},
+			0.9, 0.9))
+	}
+
+	global := run(nil)
+	own := run(new(0.5))
+	require.Equal(t, "Optimal", own.Status)
+	// the pack carries the house both ways; at eta_d 0.5 each delivered Wh costs 2 stored Wh
+	approx(t, 5000-1000/0.9, *global.Batteries[0].StateOfCharge[1], 1)
+	approx(t, 5000-1000/0.5, *own.Batteries[0].StateOfCharge[1], 1)
+}
+
+func TestBatteryEfficiencyParsed(t *testing.T) {
+	dec := json.NewDecoder(strings.NewReader(`{
+		"batteries": [{"s_min": 0, "s_max": 1000, "s_initial": 500, "c_min": 0, "c_max": 100, "d_max": 100, "p_a": 0,
+			"eta_c": 0.98, "eta_d": 0.95}, {"s_min": 0, "s_max": 1000, "s_initial": 500, "c_min": 0, "c_max": 100, "d_max": 100, "p_a": 0}],
+		"time_series": {"dt": [3600], "gt": [0], "ft": [0], "p_N": [0], "p_E": [0]},
+		"eta_c": 0.9, "eta_d": 0.9
+	}`))
+	dec.UseNumber()
+	var data map[string]any
+	require.NoError(t, dec.Decode(&data))
+
+	o, err := parse(data, Settings{})
+	require.NoError(t, err)
+	assert.Equal(t, 0.98, o.etaCOf(0))
+	assert.Equal(t, 0.95, o.etaDOf(0))
+	assert.Equal(t, 0.9, o.etaCOf(1), "falls back to the global value")
+	assert.Equal(t, 0.9, o.etaDOf(1))
 }

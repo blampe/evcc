@@ -111,6 +111,9 @@ type Site struct {
 
 	batterySocEstimators map[string]*soc.BatteryEstimator // per-battery soc interpolators, keyed by meter ref
 
+	batteryEfficiencyMu sync.Mutex
+	batteryEfficiency   map[string]*soc.EfficiencyLearner // per-battery efficiency learners, keyed by meter ref
+
 	// cached state
 	gridPower                float64                     // Grid power
 	pvPower                  float64                     // PV power
@@ -791,6 +794,51 @@ func (site *Site) batterySocEstimator(ref string) *soc.BatteryEstimator {
 	return e
 }
 
+// batteryEfficiencyKey is the setting persisting a battery's efficiency learner
+func batteryEfficiencyKey(ref string) string {
+	return "battery.efficiency." + ref
+}
+
+// observeBatteryEfficiency feeds a battery's raw soc and power to its efficiency
+// learner, created on first use from its persisted state.
+func (site *Site) observeBatteryEfficiency(ref string, rawSoc, power, capacity float64) {
+	site.batteryEfficiencyMu.Lock()
+	defer site.batteryEfficiencyMu.Unlock()
+
+	if site.batteryEfficiency == nil {
+		site.batteryEfficiency = make(map[string]*soc.EfficiencyLearner)
+	}
+	l, ok := site.batteryEfficiency[ref]
+	if !ok {
+		var state soc.EfficiencyState
+		_ = settings.Json(batteryEfficiencyKey(ref), &state)
+		l = soc.NewEfficiencyLearner(state)
+		site.batteryEfficiency[ref] = l
+	}
+
+	if !l.Observe(rawSoc, power) {
+		return
+	}
+	if err := settings.SetJson(batteryEfficiencyKey(ref), l.State()); err != nil {
+		site.log.ERROR.Printf("battery efficiency: %v", err)
+	}
+	if m, ok := l.Model(capacity); ok {
+		site.log.DEBUG.Printf("battery %s efficiency: charge %.3f discharge %.3f standby %.0fW", ref, m.EtaC, m.EtaD, m.Standby)
+	}
+}
+
+// batteryEfficiencyModel is a battery's learned efficiency model, false while
+// the learner has too little data.
+func (site *Site) batteryEfficiencyModel(ref string, capacity float64) (soc.EfficiencyModel, bool) {
+	site.batteryEfficiencyMu.Lock()
+	defer site.batteryEfficiencyMu.Unlock()
+
+	if l, ok := site.batteryEfficiency[ref]; ok {
+		return l.Model(capacity)
+	}
+	return soc.EfficiencyModel{}, false
+}
+
 // updateBatteryMeters updates battery meters
 func (site *Site) updateBatteryMeters() {
 	if len(site.batteryMeters) == 0 {
@@ -818,6 +866,7 @@ func (site *Site) updateBatteryMeters() {
 				rawSoc := batSoc
 				if capacity > 0 {
 					batSoc = site.batterySocEstimator(dev.Config().Name).Soc(rawSoc, mm[i].Power, capacity)
+					site.observeBatteryEfficiency(dev.Config().Name, rawSoc, mm[i].Power, capacity)
 				}
 
 				mm[i].Soc = new(batSoc)

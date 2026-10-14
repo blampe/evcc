@@ -111,6 +111,17 @@ type BatteryConfig struct {
 	PrcGoal         *float64
 	ReserveForLoad  bool
 	ServeHomeFirst  bool
+	EtaC, EtaD      *float64 // this battery's efficiencies, nil for the global ones
+}
+
+// etaCOf is battery i's charge efficiency: its own, else the global one
+func (o *Optimizer) etaCOf(i int) float64 {
+	return orDefault(o.batteries[i].EtaC, o.etaC)
+}
+
+// etaDOf is battery i's discharge efficiency: its own, else the global one
+func (o *Optimizer) etaDOf(i int) float64 {
+	return orDefault(o.batteries[i].EtaD, o.etaD)
 }
 
 // cMaxAt is c_max_at()
@@ -324,7 +335,7 @@ func (o *Optimizer) setupReserve() {
 		} else {
 			run += gt[t] - ft[t]
 		}
-		reserve[t] = run / o.etaD
+		reserve[t] = run
 	}
 
 	for i := range o.batteries {
@@ -332,7 +343,7 @@ func (o *Optimizer) setupReserve() {
 		profile := make([]float64, o.t)
 		for t := range o.t {
 			if bat.ReserveForLoad {
-				profile[t] = pyMin(bat.SCapacity, pyMax(bat.SMin, reserve[t]))
+				profile[t] = pyMin(bat.SCapacity, pyMax(bat.SMin, reserve[t]/o.etaDOf(i)))
 			} else if len(bat.CMaxT) > 0 && cMaxAt(bat, t) == 0 {
 				profile[t] = 0.0
 			} else {
@@ -595,7 +606,7 @@ func (o *Optimizer) setupTargetFunction() {
 	for i := range o.batteries {
 		if v.drive[i] != nil {
 			for t := range T {
-				iadd(&objective, affine(v.drive[i][t]).mul(o.prcGoal[i]/o.etaC))
+				iadd(&objective, affine(v.drive[i][t]).mul(o.prcGoal[i]/o.etaCOf(i)))
 			}
 		}
 	}
@@ -846,15 +857,15 @@ func (o *Optimizer) addBatteryConstraints() {
 
 		// py: s[0] == s_initial + eta_c * c[0] - (1 / eta_d) * d[0] - drive_at(0)
 		if o.t > 0 {
-			rhs := affine(v.c[i][0]).mul(o.etaC).copy().addConst(bat.SInitial, 1)
-			rhs = sub(rhs, affine(v.d[i][0]).mul(1/o.etaD))
+			rhs := affine(v.c[i][0]).mul(o.etaCOf(i)).copy().addConst(bat.SInitial, 1)
+			rhs = sub(rhs, affine(v.d[i][0]).mul(1/o.etaDOf(i)))
 			p.add(eq(affine(v.s[i][0]), minusDrive(rhs, 0)), "")
 		}
 
 		// py: s[t] == s[t - 1] + eta_c * c[t] - (1 / eta_d) * d[t] - drive_at(t)
 		for t := 1; t < o.t; t++ {
-			rhs := plus(affine(v.s[i][t-1]), affine(v.c[i][t]).mul(o.etaC))
-			rhs = sub(rhs, affine(v.d[i][t]).mul(1/o.etaD))
+			rhs := plus(affine(v.s[i][t-1]), affine(v.c[i][t]).mul(o.etaCOf(i)))
+			rhs = sub(rhs, affine(v.d[i][t]).mul(1/o.etaDOf(i)))
 			p.add(eq(affine(v.s[i][t]), minusDrive(rhs, t)), "")
 		}
 

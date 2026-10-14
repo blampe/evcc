@@ -981,6 +981,14 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 
 		cfg, detail := site.batteryRequest(dev, b, grid, minLen, firstSlotDuration)
 		batteries = append(batteries, optimizerBattery{cfg, detail})
+
+		// the pack's own standby comes out of storage, unseen by the battery meter and so
+		// missing from the home profile: the pack covers it while it has charge, PV while it
+		// charges, the grid (topping up to reserve) when it sits at the floor
+		if m, ok := site.batteryEfficiencyModel(dev.Config().Name, *b.Capacity); ok && m.Standby > 0 {
+			addStandby(&req.TimeSeries, m.Standby)
+			site.log.DEBUG.Printf("optimizer: home slots updated with %.0fW %s standby", m.Standby, dev.Config().Name)
+		}
 	}
 
 	// all batteries value leftover stored energy at pa (~the cheapest grid price). The EV is no longer
@@ -995,6 +1003,13 @@ func (site *Site) optimizerRequest(battery []types.Measurement) (optimizer.Optim
 	}
 
 	return req, details, nil
+}
+
+// addStandby adds a constant draw (W) to every home slot as energy (Wh)
+func addStandby(ts *optimizer.TimeSeries, standby float64) {
+	for t, dt := range ts.Dt {
+		ts.Gt[t] += float32(standby * float64(dt) / 3600)
+	}
 }
 
 func (site *Site) optimizerUpdate(battery []types.Measurement) error {
@@ -1610,6 +1625,12 @@ func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measureme
 		// the pack empty) before PV takes over. A pure tie break: it never trades money, so
 		// energy the house does not need still goes to the car.
 		ServeHomeFirst: site.optimizerServeHomeFirst(),
+	}
+
+	// measured efficiencies, so the plan knows what a stored Wh really delivers
+	if m, ok := site.batteryEfficiencyModel(dev.Config().Name, *b.Capacity); ok {
+		bat.EtaC = new(float32(m.EtaC))
+		bat.EtaD = new(float32(m.EtaD))
 	}
 
 	instance := dev.Instance()

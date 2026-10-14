@@ -160,6 +160,8 @@ func parse(data map[string]any, settings Settings) (*Optimizer, error) {
 			PrcGoal:         optNum(bat, "prc_goal"),
 			ReserveForLoad:  boolOr(bat, "reserve_for_load"),
 			ServeHomeFirst:  boolOr(bat, "serve_home_first"),
+			EtaC:            optNum(bat, "eta_c"),
+			EtaD:            optNum(bat, "eta_d"),
 		})
 	}
 
@@ -321,6 +323,8 @@ var (
 		"prc_goal":          {kind: kindNumber},
 		"reserve_for_load":  {kind: kindBoolean},
 		"serve_home_first":  {kind: kindBoolean},
+		"eta_c":             {kind: kindNumber},
+		"eta_d":             {kind: kindNumber},
 	}
 	timeSeriesModel = model{
 		"dt":  {kind: kindNumberList, required: true},

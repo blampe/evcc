@@ -6,6 +6,7 @@ import (
 
 	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/core/loadpoint"
+	"github.com/evcc-io/evcc/core/soc"
 	"github.com/evcc-io/evcc/core/types"
 	"github.com/evcc-io/evcc/tariff"
 	"github.com/evcc-io/evcc/util"
@@ -1549,4 +1550,55 @@ func TestBatteriesReported(t *testing.T) {
 
 	// the pack drops out after having reported: planned without it rather than blocking
 	assert.NoError(t, site.batteriesReported(pending), "a later outage does not block the optimizer")
+}
+
+// efficiencyState is the learner state of exact rows from model m for a pack of the
+// given capacity (kWh): discharge and charge runs at two powers each, 60 points per side.
+func efficiencyState(m soc.EfficiencyModel, capacity float64) soc.EfficiencyState {
+	var st soc.EfficiencyState
+	nominal := capacity * 10
+	add := func(x [3]float64, pts float64) {
+		for i := range 3 {
+			for j := range 3 {
+				st.XtX[3*i+j] += x[i] * x[j]
+			}
+			st.XtY[i] += x[i] * pts
+		}
+	}
+	for _, p := range []float64{450, 5000} {
+		h := 2.0
+		add([3]float64{p * h, 0, h}, (p*h/m.EtaD+m.Standby*h)/nominal)
+		add([3]float64{0, p * h, -h}, (p*h*m.EtaC-m.Standby*h)/nominal)
+	}
+	st.ChargePts, st.DischargePts = 60, 60
+	return st
+}
+
+func TestBatteryRequestLearnedEfficiency(t *testing.T) {
+	capacity, socV := 13.5, 50.0
+	m := types.Measurement{Capacity: &capacity, Soc: &socV}
+	dev := config.NewStaticDevice(config.Named{Name: "pw"}, api.Meter(&struct{ api.Meter }{}))
+	want := soc.EfficiencyModel{EtaC: 0.98, EtaD: 0.95, Standby: 88}
+
+	site := &Site{log: util.NewLogger("foo")}
+	req, _ := site.batteryRequest(dev, m, nil, 8, 15*time.Minute)
+	assert.Nil(t, req.EtaC, "nothing learned: global efficiency")
+	assert.Nil(t, req.EtaD)
+
+	site.batteryEfficiency = map[string]*soc.EfficiencyLearner{"pw": soc.NewEfficiencyLearner(efficiencyState(want, capacity))}
+	req, _ = site.batteryRequest(dev, m, nil, 8, 15*time.Minute)
+	require.NotNil(t, req.EtaC)
+	require.NotNil(t, req.EtaD)
+	assert.InDelta(t, 0.98, *req.EtaC, 1e-4)
+	assert.InDelta(t, 0.95, *req.EtaD, 1e-4)
+
+	got, ok := site.batteryEfficiencyModel("pw", capacity)
+	require.True(t, ok)
+	assert.InDelta(t, 88, got.Standby, 1e-3)
+}
+
+func TestAddStandby(t *testing.T) {
+	ts := optimizer.TimeSeries{Dt: []int{600, 900}, Gt: []float32{100, 200}}
+	addStandby(&ts, 88)
+	assert.InDeltaSlice(t, []float32{100 + 88.0/6, 200 + 22}, ts.Gt, 1e-3)
 }
