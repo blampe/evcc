@@ -96,6 +96,12 @@ type BatteryModeController interface {
 	SetBatteryModeSoc(BatteryMode, float64) error
 }
 
+// GridOutage optionally reports whether the site is islanded from the grid,
+// i.e. the house and any charging car run on the home battery and solar alone
+type GridOutage interface {
+	GridOutage() (bool, error)
+}
+
 // GridChargeController optionally reports whether a controllable battery may
 // charge from the grid. When AllowGridImport returns false, the optimizer models
 // the pack with charge_from_grid disabled (it may still charge from solar) and

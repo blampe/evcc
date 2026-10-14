@@ -11,6 +11,7 @@ const (
 	GreenShareLoadpoints  = "greenShareLoadpoints"
 	GridConfigured        = "gridConfigured"
 	Grid                  = "grid"
+	GridOutage            = "gridOutage"
 	HistoryUpdated        = "historyUpdated"
 	HomePower             = "homePower"
 	PrioritySoc           = "prioritySoc"

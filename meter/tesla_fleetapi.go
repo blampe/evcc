@@ -287,13 +287,32 @@ func (p *fleetAPIProvider) getLiveStatus() (*teslaclient.EnergySiteLiveStatus, e
 			return nil, fmt.Errorf("%w: %w", api.ErrMustRetry, err)
 		}
 	} else {
-		p.log.DEBUG.Printf("live status: grid=%.0fW solar=%.0fW battery=%.0fW load=%.0fW soc=%.1f%%",
-			res.GridPower, res.SolarPower, res.BatteryPower, res.LoadPower, res.PercentageCharged)
+		p.log.DEBUG.Printf("live status: grid=%.0fW solar=%.0fW battery=%.0fW load=%.0fW soc=%.1f%% grid status=%s island=%s",
+			res.GridPower, res.SolarPower, res.BatteryPower, res.LoadPower, res.PercentageCharged, res.GridStatus, res.IslandStatus)
 	}
 	return res, err
 }
 
 var _ api.Meter = (*FleetAPI)(nil)
+
+var _ api.GridOutage = (*FleetAPI)(nil)
+
+// GridOutage implements the api.GridOutage interface.
+func (m *FleetAPI) GridOutage() (bool, error) {
+	res, err := m.provider.liveStatusG()
+	if err != nil {
+		return false, err
+	}
+	return liveStatusOutage(res), nil
+}
+
+// liveStatusOutage reports whether the gateway is islanded. island_status is the
+// authoritative signal (off_grid, off_grid_intentional, off_grid_unintentional);
+// grid_status "Inactive" covers a response without it. Unknown or transitional
+// values are not an outage.
+func liveStatusOutage(res *teslaclient.EnergySiteLiveStatus) bool {
+	return strings.HasPrefix(res.IslandStatus, "off_grid") || res.GridStatus == "Inactive"
+}
 
 // CurrentPower implements the api.Meter interface.
 func (m *FleetAPI) CurrentPower() (float64, error) {

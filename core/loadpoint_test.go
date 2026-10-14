@@ -265,6 +265,70 @@ func TestOptimizerLoadpointAction(t *testing.T) {
 	}
 }
 
+func TestGridOutageCharging(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mode      api.ChargeMode
+		action    string
+		source    string
+		sitePower float64 // islanded: battery charging (<0) or discharging (>0)
+		expect    func(*api.MockCharger)
+	}{
+		{"now mode stops on battery", api.ModeNow, "", "", 2000, func(c *api.MockCharger) {
+			c.EXPECT().Enable(false).Return(nil)
+		}},
+		{"now mode tracks solar surplus", api.ModeNow, "", "", -920, func(c *api.MockCharger) {
+			c.EXPECT().MaxCurrent(int64(10)).Return(nil)
+		}},
+		{"minpv does not hold min current on battery", api.ModeMinPV, "", "", 2000, func(c *api.MockCharger) {
+			c.EXPECT().Enable(false).Return(nil)
+		}},
+		{"optimizer grid charge ignored", api.ModePV, actionCharge, sourceGrid, 2000, func(c *api.MockCharger) {
+			c.EXPECT().Enable(false).Return(nil)
+		}},
+	} {
+		t.Log(tc.name)
+
+		ctrl := gomock.NewController(t)
+		charger := api.NewMockCharger(ctrl)
+
+		lp := &Loadpoint{
+			log:          util.NewLogger("foo"),
+			bus:          evbus.New(),
+			clock:        clock.NewMock(),
+			charger:      charger,
+			chargeMeter:  &Null{},
+			chargeRater:  &Null{},
+			chargeTimer:  &Null{},
+			wakeUpTimer:  NewTimer(),
+			minCurrent:   minA,
+			maxCurrent:   maxA,
+			phases:       1,
+			status:       api.StatusC,
+			mode:         tc.mode,
+			batteryBoost: boostStart,
+		}
+		attachListeners(t, lp)
+
+		lp.enabled = true
+		lp.offeredCurrent = minA
+		lp.gridOutage = true
+		lp.optimizerAction = tc.action
+		lp.optimizerChargeSource = tc.source
+		lp.optimizerChargePower = 9600
+
+		charger.EXPECT().Status().Return(api.StatusC, nil)
+		charger.EXPECT().Enabled().Return(true, nil)
+		tc.expect(charger)
+
+		lp.Update(tc.sitePower, tc.sitePower, nil, nil, true, true, 0, nil, nil, nil)
+
+		assert.Equal(t, boostDisabled, lp.GetBatteryBoost(), "battery boost cancelled")
+
+		ctrl.Finish()
+	}
+}
+
 func TestPVHysteresis(t *testing.T) {
 	const dt = time.Minute
 	const phases = 3

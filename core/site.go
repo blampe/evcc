@@ -126,6 +126,7 @@ type Site struct {
 	batterySchedules         map[string][]batterySlot    // per-battery optimizer mode plan, for front-running export transitions
 	batterySpikeSlot         time.Time                   // 15-min slot the export spike was last (re)written for
 	batteryBoostSlot         time.Time                   // 15-min slot the car-charge reserve pin was last written for (zero = not pinned)
+	gridOutage               bool                        // site is islanded from the grid (last known, kept across read errors)
 	batteryBoostReserveSlot  time.Time                   // 15-min slot a battery boost hit the pack's reserve (latches the car stop, zero = not tripped)
 	interval                 time.Duration               // control-loop cadence (set in Run), for deriving reaction-lag margins
 	suggestionActions        map[string]string           // last notified actionable optimizer action by device key
@@ -1187,6 +1188,8 @@ func (site *Site) updateLoadpoints(rates api.Rates) float64 {
 		sum float64
 	)
 
+	outage := site.updateGridOutage()
+
 	for id, lp := range site.loadpoints {
 		if lp == nil {
 			continue
@@ -1199,6 +1202,7 @@ func (site *Site) updateLoadpoints(rates api.Rates) float64 {
 		// in PV mode unless the source is "grid" (fast charge), and always charges at
 		// the requested power outside pure PV (MinPV).
 		lp.optimizerAction, lp.optimizerChargePower, lp.optimizerChargeSource = site.loadpointOptimizerAction(id)
+		lp.gridOutage = outage
 
 		wg.Go(func() {
 			power := lp.UpdateChargePowerAndCurrents()

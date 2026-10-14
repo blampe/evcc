@@ -138,6 +138,7 @@ type Loadpoint struct {
 	optimizerAction       string    // current optimizer suggestion (charge|stop|""), set by the site each cycle
 	optimizerChargePower  float64   // optimizer's requested charge power (W) for a "charge" suggestion, set by the site each cycle
 	optimizerChargeSource string    // optimizer's charge source (surplus|grid|battery|""), set by the site each cycle
+	gridOutage            bool      // site is islanded from the grid, set by the site each cycle
 	phasesSwitched        time.Time // Phase switch timestamp
 	vehicleDetectTicker   *clock.Ticker
 	vehicleIdentifier     string
@@ -1668,6 +1669,26 @@ func (lp *Loadpoint) publishTimer(name string, delay time.Duration, action strin
 	}
 }
 
+// outageCharging charges from solar surplus only while the site is islanded.
+// Islanded, grid power is zero, so sitePower is the battery's flow: a discharging
+// pack is a deficit and the car backs off, a charging pack is surplus the car may
+// take. Battery boost and the battery buffer are bypassed so nothing deliberately
+// drains the pack into the car.
+func (lp *Loadpoint) outageCharging(sitePower, batteryPower float64) error {
+	if lp.GetBatteryBoost() != boostDisabled {
+		if err := lp.SetBatteryBoost(false); err != nil {
+			lp.log.ERROR.Printf("battery boost: %v", err)
+		}
+	}
+
+	if lp.LimitEnergyReached() || lp.LimitSocReached() {
+		return lp.disableUnlessClimater()
+	}
+
+	lp.log.DEBUG.Println("grid outage: solar surplus only")
+	return lp.setLimit(lp.pvMaxCurrent(api.ModePV, sitePower, batteryPower, false, false))
+}
+
 // boostPower returns the additional power that the loadpoint should draw from the battery
 func (lp *Loadpoint) boostPower(batteryPower float64) float64 {
 	boost := lp.GetBatteryBoost()
@@ -2363,6 +2384,11 @@ func (lp *Loadpoint) Update(sitePower, batteryPower float64, consumption, feedin
 			current = lp.effectiveMinCurrent()
 		}
 		err = lp.setLimit(current)
+
+	// grid outage: the battery is all the house has until the grid returns, so
+	// charge from solar surplus only, whatever the mode, plan or optimizer say
+	case lp.gridOutage:
+		err = lp.outageCharging(sitePower, batteryPower)
 
 	// minimum or target charging
 	case minSocNotReached || plannerActive:

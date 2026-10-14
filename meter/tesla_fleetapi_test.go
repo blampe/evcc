@@ -26,6 +26,23 @@ func TestRetryable(t *testing.T) {
 }
 
 // TestClampReserve verifies reserves in the PW3-rejected (80,100) band snap to 80.
+func TestLiveStatusOutage(t *testing.T) {
+	for _, tc := range []struct {
+		grid, island string
+		outage       bool
+	}{
+		{"Active", "on_grid", false},
+		{"", "", false},
+		{"Active", "island_status_unknown", false},
+		{"Inactive", "off_grid_unintentional", true},
+		{"Active", "off_grid_intentional", true},
+		{"Inactive", "", true},
+	} {
+		res := &teslaclient.EnergySiteLiveStatus{GridStatus: tc.grid, IslandStatus: tc.island}
+		assert.Equal(t, tc.outage, liveStatusOutage(res), "%s/%s", tc.grid, tc.island)
+	}
+}
+
 func TestClampReserve(t *testing.T) {
 	assert.Equal(t, uint64(20), clampReserve(20))
 	assert.Equal(t, uint64(80), clampReserve(80))   // boundary allowed
