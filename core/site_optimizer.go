@@ -1616,14 +1616,11 @@ func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measureme
 		// cheap, exporting only when export genuinely beats that (a VPP event, or a
 		// summer-evening delivery-EEC peak). MinSoc still floors backup. Defaults false.
 
-		// Serve home first (a secondary goal): of schedules that cost the same, prefer the
-		// one where the home battery feeds the house and the grid feeds the car. On a night
-		// at one flat price, the pack charging the car now while the house imports at dawn
-		// costs exactly what the grid charging the car while the pack carries the house
-		// does, so money cannot choose - and the car's early-charge priority (fill battery
-		// first) picks the first, leaving the house on the grid (and a grid outage finding
-		// the pack empty) before PV takes over. A pure tie break: it never trades money, so
-		// energy the house does not need still goes to the car.
+		// Serve home first (a secondary goal): the home self-consumes ahead of money. The
+		// optimizer minimizes grid import not charging the car before cost, so the pack keeps
+		// what the house needs until it can refill - a grid outage never finds it empty for
+		// want of energy sold to a VPP event or given to the car - and only the surplus goes
+		// to export or the car.
 		ServeHomeFirst: site.optimizerServeHomeFirst(),
 	}
 
