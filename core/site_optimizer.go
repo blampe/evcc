@@ -1479,10 +1479,10 @@ func (site *Site) loadpointRequest(lp loadpoint.API, minLen int, firstSlotDurati
 
 		// hold the configured minimum SoC as a floor so the plan keeps the car above it instead of
 		// coasting toward empty between trips (the optimizer otherwise only charges for forecast
-		// driving). It is a soft L1 reserve, so a car already below the floor stays feasible - clamp
-		// to the current SoC and let the reserve penalty carry the rest.
+		// driving). It is a soft L1 reserve, so a car below it stays feasible and is charged up to
+		// it as soon as it can be, like evcc's min soc fast charge.
 		if minSoc := lp.EffectiveMinSoc(); minSoc > 0 {
-			bat.SMin = min(bat.SInitial, float32(capacity*float64(minSoc)*10)) // Wh
+			bat.SMin = float32(capacity * float64(minSoc) * 10) // Wh
 		}
 	}
 

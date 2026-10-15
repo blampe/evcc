@@ -440,3 +440,24 @@ func TestBatteryEfficiencyParsed(t *testing.T) {
 	assert.Equal(t, 0.9, o.etaCOf(1), "falls back to the global value")
 	assert.Equal(t, 0.9, o.etaDOf(1))
 }
+
+// --- min soc
+
+func TestMinSocChargesTheCarUpFromTheGridFirst(t *testing.T) {
+	// no PuLP parity: serve_home_first adds an L1 home-import commitment the Python reference lacks
+	car := BatteryConfig{
+		ChargeFromGrid: true,
+		SCapacity:      60000, SMax: 60000, SInitial: 10000, SMin: 18000,
+		CMax: 7000, PA: 0.0001,
+	}
+	r := solveOK(t, newOptimizer(t, strat("none", "discharge_before_import"), GridConfig{},
+		[]BatteryConfig{car, shfHomePack(shfEnough, true)},
+		TimeSeriesData{Dt: shfDT, Gt: shfGT, Ft: shfFT, PN: shfPN, PE: shfPE}, shfEta, shfEta))
+	require.Equal(t, "Optimal", r.Status)
+
+	soc := f(r.Batteries[0].StateOfCharge)
+	approx(t, 10000+7000*shfEta, soc[0], 1)
+	assert.GreaterOrEqual(t, soc[1], 18000-1.)
+	approx(t, 0, shfHouseImport(r), 1)
+	approx(t, shfSpareWh, shfPackToOtherLoads(r), 1)
+}
