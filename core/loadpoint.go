@@ -1527,6 +1527,13 @@ func (lp *Loadpoint) minCharging() error {
 	return lp.setLimit(lp.effectiveMinCurrent())
 }
 
+// optimizerDriven reports whether the optimizer's suggestion controls charging in
+// this mode. Its result is cleared when stale, so evcc's planner takes over again
+// whenever the optimizer is not running.
+func (lp *Loadpoint) optimizerDriven(mode api.ChargeMode) bool {
+	return lp.optimizerAction != "" && (mode == api.ModePV || mode == api.ModeMinPV)
+}
+
 // optimizerChargeCurrent converts the optimizer's requested charge power (W) to a
 // charge current for the active phase count, clamped to the loadpoint's current range.
 // With no requested power it falls back to the maximum (fast charging).
@@ -2390,8 +2397,9 @@ func (lp *Loadpoint) Update(sitePower, batteryPower float64, consumption, feedin
 	case lp.gridOutage:
 		err = lp.outageCharging(sitePower, batteryPower)
 
-	// minimum or target charging
-	case minSocNotReached || plannerActive:
+	// minimum or target charging, unless the optimizer drives the car: it plans
+	// both itself, and fast-charging past it would let the home battery feed the car
+	case (minSocNotReached || plannerActive) && !lp.optimizerDriven(mode):
 		err = lp.fastCharging()
 		lp.resetPhaseTimer()
 		lp.elapsePVTimer() // let PV mode disable immediately afterwards

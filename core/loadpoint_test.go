@@ -8,6 +8,7 @@ import (
 	"github.com/benbjohnson/clock"
 	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/core/loadpoint"
+	"github.com/evcc-io/evcc/core/planner"
 	"github.com/evcc-io/evcc/core/settings"
 	"github.com/evcc-io/evcc/core/soc"
 	"github.com/evcc-io/evcc/messenger"
@@ -1073,4 +1074,83 @@ func TestNewLoadpointFromConfigDisabledVehicle(t *testing.T) {
 
 	// disabled vehicle is filtered from instances
 	require.Empty(t, config.Instances(config.Vehicles().Devices()))
+}
+
+// TestOptimizerOwnsForcedCharging covers evcc's planner and min soc forcing a fast
+// charge: while the optimizer drives the car, it plans the goal and the min soc
+// itself and neither may fast-charge past it. Without a suggestion they are the
+// fallback.
+func TestOptimizerOwnsForcedCharging(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		minSoc bool // car below min soc instead of an active plan
+		action string
+		source string
+		expect func(*api.MockCharger)
+	}{
+		{"no optimizer: planner fast-charges", false, "", "", func(c *api.MockCharger) {
+			c.EXPECT().MaxCurrent(int64(maxA)).Return(nil)
+		}},
+		{"optimizer stop wins over plan", false, actionStop, "", func(c *api.MockCharger) {
+			c.EXPECT().Enable(false).Return(nil)
+		}},
+		{"optimizer charge power wins over plan", false, actionCharge, sourceGrid, func(c *api.MockCharger) {
+			c.EXPECT().MaxCurrent(int64(12)).Return(nil)
+		}},
+		{"no optimizer: min soc fast-charges", true, "", "", func(c *api.MockCharger) {
+			c.EXPECT().MaxCurrent(int64(maxA)).Return(nil)
+		}},
+		{"optimizer charge power wins over min soc", true, actionCharge, sourceGrid, func(c *api.MockCharger) {
+			c.EXPECT().MaxCurrent(int64(12)).Return(nil)
+		}},
+	} {
+		t.Log(tc.name)
+
+		ctrl := gomock.NewController(t)
+		charger := api.NewMockCharger(ctrl)
+		clck := clock.NewMock()
+		clck.Set(time.Now()) // the planner reads the wall clock
+
+		lp := &Loadpoint{
+			log:         util.NewLogger("foo"),
+			bus:         evbus.New(),
+			clock:       clck,
+			charger:     charger,
+			chargeMeter: &Null{},
+			chargeRater: &Null{},
+			chargeTimer: &Null{},
+			wakeUpTimer: NewTimer(),
+			planner:     planner.New(util.NewLogger("foo"), nil),
+			minCurrent:  minA,
+			maxCurrent:  maxA,
+			phases:      1,
+			status:      api.StatusC,
+			mode:        api.ModePV,
+		}
+		attachListeners(t, lp)
+
+		if tc.minSoc {
+			lp.minSoc = 30
+			lp.vehicleSoc = 20
+		} else {
+			// more energy than fits before the deadline: the plan is active now
+			lp.planTime = clck.Now().Add(time.Hour)
+			lp.planEnergy = 20
+		}
+
+		lp.enabled = true
+		lp.offeredCurrent = minA
+		lp.optimizerAction = tc.action
+		lp.optimizerChargeSource = tc.source
+		lp.optimizerChargePower = 2760
+
+		charger.EXPECT().Status().Return(api.StatusC, nil)
+		charger.EXPECT().Enabled().Return(true, nil)
+		tc.expect(charger)
+
+		lp.Update(0, 0, nil, nil, false, false, 0, nil, nil, nil)
+		assert.Equal(t, !tc.minSoc, lp.planActive, "plan stays active for the UI")
+
+		ctrl.Finish()
+	}
 }
