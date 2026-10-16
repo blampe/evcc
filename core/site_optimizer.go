@@ -494,8 +494,82 @@ func (site *Site) batteryBoostReserveReached(requestedPower, actualPower float64
 		// logged once per slot (set only on the first trip), not every cycle
 		site.log.DEBUG.Printf("optimizer: battery boost reached reserve (soc %.0f%%, grid %.0fW) - stopping car to avoid grid import", soc, site.gridPower)
 		site.batteryBoostReserveSlot = slot
+
+		// the plan expected the boost to continue; re-plan from where it stopped
+		site.requestReplan("battery boost reached reserve")
 	}
 	return tripped
+}
+
+// replanner re-plans when execution deviates from the optimizer's plan
+type replanner interface {
+	requestReplan(reason string) bool
+}
+
+var _ replanner = (*Site)(nil)
+
+// requestReplan re-runs the optimizer because execution deviated from the plan,
+// at most once per slot and reason: a deviation that persists can't be planned
+// away within the slot, and the next slot re-plans anyway. It reports whether a
+// run was requested.
+func (site *Site) requestReplan(reason string) bool {
+	slot := time.Now().Truncate(tariff.SlotDuration)
+
+	site.Lock()
+	if site.replanSlots == nil {
+		site.replanSlots = make(map[string]time.Time)
+	}
+	if site.replanSlots[reason].Equal(slot) {
+		site.Unlock()
+		return false
+	}
+	site.replanSlots[reason] = slot
+	site.Unlock()
+
+	site.log.DEBUG.Printf("optimizer: re-plan, %s", reason)
+	go site.optimizerUpdateAsync(0)
+
+	return true
+}
+
+// planSocTolerance is how far (SoC points) a battery may stray outside its
+// planned slot trajectory before execution counts as deviating: the resolution
+// most batteries report SoC at.
+const planSocTolerance = 1.0
+
+// socOffPlan reports whether soc (percent) lies outside the slot's planned
+// trajectory, between its start and end SoC, by more than planSocTolerance.
+func socOffPlan(slot batterySlot, soc float64) bool {
+	if soc <= 0 || slot.soc <= 0 || slot.startSoc <= 0 {
+		return false
+	}
+	lo, hi := min(slot.startSoc, slot.soc), max(slot.startSoc, slot.soc)
+	return soc < lo-planSocTolerance || soc > hi+planSocTolerance
+}
+
+// checkBatteryPlan re-plans when a home battery's soc has left its planned
+// trajectory for the current slot, e.g. a car drew the pack below the plan's
+// target or the pack did not discharge as planned.
+func (site *Site) checkBatteryPlan(now time.Time) {
+	site.RLock()
+	schedules := site.batterySchedules
+	site.RUnlock()
+
+	for _, dev := range site.batteryMeters {
+		if dev == nil {
+			continue
+		}
+		name := dev.Config().Name
+		plan := schedules[batteryKey(name)]
+		i := slices.IndexFunc(plan, func(s batterySlot) bool { return s.until.After(now) })
+		if i < 0 {
+			continue
+		}
+		if soc := site.batteryDeviceSoc(name); socOffPlan(plan[i], soc) &&
+			site.requestReplan(fmt.Sprintf("battery %s off plan", name)) {
+			site.log.DEBUG.Printf("optimizer: battery %s soc %.1f%% outside planned %.1f%%..%.1f%%", name, soc, plan[i].startSoc, plan[i].soc)
+		}
+	}
 }
 
 // publishSuggestions publishes the loadpoints' suggestions
@@ -661,6 +735,8 @@ type batterySlot struct {
 	until  time.Time
 	action string
 	soc    float64 // optimizer's planned end-of-slot SoC (percent), 0 if unknown
+
+	startSoc float64 // planned SoC (percent) at the slot's start, 0 if unknown
 }
 
 // currentBatterySlot resolves the plan slot in effect at `now` for a battery at
@@ -1408,7 +1484,11 @@ func batteryModePlan(detail batteryDetail, batReq optimizer.BatteryConfig, batRe
 		slotHours := (time.Duration(dt[j]) * time.Second).Hours()
 		action := currentSlotSuggestion(detail, batRes, j, importing, exporting, noGridImport, slotHours).Action
 		until := firstBoundary.Add(time.Duration(j) * tariff.SlotDuration)
-		plan = append(plan, batterySlot{until: until, action: action, soc: slotSocPercent(batReq, batRes, j)})
+		startSoc := slotSocPercent(batReq, batRes, j-1)
+		if j == 0 && batReq.SCapacity > 0 {
+			startSoc = float64(batReq.SInitial) / float64(batReq.SCapacity) * 100
+		}
+		plan = append(plan, batterySlot{until: until, action: action, soc: slotSocPercent(batReq, batRes, j), startSoc: startSoc})
 	}
 
 	// Bridge a within-peak lull: a HOLD slot that opens onto an export slot is a

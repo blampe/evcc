@@ -136,6 +136,7 @@ type Site struct {
 
 	optimizerMu      sync.Mutex                  // guards optimizer runs
 	optimizerUpdated time.Time                   // last optimizer run, guarded by optimizerMu
+	replanSlots      map[string]time.Time        // per deviation reason, the slot it last forced a re-plan in
 	forecasts        map[string]forecastEntry    // cached hybrid forecasts by collector ref, refit daily under optimizerMu
 	consumption      map[string]consumptionEntry // cached vehicle driving forecasts by loadpoint title, refit daily under optimizerMu
 	batteriesSeen    map[string]bool             // battery meters that have reported a soc since startup, under optimizerMu
@@ -1431,6 +1432,8 @@ func (site *Site) update(lp updater) {
 
 	// re-evaluate against the updated loadpoint state
 	site.publishSuggestions()
+
+	site.checkBatteryPlan(time.Now())
 
 	site.stats.Update(site)
 }

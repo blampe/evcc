@@ -815,6 +815,7 @@ func TestBatteryBoostReserveGate(t *testing.T) {
 	action, _, source = site.loadpointOptimizerAction(0)
 	assert.Equal(t, actionStop, action, "at reserve: boost stops")
 	assert.Equal(t, sourceBattery, source, "source stays battery so the pack holds at the reserve")
+	assert.Contains(t, site.replanSlots, "battery boost reached reserve", "the stopped boost re-plans")
 
 	// pack still above reserve but the boost's draw is already spilling to the grid
 	// (the pack stopped discharging early) => real-time stop
@@ -1775,4 +1776,87 @@ func TestOptimizerDue(t *testing.T) {
 			assert.Equal(t, tc.due, optimizerDue(tc.last, tc.now, tc.minAge))
 		})
 	}
+}
+
+func TestSocOffPlan(t *testing.T) {
+	discharge := batterySlot{startSoc: 16, soc: 14}
+	charge := batterySlot{startSoc: 40, soc: 45}
+
+	for _, tc := range []struct {
+		name string
+		slot batterySlot
+		soc  float64
+		off  bool
+	}{
+		{"on the planned drain", discharge, 15, false},
+		{"within tolerance below target", discharge, 13.2, false},
+		{"car drew the pack past the target", discharge, 12.7, true},
+		{"pack did not discharge", discharge, 17.5, true},
+		{"charging on plan", charge, 43, false},
+		{"charging ahead of plan", charge, 46.5, true},
+		{"unknown soc", discharge, 0, false},
+		{"no planned start", batterySlot{soc: 14}, 10, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.off, socOffPlan(tc.slot, tc.soc))
+		})
+	}
+}
+
+func TestRequestReplanOncePerSlot(t *testing.T) {
+	site := &Site{log: util.NewLogger("foo")}
+
+	assert.True(t, site.requestReplan("battery boost reached reserve"))
+	assert.False(t, site.requestReplan("battery boost reached reserve"), "latched for the slot")
+	assert.True(t, site.requestReplan("loadpoint Home control failed"), "other reasons re-plan independently")
+
+	// a deviation in a later slot re-plans again
+	site.replanSlots["battery boost reached reserve"] = time.Now().Truncate(tariff.SlotDuration).Add(-tariff.SlotDuration)
+	assert.True(t, site.requestReplan("battery boost reached reserve"))
+}
+
+func TestCheckBatteryPlan(t *testing.T) {
+	now := time.Now()
+	newSite := func(soc float64) *Site {
+		s := &Site{
+			log: util.NewLogger("foo"),
+			batteryMeters: []config.Device[api.Meter]{
+				config.NewStaticDevice(config.Named{Name: "home"}, api.Meter(&recordingBatteryController{})),
+			},
+			batterySchedules: map[string][]batterySlot{
+				batteryKey("home"): {
+					{until: now.Add(-time.Minute), action: "normal", startSoc: 20, soc: 16},
+					{until: now.Add(time.Minute), action: "normal", startSoc: 16, soc: 14},
+				},
+			},
+		}
+		s.battery.Devices = []types.Measurement{{Name: "home", Soc: &soc}}
+		return s
+	}
+
+	site := newSite(15)
+	site.checkBatteryPlan(now)
+	assert.Empty(t, site.replanSlots, "on plan: no re-plan")
+
+	site = newSite(12.7)
+	site.checkBatteryPlan(now)
+	assert.Contains(t, site.replanSlots, "battery home off plan", "past the slot's target: re-plan")
+}
+
+func TestBatteryModePlanStartSoc(t *testing.T) {
+	req := optimizer.BatteryConfig{SCapacity: 10000, SInitial: 2000}
+	batRes := optimizer.BatteryResult{
+		ChargingPower:    []float32{0, 0},
+		DischargingPower: []float32{100, 200},
+		StateOfCharge:    []float32{1900, 1700},
+	}
+	res := optimizer.OptimizationResult{GridImport: []float32{0, 0}, GridExport: []float32{0, 0}}
+	boundary := time.Now().Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+
+	plan := batteryModePlan(batteryDetail{Type: batteryTypeBattery}, req, batRes, res, []int{600, 900}, boundary, false)
+	require.Len(t, plan, 2)
+	assert.InDelta(t, 20, plan[0].startSoc, 1e-6, "first slot starts at the request's soc")
+	assert.InDelta(t, 19, plan[0].soc, 1e-6)
+	assert.InDelta(t, 19, plan[1].startSoc, 1e-6, "later slots start where the previous one ended")
+	assert.InDelta(t, 17, plan[1].soc, 1e-6)
 }

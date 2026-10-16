@@ -2511,5 +2511,10 @@ func (lp *Loadpoint) Update(sitePower, batteryPower float64, consumption, feedin
 	// log any error
 	if err != nil {
 		lp.log.ERROR.Println(err)
+
+		// the charger did not follow the optimizer's plan, re-plan from its actual state
+		if r, ok := lp.site.(replanner); ok && lp.optimizerDriven(mode) {
+			r.requestReplan(fmt.Sprintf("loadpoint %q control failed", lp.GetTitle()))
+		}
 	}
 }

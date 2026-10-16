@@ -1,6 +1,7 @@
 package core
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -10,6 +11,7 @@ import (
 	"github.com/evcc-io/evcc/core/loadpoint"
 	"github.com/evcc-io/evcc/core/planner"
 	"github.com/evcc-io/evcc/core/settings"
+	"github.com/evcc-io/evcc/core/site"
 	"github.com/evcc-io/evcc/core/soc"
 	"github.com/evcc-io/evcc/messenger"
 	"github.com/evcc-io/evcc/util"
@@ -1152,5 +1154,75 @@ func TestOptimizerOwnsForcedCharging(t *testing.T) {
 		assert.Equal(t, !tc.minSoc, lp.planActive, "plan stays active for the UI")
 
 		ctrl.Finish()
+	}
+}
+
+// replanRecorder is a site that records the re-plans a loadpoint requests
+type replanRecorder struct {
+	site.API
+	reasons []string
+}
+
+func (r *replanRecorder) requestReplan(reason string) bool {
+	r.reasons = append(r.reasons, reason)
+	return true
+}
+
+// TestOptimizerReplanOnChargerFailure re-plans when the charger fails to follow
+// the optimizer's action, and only then.
+func TestOptimizerReplanOnChargerFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		action string
+		err    error
+		replan bool
+	}{
+		{"optimizer charge, charger fails", actionCharge, errors.New("ack timeout"), true},
+		{"optimizer charge, charger follows", actionCharge, nil, false},
+		{"no optimizer, charger fails", "", errors.New("ack timeout"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			charger := api.NewMockCharger(ctrl)
+			rec := &replanRecorder{}
+
+			lp := &Loadpoint{
+				log:         util.NewLogger("foo"),
+				bus:         evbus.New(),
+				clock:       clock.NewMock(),
+				charger:     charger,
+				chargeMeter: &Null{},
+				chargeRater: &Null{},
+				chargeTimer: &Null{},
+				wakeUpTimer: NewTimer(),
+				minCurrent:  minA,
+				maxCurrent:  maxA,
+				phases:      1,
+				status:      api.StatusB,
+				mode:        api.ModeNow,
+			}
+			if tc.action != "" {
+				lp.mode = api.ModePV
+			}
+			attachListeners(t, lp)
+			lp.site = rec
+
+			lp.optimizerAction = tc.action
+			lp.optimizerChargeSource = sourceGrid
+			lp.optimizerChargePower = 2760
+
+			charger.EXPECT().Status().Return(api.StatusB, nil)
+			charger.EXPECT().Enabled().Return(false, nil)
+			charger.EXPECT().MaxCurrent(gomock.Any()).Return(nil).AnyTimes()
+			charger.EXPECT().Enable(true).Return(tc.err)
+
+			lp.Update(0, 0, nil, nil, false, false, 0, nil, nil, nil)
+
+			if tc.replan {
+				assert.Equal(t, []string{`loadpoint "" control failed`}, rec.reasons)
+			} else {
+				assert.Empty(t, rec.reasons)
+			}
+		})
 	}
 }
