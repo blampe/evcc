@@ -63,6 +63,7 @@ func (lp *Loadpoint) createSession() {
 
 	// energy
 	lp.energyMetrics.Reset()
+	lp.integratedEnergy = 0
 	lp.energyMetrics.Publish("session", lp)
 	lp.publish(keys.ChargedEnergy, lp.GetChargedEnergy())
 }

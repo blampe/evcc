@@ -1226,3 +1226,43 @@ func TestOptimizerReplanOnChargerFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestIntegrateChargePower(t *testing.T) {
+	lp := NewLoadpoint(util.NewLogger("foo"), nil)
+	start := time.Now()
+
+	lp.integrateChargePower(4800, start)
+	assert.Zero(t, lp.integratedEnergy, "the first sample has no interval yet")
+
+	lp.integrateChargePower(9600, start.Add(90*time.Second))
+	assert.InDelta(t, 120, lp.integratedEnergy, 1e-6, "90s at the previous sample's 4.8kW")
+
+	lp.integrateChargePower(0, start.Add(180*time.Second))
+	assert.InDelta(t, 360, lp.integratedEnergy, 1e-6, "plus 90s at 9.6kW")
+
+	lp.integrateChargePower(0, start.Add(270*time.Second))
+	assert.InDelta(t, 360, lp.integratedEnergy, 1e-6, "nothing while stopped")
+}
+
+// TestSocEstimatorEnergy keeps the soc estimate moving while the charger's
+// session energy lags: the car charged 0.83kWh by measured power while the
+// charger still reports nothing, and the vehicle's soc is stale.
+func TestSocEstimatorEnergy(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	v := api.NewMockVehicle(ctrl)
+	v.EXPECT().Capacity().Return(70.5).AnyTimes()
+
+	lp := NewLoadpoint(util.NewLogger("foo"), nil)
+	assert.Zero(t, lp.socEstimatorEnergy())
+
+	estimator := soc.NewEstimator(util.NewLogger("foo"), v)
+	stale := 46.0
+	assert.Equal(t, 46.0, estimator.Soc(&stale, lp.socEstimatorEnergy()))
+
+	lp.integratedEnergy = 829.4 // one soc point at the default 85% efficiency
+	assert.Equal(t, 829.4, lp.socEstimatorEnergy(), "measured power is ahead of the charger's energy")
+	assert.InDelta(t, 47, estimator.Soc(&stale, lp.socEstimatorEnergy()), 0.01)
+
+	lp.energyMetrics.Update(2)
+	assert.Equal(t, 2000.0, lp.socEstimatorEnergy(), "the charger's energy wins once it is ahead")
+}

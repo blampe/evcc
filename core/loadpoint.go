@@ -126,12 +126,17 @@ type Loadpoint struct {
 	batteryBoost             int      // battery boost state
 	batteryBoostLimit        int      // battery boost soc limit (0-100, 100=disabled)
 
-	mode                  api.ChargeMode
-	enabled               bool      // Charger enabled state
-	phases                int       // Charger enabled phases, guarded by mutex
-	measuredPhases        int       // Charger physically measured phases
-	offeredCurrent        float64   // Charger current limit
-	socUpdated            time.Time // Soc updated timestamp (poll: connected)
+	mode           api.ChargeMode
+	enabled        bool      // Charger enabled state
+	phases         int       // Charger enabled phases, guarded by mutex
+	measuredPhases int       // Charger physically measured phases
+	offeredCurrent float64   // Charger current limit
+	socUpdated     time.Time // Soc updated timestamp (poll: connected)
+
+	// session energy integrated from measured charge power, see integrateChargePower
+	integratedEnergy      float64   // Wh
+	integratedPower       float64   // W, last sample
+	integratedAt          time.Time // last sample
 	startupSocPolled      bool      // Soc polled once at startup, even while disconnected
 	vehicleDetect         time.Time // Vehicle connected timestamp
 	chargerSwitched       time.Time // Charger enabled/disabled timestamp
@@ -1881,6 +1886,7 @@ func (lp *Loadpoint) UpdateChargePowerAndCurrents() float64 {
 	if err == nil {
 		lp.Lock()
 		lp.chargePower = power // update value if no error
+		lp.integrateChargePower(power, lp.clock.Now())
 		lp.Unlock()
 
 		lp.log.DEBUG.Printf("charge power: %.0fW", power)
@@ -1994,6 +2000,26 @@ func (lp *Loadpoint) updateChargeVoltages() {
 		lp.log.DEBUG.Printf("detected connected phases: %dp", phases)
 		lp.SetPhases(phases)
 	}
+}
+
+// integrateChargePower adds the energy drawn since the last sample, at the last
+// sample's power, to the integrated session energy. Must be called under lock.
+func (lp *Loadpoint) integrateChargePower(power float64, now time.Time) {
+	if !lp.integratedAt.IsZero() && now.After(lp.integratedAt) {
+		lp.integratedEnergy += max(0, lp.integratedPower) * now.Sub(lp.integratedAt).Hours()
+	}
+	lp.integratedPower, lp.integratedAt = power, now
+}
+
+// socEstimatorEnergy returns the session energy (Wh) the soc estimator works
+// from: the charge rater's, or the energy integrated from measured charge power
+// where that is ahead. Some chargers report session energy late or restart it
+// with each of their own sessions, which would freeze the estimate while the
+// car charges and the vehicle's soc is stale.
+func (lp *Loadpoint) socEstimatorEnergy() float64 {
+	lp.RLock()
+	defer lp.RUnlock()
+	return max(lp.getChargedEnergy(), lp.integratedEnergy)
 }
 
 // publish charged energy and duration
@@ -2147,7 +2173,7 @@ func (lp *Loadpoint) publishSocAndRange() {
 		if socEstimator == nil {
 			lp.vehicleSoc = *socR
 		} else {
-			lp.vehicleSoc = socEstimator.Soc(socR, lp.GetChargedEnergy())
+			lp.vehicleSoc = socEstimator.Soc(socR, lp.socEstimatorEnergy())
 			lp.log.DEBUG.Printf("vehicle soc (estimator): %.0f%%", lp.vehicleSoc)
 		}
 	}
