@@ -60,6 +60,12 @@ func TestNormalReserve(t *testing.T) {
 	assert.Equal(t, uint64(50), normalReserve(20, 50), "boost -> plan target above MinSoc")
 	assert.Equal(t, uint64(20), normalReserve(20, 10), "boost target below MinSoc -> floored at MinSoc")
 	assert.Equal(t, uint64(80), normalReserve(20, 90), "boost target in the PW3-rejected band -> 80")
+
+	// a pinned target between whole percents rounds up, so the car can't take the
+	// pack below the plan (a 13.6% target pinned at 13% let the pack drop to 13.5%)
+	assert.Equal(t, uint64(14), normalReserve(10, 13.6), "fractional target rounds up")
+	assert.Equal(t, uint64(15), normalReserve(10, 14.3), "fractional target rounds up")
+	assert.Equal(t, uint64(14), normalReserve(10, 14.0000001), "float noise on a whole percent stays")
 }
 
 // TestSpikeTariff verifies the discharge tariff bumps the real SELL price (only)

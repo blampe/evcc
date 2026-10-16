@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"net/http"
 	"reflect"
 	"slices"
@@ -886,12 +887,20 @@ func onOff(b bool) string {
 // normalReserve is the self_consumption reserve: MinSoc normally, or the battery-
 // plan's target SoC (never below MinSoc) when the optimizer has a car charging
 // and passes targetSoc > 0, so the pack follows the plan instead of feeding the
-// car down to MinSoc.
+// car down to MinSoc. The pack serves the car first until it reaches the
+// reserve, so the target is rounded up to the whole percent the PW3 accepts:
+// rounding down would let the car take up to a point the plan left for the house.
 func normalReserve(minSoc, targetSoc float64) uint64 {
 	if targetSoc > 0 {
-		return clampReserve(max(targetSoc, minSoc))
+		return clampReserve(max(ceilPercent(targetSoc), minSoc))
 	}
 	return clampReserve(minSoc)
+}
+
+// ceilPercent rounds a SoC up to a whole percent, ignoring float noise in a
+// target that is a whole percent already.
+func ceilPercent(soc float64) float64 {
+	return math.Ceil(soc - 1e-3)
 }
 
 // newBatteryController returns a BatteryController func that applies the mode
