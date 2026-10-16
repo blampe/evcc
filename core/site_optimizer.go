@@ -283,12 +283,43 @@ func loadpointCurrentAction(lp *Loadpoint) string {
 	return actionStop
 }
 
-// setSuggestions replaces the suggestions applied on each publish
+// suggestionSlot is one slot of a device's suggestion plan: the suggestion that
+// applies until `until`, the slot's end. A zero `until` never expires.
+type suggestionSlot struct {
+	until      time.Time
+	suggestion types.Suggestion
+}
+
+// currentSuggestion resolves the plan slot in effect at `now`. Resolving by end
+// time keeps a short first slot (a run seconds before a boundary) from governing
+// the following slot, and an exhausted plan yields no suggestion instead of a
+// stale one.
+func currentSuggestion(plan []suggestionSlot, now time.Time) (types.Suggestion, bool) {
+	i := slices.IndexFunc(plan, func(s suggestionSlot) bool { return s.until.IsZero() || s.until.After(now) })
+	if i < 0 || plan[i].suggestion.Action == "" {
+		return types.Suggestion{}, false
+	}
+	return plan[i].suggestion, true
+}
+
+// setSuggestions replaces the suggestions with fixed ones that never expire
 func (site *Site) setSuggestions(suggestions map[string]types.Suggestion) {
+	var plans map[string][]suggestionSlot
+	if suggestions != nil {
+		plans = make(map[string][]suggestionSlot, len(suggestions))
+		for key, s := range suggestions {
+			plans[key] = []suggestionSlot{{suggestion: s}}
+		}
+	}
+	site.setSuggestionPlans(plans)
+}
+
+// setSuggestionPlans replaces the per-slot suggestion plans applied on each publish
+func (site *Site) setSuggestionPlans(plans map[string][]suggestionSlot) {
 	site.Lock()
 	defer site.Unlock()
 
-	site.suggestions = suggestions
+	site.suggestions = plans
 }
 
 // suggestionComputedAt returns when the current suggestions' input snapshot was
@@ -304,9 +335,10 @@ func (site *Site) suggestionComputedAt() time.Time {
 // action since that changes between optimizer runs.
 func (site *Site) suggestion(key, currentAction string) *types.Suggestion {
 	site.RLock()
-	s, ok := site.suggestions[key]
+	plan := site.suggestions[key]
 	site.RUnlock()
 
+	s, ok := currentSuggestion(plan, time.Now())
 	if !ok {
 		return nil
 	}
@@ -1201,28 +1233,14 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 		lo.Min(req.TimeSeries.PN)*1000, lo.Max(req.TimeSeries.PN)*1000,
 		lo.Min(req.TimeSeries.PE)*1000, lo.Max(req.TimeSeries.PE)*1000)
 
-	// aggregate home-battery discharge in the current slot. If the pack is
-	// discharging while the car charges (and nothing is imported or exported), the
-	// car is being fed from the battery, not from real-time PV surplus - so PV
-	// mode must charge at the planned power instead of deferring to measured export.
-	var homeDischargeNow float64
-	for i, detail := range details {
-		if detail.Type != batteryTypeBattery {
-			continue
-		}
-		if d := res.Batteries[i].DischargingPower; len(d) > 0 {
-			homeDischargeNow += float64(d[0]) / slotHours
-		}
-	}
-	batteryDischarging := homeDischargeNow > suggestionThreshold
-
-	// first slot boundary; battery-mode plan slots are keyed by their end time so
-	// the control loop can front-run an export-mode transition near the boundary
-	// regardless of when the optimizer last ran.
-	firstBoundary := time.Now().Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+	// battery-mode and suggestion plan slots are keyed by their end time, so the
+	// control loop applies the slot in effect regardless of when the optimizer last
+	// ran. Derived from the request's first slot rather than the clock after the
+	// solve, which may already have crossed into the next slot.
+	firstBoundary := planFirstBoundary(computedAt, dt)
 
 	var batteries []batteryResult
-	suggestions := make(map[string]types.Suggestion, len(req.Batteries))
+	plans := make(map[string][]suggestionSlot, len(req.Batteries))
 	schedules := make(map[string][]batterySlot)
 
 	for i, batReq := range req.Batteries {
@@ -1245,21 +1263,7 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 			continue
 		}
 
-		// A car pinned at its own minimum charge power is not grid-fed just because
-		// that minimum outran the surplus (see chosenImportAt). The home battery keeps
-		// the raw reading: its reserve, not this flag, is what bounds its discharge.
-		importing := gridImporting
-		if importing && detail.Type != batteryTypeBattery {
-			importing = chosenImportAt(req, res, 0) > suggestionThreshold
-		}
-
-		// current-slot advisory, for the UI and notifications
-		if s := currentSlotSuggestion(detail, batRes, 0, importing, gridExporting, noGridImport, slotHours); s.Action != "" {
-			if detail.Type == batteryTypeVehicle && s.Action == actionCharge {
-				s.Source = evChargeSource(s.Source, batteryDischarging, gridExporting)
-			}
-			suggestions[key] = s
-		}
+		plans[key] = suggestionPlan(i, req, res, details, firstBoundary, noGridImport)
 
 		// battery-mode plan (slot end + action) so the control loop front-runs
 		// export-mode transitions independent of the optimizer cadence. Home
@@ -1274,11 +1278,13 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 	// log the current-slot suggestions so it's visible what the optimizer wants
 	site.log.DEBUG.Printf("optimizer suggestions: gridImport=%t (chosen %.0fW of %.0fW) gridExport=%t",
 		gridImporting, chosenImportAt(req, res, 0), float64(gridImportAt(res, 0))/slotHours, gridExporting)
-	for key, s := range suggestions {
-		site.log.DEBUG.Printf("optimizer %q: %s (charge %.0fW discharge %.0fW)", key, s.Action, s.Charge, s.Discharge)
+	for key, plan := range plans {
+		if s, ok := currentSuggestion(plan, computedAt); ok {
+			site.log.DEBUG.Printf("optimizer %q: %s (charge %.0fW discharge %.0fW)", key, s.Action, s.Charge, s.Discharge)
+		}
 	}
 
-	site.setSuggestions(suggestions)
+	site.setSuggestionPlans(plans)
 	site.Lock()
 	site.suggestionsComputedAt = computedAt
 	site.Unlock()
@@ -1307,6 +1313,76 @@ func (site *Site) applyOptimizerResult(req optimizer.OptimizationInput, details 
 	for _, ev := range site.diffSuggestions(site.pendingSuggestions(details)) {
 		site.pushEvent(ev)
 	}
+}
+
+// planFirstBoundary returns the end of the request's first slot, which starts
+// at computedAt and lasts dt[0] seconds (a full slot when computedAt sits on a
+// boundary, see timeSteps).
+func planFirstBoundary(computedAt time.Time, dt []int) time.Time {
+	if len(dt) == 0 {
+		return computedAt.Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+	}
+	return computedAt.Add(time.Duration(dt[0]) * time.Second).Round(tariff.SlotDuration)
+}
+
+// suggestionPlan builds device i's per-slot suggestions for the first
+// frontRunScheduleSlots slots of the result. Slot j ends at
+// firstBoundary+j·slot. A slot without an action is kept so it resolves to no
+// suggestion rather than falling through to a later slot.
+func suggestionPlan(i int, req optimizer.OptimizationInput, res optimizer.OptimizationResult, details []batteryDetail, firstBoundary time.Time, noGridImport bool) []suggestionSlot {
+	if i < 0 || i >= len(res.Batteries) || i >= len(details) {
+		return nil
+	}
+	detail := details[i]
+	batRes := res.Batteries[i]
+	dt := req.TimeSeries.Dt
+
+	n := min(len(batRes.ChargingPower), len(dt), frontRunScheduleSlots)
+	plan := make([]suggestionSlot, 0, n)
+	for j := range n {
+		slotHours := (time.Duration(dt[j]) * time.Second).Hours()
+		exporting := len(res.GridExport) > j && res.GridExport[j] > 0
+
+		// A car pinned at its own minimum charge power is not grid-fed just because
+		// that minimum outran the surplus (see chosenImportAt). The home battery keeps
+		// the raw reading: its reserve, not this flag, is what bounds its discharge.
+		importing := gridImportAt(res, j) > 0
+		if importing && detail.Type != batteryTypeBattery {
+			importing = chosenImportAt(req, res, j) > suggestionThreshold
+		}
+
+		s := currentSlotSuggestion(detail, batRes, j, importing, exporting, noGridImport, slotHours)
+		if detail.Type == batteryTypeVehicle && s.Action == actionCharge {
+			s.Source = evChargeSource(s.Source, homeDischargeAt(res, details, j, slotHours) > suggestionThreshold, exporting)
+		}
+
+		plan = append(plan, suggestionSlot{
+			until:      firstBoundary.Add(time.Duration(j) * tariff.SlotDuration),
+			suggestion: s,
+		})
+	}
+	return plan
+}
+
+// homeDischargeAt returns the home batteries' aggregate discharge in slot j (W).
+// If the pack is discharging while the car charges (and nothing is imported or
+// exported), the car is being fed from the battery, not from real-time PV
+// surplus, so PV mode must charge at the planned power instead of deferring to
+// measured export.
+func homeDischargeAt(res optimizer.OptimizationResult, details []batteryDetail, j int, slotHours float64) float64 {
+	if slotHours <= 0 {
+		return 0
+	}
+	var sum float64
+	for i, detail := range details {
+		if detail.Type != batteryTypeBattery || i >= len(res.Batteries) {
+			continue
+		}
+		if d := res.Batteries[i].DischargingPower; j < len(d) {
+			sum += float64(d[j]) / slotHours
+		}
+	}
+	return sum
 }
 
 // batteryModePlan builds the per-slot battery-mode plan (slot end time + mode

@@ -1634,3 +1634,125 @@ func TestLoadpointRequestMinSoc(t *testing.T) {
 	assert.Equal(t, float32(10000), req.SInitial)
 	assert.Equal(t, float32(15000), req.SMin, "floor above the current soc")
 }
+
+func TestCurrentSuggestion(t *testing.T) {
+	now := time.Now().Truncate(tariff.SlotDuration).Add(5 * time.Minute)
+	boundary := now.Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+	plan := []suggestionSlot{
+		{until: boundary, suggestion: types.Suggestion{Action: actionStop}},
+		{until: boundary.Add(tariff.SlotDuration), suggestion: types.Suggestion{Action: actionCharge, Charge: 1840}},
+		{until: boundary.Add(2 * tariff.SlotDuration)},
+	}
+
+	s, ok := currentSuggestion(plan, now)
+	require.True(t, ok)
+	assert.Equal(t, actionStop, s.Action)
+
+	s, ok = currentSuggestion(plan, boundary)
+	require.True(t, ok, "the next slot applies from its start, not the first slot's action")
+	assert.Equal(t, actionCharge, s.Action)
+	assert.Equal(t, 1840.0, s.Charge)
+
+	_, ok = currentSuggestion(plan, boundary.Add(tariff.SlotDuration))
+	assert.False(t, ok, "a slot without an action yields no suggestion")
+
+	_, ok = currentSuggestion(plan, boundary.Add(time.Hour))
+	assert.False(t, ok, "an exhausted plan yields no suggestion instead of a stale one")
+
+	s, ok = currentSuggestion([]suggestionSlot{{suggestion: types.Suggestion{Action: actionStop}}}, now.Add(24*time.Hour))
+	require.True(t, ok, "an open-ended slot never expires")
+	assert.Equal(t, actionStop, s.Action)
+}
+
+func TestPlanFirstBoundary(t *testing.T) {
+	slot := time.Now().Truncate(tariff.SlotDuration)
+
+	for _, tc := range []struct {
+		name string
+		at   time.Time
+		want time.Time
+	}{
+		{"mid slot", slot.Add(7 * time.Minute), slot.Add(tariff.SlotDuration)},
+		{"seconds before a boundary", slot.Add(tariff.SlotDuration - 26*time.Second), slot.Add(tariff.SlotDuration)},
+		{"on a boundary", slot, slot.Add(tariff.SlotDuration)},
+		{"under a second before a boundary", slot.Add(tariff.SlotDuration - 500*time.Millisecond), slot.Add(2 * tariff.SlotDuration)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// the boundary must match the first slot timeSteps produced for the same instant
+			assert.Equal(t, tc.want, planFirstBoundary(tc.at, timeSteps(4, tc.at)))
+		})
+	}
+}
+
+// TestSuggestionPlan replays a run that lands seconds before a slot boundary:
+// its first slot's action must govern only those seconds, and each later slot
+// carries its own action, power and charge source.
+func TestSuggestionPlan(t *testing.T) {
+	computedAt := time.Now().Truncate(tariff.SlotDuration).Add(tariff.SlotDuration - 26*time.Second)
+	dt := timeSteps(3, computedAt)
+	require.Equal(t, []int{26, 900, 900}, dt)
+
+	lp := 0
+	details := []batteryDetail{
+		{Type: batteryTypeVehicle, loadpoint: &lp, controllable: true},
+		{Type: batteryTypeBattery, Name: "pw", controllable: true},
+	}
+	req := optimizer.OptimizationInput{
+		TimeSeries: optimizer.TimeSeries{Dt: dt, Ft: []float32{0, 0, 0}, Gt: []float32{5, 150, 150}},
+		Batteries:  []optimizer.BatteryConfig{{CMin: 1840}, {SCapacity: 13500}},
+	}
+	res := optimizer.OptimizationResult{
+		GridImport: []float32{0, 0, 2400},
+		GridExport: []float32{0, 0, 0},
+		Batteries: []optimizer.BatteryResult{
+			// car: idle, then fed from the pack, then from the grid
+			{ChargingPower: []float32{0, 460, 2400}, DischargingPower: []float32{0, 0, 0}},
+			{ChargingPower: []float32{0, 0, 0}, DischargingPower: []float32{5, 610, 150}},
+		},
+	}
+
+	boundary := planFirstBoundary(computedAt, dt)
+	plan := suggestionPlan(0, req, res, details, boundary, false)
+	require.Len(t, plan, 3)
+
+	assert.Equal(t, boundary, plan[0].until)
+	assert.Equal(t, actionStop, plan[0].suggestion.Action)
+
+	assert.Equal(t, boundary.Add(tariff.SlotDuration), plan[1].until)
+	assert.Equal(t, actionCharge, plan[1].suggestion.Action)
+	assert.InDelta(t, 1840, plan[1].suggestion.Charge, 1)
+	assert.Equal(t, sourceBattery, plan[1].suggestion.Source)
+
+	assert.Equal(t, actionCharge, plan[2].suggestion.Action)
+	assert.InDelta(t, 9600, plan[2].suggestion.Charge, 1)
+	assert.Equal(t, sourceGrid, plan[2].suggestion.Source)
+
+	// the control loop resolves the slot in effect, not the run's first slot
+	s, ok := currentSuggestion(plan, boundary.Add(time.Minute))
+	require.True(t, ok)
+	assert.Equal(t, actionCharge, s.Action)
+	assert.Equal(t, sourceBattery, s.Source)
+}
+
+// TestLoadpointOptimizerActionFollowsPlan applies the plan slot in effect rather
+// than the slot that was current when the optimizer ran.
+func TestLoadpointOptimizerActionFollowsPlan(t *testing.T) {
+	site := &Site{loadpoints: []*Loadpoint{NewLoadpoint(util.NewLogger("lp0"), nil)}}
+
+	now := time.Now()
+	site.setSuggestionPlans(map[string][]suggestionSlot{
+		loadpointKey(0): {
+			{until: now.Add(-time.Second), suggestion: types.Suggestion{Action: actionCharge, Charge: 9600, Source: sourceGrid}},
+			{until: now.Add(tariff.SlotDuration), suggestion: types.Suggestion{Action: actionStop}},
+		},
+	})
+
+	action, _, _ := site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionStop, action, "the expired first slot no longer applies")
+
+	site.setSuggestionPlans(map[string][]suggestionSlot{
+		loadpointKey(0): {{until: now.Add(-time.Second), suggestion: types.Suggestion{Action: actionCharge}}},
+	})
+	action, _, _ = site.loadpointOptimizerAction(0)
+	assert.Empty(t, action, "an exhausted plan falls back to no optimizer action")
+}

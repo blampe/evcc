@@ -124,7 +124,7 @@ type Site struct {
 	batteryMode              api.BatteryMode             // Battery mode (runtime only, not persisted)
 	batteryModeExternal      api.BatteryMode             // Battery mode (external, runtime only, not persisted)
 	batteryModeExternalTimer time.Time                   // Battery mode timer for external control
-	suggestions              map[string]types.Suggestion // Optimizer suggestions by device key
+	suggestions              map[string][]suggestionSlot // Optimizer per-slot suggestion plans by device key
 	suggestionsComputedAt    time.Time                   // when the current suggestions' input snapshot was taken (guarded by the site lock)
 	batterySchedules         map[string][]batterySlot    // per-battery optimizer mode plan, for front-running export transitions
 	batterySpikeSlot         time.Time                   // 15-min slot the export spike was last (re)written for
