@@ -1756,3 +1756,23 @@ func TestLoadpointOptimizerActionFollowsPlan(t *testing.T) {
 	action, _, _ = site.loadpointOptimizerAction(0)
 	assert.Empty(t, action, "an exhausted plan falls back to no optimizer action")
 }
+
+func TestOptimizerDue(t *testing.T) {
+	slot := time.Now().Truncate(tariff.SlotDuration)
+
+	for _, tc := range []struct {
+		name      string
+		last, now time.Time
+		minAge    time.Duration
+		due       bool
+	}{
+		{"never ran", time.Time{}, slot.Add(time.Minute), tariff.SlotDuration, true},
+		{"same slot", slot.Add(time.Minute), slot.Add(10 * time.Minute), tariff.SlotDuration, false},
+		{"next slot starts", slot.Add(14 * time.Minute), slot.Add(tariff.SlotDuration + 30*time.Second), tariff.SlotDuration, true},
+		{"forced", slot.Add(time.Minute), slot.Add(2 * time.Minute), 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.due, optimizerDue(tc.last, tc.now, tc.minAge))
+		})
+	}
+}

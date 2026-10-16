@@ -766,11 +766,19 @@ func (site *Site) setBatterySchedules(schedules map[string][]batterySlot) {
 	site.batterySchedules = schedules
 }
 
+// optimizerDue reports whether a run is due at now after the last one: once
+// minAge has passed, or as soon as a new slot starts. Re-planning at the boundary
+// keeps the first slot a full slot of fresh state instead of drifting off the
+// slot grid, where a run lands seconds before a boundary.
+func optimizerDue(last, now time.Time, minAge time.Duration) bool {
+	return now.Sub(last) >= minAge || !now.Truncate(tariff.SlotDuration).Equal(last.Truncate(tariff.SlotDuration))
+}
+
 // optimizerUpdateAsync runs the optimizer unless the last run is younger than
-// minAge. Pass 0 to force a run, e.g. when a changed setting should take effect
-// without waiting for the next slot. It is a no-op when the optimizer is not
-// active or a run is already in progress; the running update reflects the
-// change on its next slot.
+// minAge and still in the current slot (see optimizerDue). Pass 0 to force a run,
+// e.g. when a changed setting should take effect without waiting for the next
+// slot. It is a no-op when the optimizer is not active or a run is already in
+// progress; the running update reflects the change on its next slot.
 func (site *Site) optimizerUpdateAsync(minAge time.Duration) {
 	if !sponsor.IsAuthorized() || !optimizerEnabled() {
 		return
@@ -784,7 +792,7 @@ func (site *Site) optimizerUpdateAsync(minAge time.Duration) {
 	if minAge == 0 {
 		// keep the gate open so a not-ready run is retried on the next cycle
 		site.optimizerUpdated = time.Time{}
-	} else if time.Since(site.optimizerUpdated) < minAge {
+	} else if !optimizerDue(site.optimizerUpdated, time.Now(), minAge) {
 		return
 	}
 
