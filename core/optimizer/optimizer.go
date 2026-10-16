@@ -194,6 +194,7 @@ type variables struct {
 	zExpLim          []*lpVar
 	pMaxImpExc       *lpVar
 	dExcess          []*lpVar
+	dExcessFast      []*lpVar
 	homeImport       []*lpVar
 	peak             map[string]*lpVar
 	y                []*lpVar
@@ -467,6 +468,9 @@ func (o *Optimizer) setupVariables() {
 	if len(o.serveHomeFirst) > 0 {
 		v.dExcess = perSlot(nt, func(t int) *lpVar { return newVar(fmt.Sprintf("d_excess_%d", t), zero, nil) })
 		v.homeImport = perSlot(nt, func(t int) *lpVar { return newVar(fmt.Sprintf("home_import_%d", t), zero, nil) })
+		if o.otherCMin() > 0 {
+			v.dExcessFast = perSlot(nt, func(t int) *lpVar { return newVar(fmt.Sprintf("d_excess_fast_%d", t), zero, nil) })
+		}
 	}
 
 	v.peak = make(map[string]*lpVar)
@@ -661,6 +665,13 @@ func (o *Optimizer) setupTargetFunction() {
 		prcExcess := float64(o.minImportPrice * 1e-2)
 		for t := range T {
 			iadd(&preference, affine(v.dExcess[t]).neg().mul(prcExcess))
+
+			// drain the home pack into other loads slowly: whether a boost runs at the
+			// car's minimum over several slots or at full power in one is a cost tie, and
+			// the slow one leaves the car drawing to soak up PV beyond the forecast
+			if v.dExcessFast != nil {
+				iadd(&preference, affine(v.dExcessFast[t]).neg().mul(prcExcess))
+			}
 		}
 	}
 
@@ -688,6 +699,18 @@ func (o *Optimizer) setupTargetFunction() {
 
 	o.objectiveScale = objectiveScale(plusAny(objective, preference))
 	o.problem.setObjective(plusAny(objective, preference).mul(o.objectiveScale))
+}
+
+// otherCMin is the summed minimum charge power (W) of the batteries that do not
+// serve the home first, i.e. what the home pack can feed them per slot at least.
+func (o *Optimizer) otherCMin() float64 {
+	var sum float64
+	for i := range o.batteries {
+		if !o.batteries[i].ServeHomeFirst {
+			sum += o.batteries[i].CMin
+		}
+	}
+	return sum
 }
 
 // terminalValue is terminal_value()
@@ -785,6 +808,11 @@ func (o *Optimizer) addEnergyBalanceConstraints() {
 				discharge.addVar(v.d[i][t], 1)
 			}
 			p.add(ge(affine(v.dExcess[t]), discharge.copy().addConst(deficit, -1)), "")
+
+			// d_excess_fast >= d_excess - the other batteries' minimum charge energy
+			if v.dExcessFast != nil {
+				p.add(ge(affine(v.dExcessFast[t]), affine(v.dExcess[t]).addConst(o.energy(o.otherCMin(), t), -1)), "")
+			}
 		}
 
 		// home_import >= import - charging of the other batteries (the cars): grid
