@@ -111,6 +111,7 @@ type BatteryConfig struct {
 	PrcGoal         *float64
 	ReserveForLoad  bool
 	ServeHomeFirst  bool
+	Charging        bool     // already charging as the horizon starts
 	EtaC, EtaD      *float64 // this battery's efficiencies, nil for the global ones
 }
 
@@ -490,6 +491,10 @@ func (o *Optimizer) setupVariables() {
 		}
 		v.zStart[i] = perSlot(nt, func(t int) *lpVar { return newVar(fmt.Sprintf("z_start_%d_%d", i, t), zero, fptr(1)) })
 		for t := range nt {
+			// charging in the first slot continues a running session, it is no start
+			if t == 0 && o.batteries[i].Charging {
+				continue
+			}
 			rhs := affine(zc[t])
 			if t > 0 {
 				rhs.addVar(zc[t-1], -1)

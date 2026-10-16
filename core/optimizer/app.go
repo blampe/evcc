@@ -160,6 +160,7 @@ func parse(data map[string]any, settings Settings) (*Optimizer, error) {
 			PrcGoal:         optNum(bat, "prc_goal"),
 			ReserveForLoad:  boolOr(bat, "reserve_for_load"),
 			ServeHomeFirst:  boolOr(bat, "serve_home_first"),
+			Charging:        boolOr(bat, "charging"),
 			EtaC:            optNum(bat, "eta_c"),
 			EtaD:            optNum(bat, "eta_d"),
 		})
@@ -323,6 +324,7 @@ var (
 		"prc_goal":          {kind: kindNumber},
 		"reserve_for_load":  {kind: kindBoolean},
 		"serve_home_first":  {kind: kindBoolean},
+		"charging":          {kind: kindBoolean},
 		"eta_c":             {kind: kindNumber},
 		"eta_d":             {kind: kindNumber},
 	}

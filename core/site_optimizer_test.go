@@ -1634,6 +1634,36 @@ func TestLoadpointRequestMinSoc(t *testing.T) {
 
 	assert.Equal(t, float32(10000), req.SInitial)
 	assert.Equal(t, float32(15000), req.SMin, "floor above the current soc")
+	assert.False(t, req.Charging, "connected but not charging")
+}
+
+func TestLoadpointRequestCharging(t *testing.T) {
+	site := &Site{log: util.NewLogger("foo")}
+	ctrl := gomock.NewController(t)
+
+	v := api.NewMockVehicle(ctrl)
+	v.EXPECT().Capacity().Return(50.0).AnyTimes()
+	v.EXPECT().GetTitle().Return("").AnyTimes()
+
+	lp := loadpoint.NewMockAPI(ctrl)
+	lp.EXPECT().GetVehicle().Return(v).AnyTimes()
+	lp.EXPECT().GetSoc().Return(40.0).AnyTimes()
+	lp.EXPECT().EffectiveLimitSoc().Return(100).AnyTimes()
+	lp.EXPECT().EffectiveMinSoc().Return(0).AnyTimes()
+	lp.EXPECT().GetLimitEnergy().Return(0.0).AnyTimes()
+	lp.EXPECT().GetChargedEnergy().Return(0.0).AnyTimes()
+	lp.EXPECT().GetTitle().Return("lp").AnyTimes()
+	lp.EXPECT().EffectiveMinPower().Return(1380.0).AnyTimes()
+	lp.EXPECT().EffectiveMaxPower().Return(11000.0).AnyTimes()
+	lp.EXPECT().GetMode().Return(api.ModePV).AnyTimes()
+	lp.EXPECT().GetStatus().Return(api.StatusC).AnyTimes()
+	lp.EXPECT().GetSmartCostLimit().Return(nil).AnyTimes()
+	lp.EXPECT().EffectivePlanStrategy().Return(api.PlanStrategy{}).AnyTimes()
+	lp.EXPECT().GetPlanGoals(gomock.Any()).Return(nil, false).AnyTimes()
+
+	req, _ := site.loadpointRequest(lp, 8, 15*time.Minute, nil)
+
+	assert.True(t, req.Charging, "a charging car continues its session")
 }
 
 func TestCurrentSuggestion(t *testing.T) {

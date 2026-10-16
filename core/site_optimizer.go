@@ -1613,6 +1613,10 @@ func (site *Site) loadpointRequest(lp loadpoint.API, minLen int, firstSlotDurati
 		DMax:           0,
 		SMin:           0,
 		// PA:             pa,
+
+		// a running session continues rather than counting as a fresh start, so the
+		// plan favors keeping it on over stopping it to restart later
+		Charging: lp.GetStatus() == api.StatusC,
 	}
 
 	if profile := loadpointProfile(lp, minLen); profile != nil {
