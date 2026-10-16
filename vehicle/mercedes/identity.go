@@ -54,7 +54,7 @@ func NewIdentity(log *util.Logger, token *oauth2.Token, account string, region s
 	v.Sessionid = uuid.New().String()
 	v.Helper.Transport = &transport.Decorator{
 		Base:      v.Helper.Transport, //.NewTripper(log, transport.Insecure()),
-		Decorator: transport.DecorateHeaders(mbheaders(true, region)),
+		Decorator: transport.DecorateHeaders(v.authHeaders()),
 	}
 
 	// reuse identity instance
@@ -103,6 +103,19 @@ func (v *Identity) settingsKey() string {
 	return fmt.Sprintf("mercedes.%s-%s", v.account, v.region)
 }
 
+// authHeaders returns the auth server headers with a device id that is stable
+// across restarts, so token refreshes don't present as a new device each time.
+func (v *Identity) authHeaders() map[string]string {
+	headers := mbheaders(true, v.region)
+	headers["X-Device-Id"] = deviceID(v.account, v.region)
+	return headers
+}
+
+// deviceID derives a stable device id from the account and region.
+func deviceID(account, region string) string {
+	return uuid.NewSHA1(uuid.NameSpaceOID, []byte("evcc-mercedes:"+account+"-"+region)).String()
+}
+
 func (v *Identity) refreshToken(token *oauth2.Token) (*oauth2.Token, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -113,7 +126,7 @@ func (v *Identity) refreshToken(token *oauth2.Token) (*oauth2.Token, error) {
 	}
 
 	uri := fmt.Sprintf("%s/as/token.oauth2", IdUri)
-	req, _ := request.New(http.MethodPost, uri, strings.NewReader(data.Encode()), mbheaders(true, v.region))
+	req, _ := request.New(http.MethodPost, uri, strings.NewReader(data.Encode()), v.authHeaders())
 
 	var res oauth2.Token
 	if err := v.DoJSON(req, &res); err != nil {

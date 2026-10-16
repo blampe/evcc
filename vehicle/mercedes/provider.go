@@ -27,28 +27,23 @@ func NewProvider(api *API, ws *Websocket, vin string, cache time.Duration) *Prov
 			return api.Status(vin)
 		}, cache),
 		vsuG: util.Cached(func() (StatusResponse, error) {
-			return vsuStatus(ws, vin, cache)
+			return vsuStatus(ws, vin)
 		}, cache),
 	}
 	return impl
 }
 
 // vsuStatus reads the latest VehicleStatusUpdate from the websocket cache and
-// maps it. Freshness is tied to connection liveness, not to the age of the last
-// push: the VSU socket stays open and a parked vehicle sends nothing for hours,
-// while the ping keep-alive keeps proving the cached snapshot is current. The
-// data is only treated as stale once the connection has been unrecoverable (no
-// successful read or ping) for the staleness window, so callers retry rather
-// than record data from a link that has genuinely gone dark.
-func vsuStatus(ws *Websocket, vin string, cache time.Duration) (StatusResponse, error) {
-	vsu, _, ok := ws.Status(vin)
+// maps it. Every successful session delivers a full update, so the snapshot is
+// treated as stale once several poll intervals pass without one.
+func vsuStatus(ws *Websocket, vin string) (StatusResponse, error) {
+	vsu, updated, ok := ws.Status(vin)
 	if !ok {
 		// No full update received yet – retry semantics.
 		return StatusResponse{}, api.ErrMustRetry
 	}
 
-	stale := max(15*time.Minute, 3*cache)
-	if time.Since(ws.alive()) > stale {
+	if time.Since(updated) > 3*ws.interval {
 		return StatusResponse{}, errors.New("vsu data is stale")
 	}
 

@@ -8,10 +8,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/coder/websocket"
+	"github.com/evcc-io/evcc/cmd/shutdown"
+	"github.com/evcc-io/evcc/server/db/settings"
 	"github.com/evcc-io/evcc/util"
 	pb "github.com/evcc-io/evcc/vehicle/mercedes/pb"
 	"github.com/google/uuid"
@@ -19,43 +22,40 @@ import (
 )
 
 const (
-	// wsPingInterval keeps the connection alive and proves liveness between VSU
-	// pushes. A parked vehicle sends no data for hours; the successful ping (not
-	// incoming data) is what tells us the cached snapshot is still current.
-	wsPingInterval = 30 * time.Second
+	// wsMinPollInterval floors the time between sessions. Mercedes blocks a token
+	// set that opens the websocket too often, so the vehicle cache interval is
+	// never allowed to drive the handshake rate higher than this.
+	wsMinPollInterval = 5 * time.Minute
 
-	// wsMinReconnectDelay is the floor between handshake attempts. The VSU socket
-	// is long-lived — kept open by pings and only re-dialed when the backend
-	// actually drops us — so this simply bounds how fast we re-handshake after a
-	// drop. Re-dialing too eagerly is what earns HTTP 429 account blocks, so the
-	// connection is never torn down on idle; it is held open instead.
+	// wsMinReconnectDelay is the initial retry delay after a failed session.
 	wsMinReconnectDelay = 30 * time.Second
 
-	// wsMaxReconnectDelay caps the exponential backoff after repeated dial
-	// failures.
-	wsMaxReconnectDelay = 5 * time.Minute
-
 	// wsRateLimitBackoff is the initial cooldown after an HTTP 429 handshake
-	// rejection that carries no Retry-After. A 429 means we dialed too often for
-	// the account, so we wait far longer than a normal reconnect before retrying.
+	// rejection that carries no Retry-After.
 	wsRateLimitBackoff = 5 * time.Minute
 
-	// wsMaxRateLimitBackoff caps the escalating 429 cooldown. The backend's
-	// account block outlasts a single cooldown and only clears after a sustained
-	// quiet period, so consecutive rejections back off toward this cap rather than
-	// re-dialing every wsRateLimitBackoff forever (which can keep resetting a
-	// rolling-window block so it never clears).
+	// wsMaxRateLimitBackoff caps the escalating 429 cooldown. The block only
+	// clears after a sustained quiet period, so consecutive rejections back off
+	// toward this cap rather than resetting a rolling-window block.
 	wsMaxRateLimitBackoff = 30 * time.Minute
-
-	// wsHealthyThreshold is how long a connection must stay up to count as a
-	// healthy session that resets the reconnect backoff. A connection that drops
-	// sooner leaves the backoff climbing, so repeated fast drops back off instead
-	// of hammering the handshake.
-	wsHealthyThreshold = 60 * time.Second
 
 	// wsMaxMessageBytes bounds a single websocket frame. VSU full updates carry
 	// ~250 attributes per vehicle; 8 MiB is comfortably above that.
 	wsMaxMessageBytes = 8 << 20
+)
+
+// Session timing, variables so tests can shorten them.
+var (
+	// wsLinger is how long a session stays open after the last message. The full
+	// update arrives within a second of connecting; lingering briefly picks up
+	// any trailing partial updates before closing.
+	wsLinger = 30 * time.Second
+
+	// wsMaxSession caps a single session. A charging car keeps pushing partial
+	// updates, which would otherwise keep the idle timer from ever firing.
+	// Mercedes blocks accounts whose total websocket open time exceeds roughly
+	// 16-20h per day, summed over all clients, so sessions must stay short.
+	wsMaxSession = 2 * time.Minute
 )
 
 // wsState is one vehicle's cached VSU together with the time it was last
@@ -65,10 +65,11 @@ type wsState struct {
 	updated time.Time
 }
 
-// Websocket maintains a single VSU push connection per Mercedes account and
-// caches the latest VehicleStatusUpdate per VIN. It is long-lived: there is one
-// instance per account (see the registry in helper.go), started once and kept
-// running for the process lifetime, mirroring evcc's websocket chargers.
+// Websocket polls the VSU push endpoint per Mercedes account and caches the
+// latest VehicleStatusUpdate per VIN. Instead of holding the socket open, it
+// opens a short session every poll interval: the backend sends a full update on
+// connect, so a brief session yields a complete snapshot while keeping the
+// account's daily websocket open time far below Mercedes' throttling limit.
 type Websocket struct {
 	mu        sync.RWMutex
 	log       *util.Logger
@@ -77,12 +78,14 @@ type Websocket struct {
 	sessionID string
 	states    map[string]*wsState                 // keyed by VIN
 	commands  map[string]*pb.AppTwinCommandStatus // latest command result, keyed by VIN
+	cancel    context.CancelFunc
+	uri       string
+	interval  time.Duration
 
-	// lastAlive is the last time the connection proved itself alive — a
-	// successful ping or an incoming message — guarded by mu. The freshness guard
-	// keys off this rather than the age of the last data push, since a healthy
-	// connection to a parked car legitimately delivers nothing for long stretches.
-	lastAlive time.Time
+	// rateLimit tracks consecutive 429 handshake rejections. It is persisted so
+	// a restart honors the pending cooldown instead of dialing straight away.
+	// Only touched from the run goroutine.
+	rateLimit rateLimitState
 
 	// conn is the current connection, guarded by mu; used to send acks from the
 	// read loop.
@@ -98,8 +101,9 @@ var (
 )
 
 // NewWebsocket returns the shared Websocket for the given account, creating and
-// starting it on first use. Subsequent vehicles on the same account reuse it.
-func NewWebsocket(log *util.Logger, identity *Identity) *Websocket {
+// starting it on first use. Subsequent vehicles on the same account reuse it,
+// and the first vehicle's interval sets the poll interval.
+func NewWebsocket(log *util.Logger, identity *Identity, interval time.Duration) *Websocket {
 	wsMu.Lock()
 	defer wsMu.Unlock()
 
@@ -108,6 +112,8 @@ func NewWebsocket(log *util.Logger, identity *Identity) *Websocket {
 		return ws
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	ws := &Websocket{
 		log:       log,
 		identity:  identity,
@@ -115,11 +121,15 @@ func NewWebsocket(log *util.Logger, identity *Identity) *Websocket {
 		sessionID: uuid.New().String(),
 		states:    make(map[string]*wsState),
 		commands:  make(map[string]*pb.AppTwinCommandStatus),
+		cancel:    cancel,
+		uri:       getWebsocketUri(identity.region),
+		interval:  max(interval, wsMinPollInterval),
 	}
 
 	// Process-lifetime goroutine. api.Vehicle has no Close(); the account
 	// registry guarantees at most one manager per account.
-	go ws.run(context.Background())
+	go ws.run(ctx)
+	shutdown.Register(ws.shutdown)
 
 	websockets[key] = ws
 	return ws
@@ -156,9 +166,8 @@ func (ws *Websocket) commandStatus(reqID string) (*pb.AppTwinCommandStatus, bool
 
 // sendCommand issues a vehicle CommandRequest over the websocket. It stamps a
 // request id when one is not set and returns it so the caller can correlate the
-// asynchronous result via commandStatus. It does not block waiting for a
-// reconnect: if the connection is momentarily down it returns errNotConnected so
-// the caller can retry.
+// asynchronous result via commandStatus. It does not open a session: between
+// sessions it returns errNotConnected.
 func (ws *Websocket) sendCommand(ctx context.Context, req *pb.CommandRequest) (string, error) {
 	if req.GetRequestId() == "" {
 		req.RequestId = uuid.New().String()
@@ -168,47 +177,50 @@ func (ws *Websocket) sendCommand(ctx context.Context, req *pb.CommandRequest) (s
 	})
 }
 
-// run maintains a single long-lived VSU connection. The socket is kept open
-// (pings prove liveness); we only re-dial when the backend drops us, which keeps
-// the handshake rate low enough to stay clear of the 429 account limit.
-//
-// Normal reconnects use exponential backoff floored at wsMinReconnectDelay, and
-// a healthy session (one that stayed up past wsHealthyThreshold) resets it. A
-// handshake rejected with HTTP 429 is handled separately: the cooldown escalates
-// across consecutive rejections (see rateLimitCooldown) so a sustained account
-// block gets an increasingly quiet window to clear rather than being reset by
-// eager re-dials.
+// run opens a session every poll interval. A failed session is retried with
+// exponential backoff up to the poll interval. A handshake rejected with HTTP
+// 429 escalates its own cooldown (see rateLimitCooldown) so a sustained block
+// gets an increasingly quiet window to clear.
 func (ws *Websocket) run(ctx context.Context) {
 	bo := backoff.NewExponentialBackOff(
 		backoff.WithMaxElapsedTime(0),
 		backoff.WithInitialInterval(wsMinReconnectDelay),
-		backoff.WithMaxInterval(wsMaxReconnectDelay),
+		backoff.WithMaxInterval(ws.interval),
 	)
 
-	var rateLimits int // consecutive 429 handshake rejections
+	ws.rateLimit = loadRateLimit(ws.rateLimitKey())
+	if delay := time.Until(ws.rateLimit.Until); delay > 0 {
+		ws.log.DEBUG.Printf("websocket: resuming 429 cooldown x%d, waiting %s", ws.rateLimit.Count, delay.Round(time.Second))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
+
 	for ctx.Err() == nil {
-		healthy, err := ws.connect(ctx)
+		started := time.Now()
+		err := ws.session(ctx)
 
 		var delay time.Duration
 		var rl *rateLimitError
 		switch {
+		case err == nil:
+			bo.Reset()
+			delay = ws.interval - time.Since(started)
+
 		case errors.As(err, &rl):
-			rateLimits++
-			delay = rateLimitCooldown(rateLimits, rl.retryAfter)
-			ws.log.DEBUG.Printf("websocket: handshake rate limited (429) x%d, backing off %s", rateLimits, delay.Round(time.Second))
+			ws.rateLimit.Count++
+			delay = rateLimitCooldown(ws.rateLimit.Count, rl.retryAfter)
+			ws.rateLimit.Until = time.Now().Add(delay)
+			ws.saveRateLimit()
+			ws.log.DEBUG.Printf("websocket: handshake rate limited (429) x%d, backing off %s", ws.rateLimit.Count, delay.Round(time.Second))
 
 		default:
-			if err != nil && !errors.Is(err, context.Canceled) {
+			if !errors.Is(err, context.Canceled) {
 				ws.log.DEBUG.Printf("websocket: %v", err)
 			}
-			rateLimits = 0
-			if healthy {
-				bo.Reset()
-			}
 			delay = bo.NextBackOff()
-			if delay < wsMinReconnectDelay {
-				delay = wsMinReconnectDelay
-			}
 		}
 
 		select {
@@ -234,32 +246,30 @@ func rateLimitCooldown(consecutive int, retryAfter time.Duration) time.Duration 
 	return max(d, retryAfter)
 }
 
-// connect dials the websocket and runs the read loop until the connection drops,
-// returning the terminating error. The bool reports whether the session was
-// healthy (stayed up past wsHealthyThreshold) so the caller can reset its
-// reconnect backoff.
-//
-// There is deliberately no read deadline: a parked vehicle receives its full
-// update on connect and then goes quiet indefinitely, so a read timeout would
-// tear down a perfectly good connection and drive the very reconnect storm that
-// triggers 429s. Liveness is instead proven by the pinger, which closes the
-// connection on a failed ping and thereby unblocks Read with an error.
-func (ws *Websocket) connect(ctx context.Context) (bool, error) {
+// session dials the websocket, reads until it has been quiet for wsLinger or
+// wsMaxSession has elapsed, and then closes it with a normal close frame. It
+// returns nil only if at least one vehicle status update was received.
+func (ws *Websocket) session(ctx context.Context) error {
 	tok, err := ws.identity.Token()
 	if err != nil {
-		return false, err
+		return err
 	}
 
 	headers := wsheaders(tok.AccessToken, ws.sessionID, ws.region)
 	opts := &websocket.DialOptions{HTTPHeader: mapToHeader(headers)}
 
 	dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	conn, resp, err := websocket.Dial(dialCtx, getWebsocketUri(ws.region), opts)
+	conn, resp, err := websocket.Dial(dialCtx, ws.uri, opts)
 	cancel()
 	if err != nil {
-		return false, dialError(err, resp)
+		return dialError(err, resp)
 	}
 	conn.SetReadLimit(wsMaxMessageBytes)
+
+	if ws.rateLimit.Count > 0 {
+		ws.rateLimit = rateLimitState{}
+		ws.saveRateLimit()
+	}
 
 	ws.connMu.Lock()
 	ws.conn = conn
@@ -272,82 +282,81 @@ func (ws *Websocket) connect(ctx context.Context) (bool, error) {
 		_ = conn.CloseNow()
 	}()
 
-	connectedAt := time.Now()
-	ws.markAlive()
-	ws.log.DEBUG.Println("websocket: connected")
+	ws.log.TRACE.Println("websocket: connected")
 
-	// Ping keep-alive. Liveness is proven by pings, not by data: the pinger
-	// tears the connection down when a ping fails, so a stalled connection is
-	// surfaced as a read error rather than blocking Read forever.
-	pingCtx, pingCancel := context.WithCancel(ctx)
-	defer pingCancel()
-	go ws.pinger(pingCtx, conn)
+	// Closing from a timer rather than via a read deadline sends a close frame;
+	// an expired read context would drop the connection without one.
+	var closing atomic.Bool
+	closeNormal := func() {
+		closing.Store(true)
+		_ = conn.Close(websocket.StatusNormalClosure, "")
+	}
+	idle := time.AfterFunc(wsLinger, closeNormal)
+	defer idle.Stop()
+	limit := time.AfterFunc(wsMaxSession, closeNormal)
+	defer limit.Stop()
 
+	var updated bool
 	for {
 		typ, data, err := conn.Read(ctx)
 		if err != nil {
-			// Any read return means the connection dropped: the pinger closed a
-			// dead link, the backend closed it, or the network failed. Report
-			// whether the session lived long enough to count as healthy so run()
-			// can decide between resetting and climbing its backoff.
-			return time.Since(connectedAt) >= wsHealthyThreshold, err
+			switch {
+			case !closing.Load():
+				return err
+			case !updated:
+				return errors.New("no vehicle status update received")
+			default:
+				return nil
+			}
 		}
-		ws.markAlive()
+		idle.Reset(wsLinger)
+
 		if typ != websocket.MessageBinary {
 			continue
 		}
 
-		if err := ws.handleMessage(ctx, data); err != nil {
+		vsu, err := ws.handleMessage(ctx, data)
+		if err != nil {
 			ws.log.DEBUG.Printf("websocket: handle: %v", err)
 		}
+		updated = updated || vsu
 	}
 }
 
-func (ws *Websocket) pinger(ctx context.Context, conn *websocket.Conn) {
-	ticker := time.NewTicker(wsPingInterval)
-	defer ticker.Stop()
+// shutdown closes the connection with a normal close frame so the backend
+// releases the session right away instead of waiting for it to time out, then
+// stops the run loop. Close must come first: cancelling the read context would
+// tear the connection down without a close handshake.
+func (ws *Websocket) shutdown() {
+	ws.connMu.Lock()
+	conn := ws.conn
+	ws.connMu.Unlock()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			pingCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			err := conn.Ping(pingCtx)
-			cancel()
-			if err != nil {
-				// A failed ping means the connection is dead. Close it so the
-				// read loop unblocks immediately with an error and reconnects.
-				// Skip the close on parent-context teardown, where connect()
-				// already closes the connection.
-				if ctx.Err() == nil {
-					_ = conn.CloseNow()
-				}
-				return
-			}
-			// A successful ping proves the link is alive even while a parked car
-			// sends no data, keeping the freshness guard satisfied.
-			ws.markAlive()
-		}
+	if conn != nil {
+		_ = conn.Close(websocket.StatusNormalClosure, "")
 	}
+	ws.cancel()
 }
 
 // handleMessage decodes a PushMessage and acknowledges it. Every
 // sequence-numbered push type must be acknowledged or the backend redelivers it
 // and eventually drops the connection, so both vehicle_status_updates (the data
 // we cache) and apptwin_command_status_updates (results of commands we sent) are
-// handled and acked. Other push types are ignored.
-func (ws *Websocket) handleMessage(ctx context.Context, data []byte) error {
+// handled and acked. Other push types are ignored. The bool reports whether the
+// message carried vehicle status updates.
+func (ws *Websocket) handleMessage(ctx context.Context, data []byte) (bool, error) {
 	var msg pb.PushMessage
 	if err := proto.Unmarshal(data, &msg); err != nil {
-		return err
+		return false, err
 	}
 
+	var vsu bool
 	var ack *pb.ClientMessage
 	switch {
 	case msg.GetVehicleStatusUpdates() != nil:
 		vsus := msg.GetVehicleStatusUpdates()
 		ws.applyVSU(vsus)
+		vsu = true
 		ack = &pb.ClientMessage{Msg: &pb.ClientMessage_AcknowledgeVehicleStatusUpdates{
 			AcknowledgeVehicleStatusUpdates: &pb.AcknowledgeVehicleStatusUpdates{SequenceNumber: vsus.GetSequenceNumber()},
 		}}
@@ -364,10 +373,10 @@ func (ws *Websocket) handleMessage(ctx context.Context, data []byte) error {
 		}}
 
 	default:
-		return nil
+		return false, nil
 	}
 
-	return ws.writeMessage(ctx, ack)
+	return vsu, ws.writeMessage(ctx, ack)
 }
 
 // writeMessage marshals a ClientMessage and writes it on the current connection.
@@ -449,20 +458,30 @@ func (ws *Websocket) applyCommandStatus(upd *pb.AppTwinCommandStatusUpdatesByVIN
 	}
 }
 
-// markAlive records that the connection just proved itself alive (a successful
-// ping or an incoming message).
-func (ws *Websocket) markAlive() {
-	ws.mu.Lock()
-	ws.lastAlive = time.Now()
-	ws.mu.Unlock()
+// rateLimitState is the persisted 429 backoff: consecutive rejections and the
+// earliest time the next handshake may be attempted.
+type rateLimitState struct {
+	Count int       `json:"count"`
+	Until time.Time `json:"until"`
 }
 
-// alive returns the last time the connection proved itself alive. The provider's
-// freshness guard treats the cached snapshot as current while this is recent.
-func (ws *Websocket) alive() time.Time {
-	ws.mu.RLock()
-	defer ws.mu.RUnlock()
-	return ws.lastAlive
+func (ws *Websocket) rateLimitKey() string {
+	return fmt.Sprintf("mercedes.%s-%s.ratelimit", ws.identity.account, ws.region)
+}
+
+// loadRateLimit returns the persisted 429 backoff, or the zero state if none.
+func loadRateLimit(key string) rateLimitState {
+	var res rateLimitState
+	if err := settings.Json(key, &res); err != nil {
+		return rateLimitState{}
+	}
+	return res
+}
+
+func (ws *Websocket) saveRateLimit() {
+	if err := settings.SetJson(ws.rateLimitKey(), ws.rateLimit); err != nil {
+		ws.log.DEBUG.Printf("websocket: persist rate limit: %v", err)
+	}
 }
 
 // rateLimitError marks a handshake rejected with HTTP 429. retryAfter carries

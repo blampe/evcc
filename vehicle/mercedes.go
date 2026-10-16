@@ -61,7 +61,7 @@ func NewMercedesFromConfig(other map[string]any) (api.Vehicle, error) {
 
 	// One VSU websocket per account; sources the data Mercedes removed from the
 	// REST widget (odometer, charging status, SoC limit).
-	ws := mercedes.NewWebsocket(log, identity)
+	ws := mercedes.NewWebsocket(log, identity, cc.Cache)
 
 	v := &Mercedes{
 		embed:    &cc.embed,

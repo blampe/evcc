@@ -1,15 +1,22 @@
 package mercedes
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	"github.com/evcc-io/evcc/api"
+	"github.com/evcc-io/evcc/util"
 	pb "github.com/evcc-io/evcc/vehicle/mercedes/pb"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -181,29 +188,27 @@ func TestRateLimitCooldown(t *testing.T) {
 // been dark past the staleness window.
 func TestVSUStatusFreshness(t *testing.T) {
 	const vin = "WDB1234567890"
-	ws := &Websocket{states: map[string]*wsState{}}
+	ws := &Websocket{states: map[string]*wsState{}, interval: 15 * time.Minute}
 
 	// No full update yet → retry semantics.
-	_, err := vsuStatus(ws, vin, time.Minute)
+	_, err := vsuStatus(ws, vin)
 	assert.ErrorIs(t, err, api.ErrMustRetry)
 
-	// Old cached data but a link that pinged moments ago → still fresh.
+	// Snapshot from the last session, within the staleness window → fresh.
 	ws.states[vin] = &wsState{
 		vsu: &pb.VehicleStatusUpdate{
 			Odo: &pb.Int64DistanceAttribute{Value: 4242, Unit: pb.VehicleAttributeStatus_KILOMETERS},
 		},
-		updated: time.Now().Add(-time.Hour),
+		updated: time.Now().Add(-20 * time.Minute),
 	}
-	ws.lastAlive = time.Now()
-	res, err := vsuStatus(ws, vin, time.Minute)
-	require.NoError(t, err, "a live connection keeps a parked car's snapshot fresh")
+	res, err := vsuStatus(ws, vin)
+	require.NoError(t, err)
 	assert.Equal(t, 4242, res.VehicleInfo.Odometer.Value)
 
-	// Connection silent past the staleness window (max(15m, 3*cache) = 15m) →
-	// stale, even though the cached data is untouched.
-	ws.lastAlive = time.Now().Add(-30 * time.Minute)
-	_, err = vsuStatus(ws, vin, time.Minute)
-	assert.Error(t, err, "a dark connection eventually goes stale")
+	// Several missed sessions → stale.
+	ws.states[vin].updated = time.Now().Add(-time.Hour)
+	_, err = vsuStatus(ws, vin)
+	assert.Error(t, err, "missed sessions eventually go stale")
 }
 
 // TestMergeVSUReplacesFields verifies that a partial update replaces individual
@@ -251,4 +256,166 @@ func TestMergeVSUReplacesRepeated(t *testing.T) {
 	// The array must be replaced (1 entry), not appended (would be 3).
 	require.Len(t, cached.GetChargePrograms().GetValue(), 1)
 	assert.Equal(t, int32(100), cached.GetChargePrograms().GetValue()[0].GetMaxSoc())
+}
+
+func TestDeviceIDStable(t *testing.T) {
+	id := deviceID("user@example.com", "NORAM")
+	assert.Equal(t, id, deviceID("user@example.com", "NORAM"), "same account must yield the same device id across restarts")
+	assert.NotEqual(t, id, deviceID("other@example.com", "NORAM"))
+	assert.NotEqual(t, id, deviceID("user@example.com", "EMEA"))
+	_, err := uuid.Parse(id)
+	assert.NoError(t, err)
+}
+
+func TestRateLimitPersisted(t *testing.T) {
+	ws := &Websocket{
+		identity: &Identity{account: "ratelimit@example.com"},
+		region:   "NORAM",
+	}
+	assert.Zero(t, loadRateLimit(ws.rateLimitKey()), "no state before the first 429")
+
+	until := time.Now().Add(20 * time.Minute).Truncate(time.Second)
+	ws.rateLimit = rateLimitState{Count: 3, Until: until}
+	ws.saveRateLimit()
+
+	res := loadRateLimit(ws.rateLimitKey())
+	assert.Equal(t, 3, res.Count)
+	assert.True(t, until.Equal(res.Until), "a restart must resume the pending cooldown")
+}
+
+func TestShutdownSendsNormalClose(t *testing.T) {
+	closed := make(chan error, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			closed <- err
+			return
+		}
+		_, _, err = c.Read(context.Background())
+		closed <- err
+	}))
+	defer srv.Close()
+
+	conn, _, err := websocket.Dial(t.Context(), "ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ws := &Websocket{conn: conn, cancel: cancel}
+
+	// Mirror connect(): the read loop must observe the close and return.
+	readDone := make(chan struct{})
+	go func() {
+		_, _, _ = conn.Read(ctx)
+		close(readDone)
+	}()
+
+	ws.shutdown()
+
+	select {
+	case err := <-closed:
+		assert.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(err), "backend must see a normal close frame")
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never saw the close")
+	}
+	<-readDone
+	assert.Error(t, ctx.Err(), "shutdown must stop the run loop")
+}
+
+// sessionServer accepts one websocket, sends the given pushes, then reads until
+// the client closes and reports the close status.
+func sessionServer(t *testing.T, pushes [][]byte, every time.Duration) (string, <-chan error) {
+	t.Helper()
+	closed := make(chan error, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			closed <- err
+			return
+		}
+		go func() {
+			for _, p := range pushes {
+				if c.Write(context.Background(), websocket.MessageBinary, p) != nil {
+					return
+				}
+				time.Sleep(every)
+			}
+		}()
+		for {
+			if _, _, err := c.Read(context.Background()); err != nil {
+				closed <- err
+				return
+			}
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return "ws" + strings.TrimPrefix(srv.URL, "http"), closed
+}
+
+func vsuPush(t *testing.T, vin string, seq int64, odo int64) []byte {
+	t.Helper()
+	b, err := proto.Marshal(&pb.PushMessage{Msg: &pb.PushMessage_VehicleStatusUpdates{
+		VehicleStatusUpdates: &pb.VehicleStatusUpdates{
+			SequenceNumber: seq,
+			VehicleStatusUpdates: map[string]*pb.VehicleStatusUpdate{
+				vin: {FullUpdate: true, Odo: &pb.Int64DistanceAttribute{Value: odo}},
+			},
+		},
+	}})
+	require.NoError(t, err)
+	return b
+}
+
+func testWebsocket(uri string) *Websocket {
+	return &Websocket{
+		log:      util.NewLogger("test"),
+		identity: &Identity{TokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token"})},
+		uri:      uri,
+		states:   make(map[string]*wsState),
+		commands: make(map[string]*pb.AppTwinCommandStatus),
+	}
+}
+
+func shortSession(t *testing.T, linger, maxSession time.Duration) {
+	t.Helper()
+	l, m := wsLinger, wsMaxSession
+	wsLinger, wsMaxSession = linger, maxSession
+	t.Cleanup(func() { wsLinger, wsMaxSession = l, m })
+}
+
+func TestSessionClosesWhenIdle(t *testing.T) {
+	shortSession(t, 100*time.Millisecond, 5*time.Second)
+	const vin = "WDB1234567890"
+	uri, closed := sessionServer(t, [][]byte{vsuPush(t, vin, 1, 4242)}, 0)
+
+	ws := testWebsocket(uri)
+	start := time.Now()
+	require.NoError(t, ws.session(t.Context()))
+	assert.Less(t, time.Since(start), time.Second, "session must close once idle, not stay open")
+
+	assert.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(<-closed), "backend must see a normal close frame")
+	vsu, _, ok := ws.Status(vin)
+	require.True(t, ok)
+	assert.Equal(t, int64(4242), vsu.GetOdo().GetValue())
+}
+
+func TestSessionWithoutUpdateFails(t *testing.T) {
+	shortSession(t, 100*time.Millisecond, 5*time.Second)
+	uri, _ := sessionServer(t, nil, 0)
+
+	assert.Error(t, testWebsocket(uri).session(t.Context()), "a session without a status update must be retried")
+}
+
+func TestSessionMaxDuration(t *testing.T) {
+	shortSession(t, time.Second, 300*time.Millisecond)
+	const vin = "WDB1234567890"
+	pushes := make([][]byte, 100)
+	for i := range pushes {
+		pushes[i] = vsuPush(t, vin, int64(i), int64(i))
+	}
+	uri, closed := sessionServer(t, pushes, 50*time.Millisecond)
+
+	start := time.Now()
+	require.NoError(t, testWebsocket(uri).session(t.Context()))
+	assert.Less(t, time.Since(start), time.Second, "continuous updates must not extend the session past its cap")
+	assert.Equal(t, websocket.StatusNormalClosure, websocket.CloseStatus(<-closed))
 }
