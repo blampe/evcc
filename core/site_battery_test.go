@@ -7,6 +7,7 @@ import (
 
 	"github.com/evcc-io/evcc/api"
 	"github.com/evcc-io/evcc/core/types"
+	"github.com/evcc-io/evcc/tariff"
 	"github.com/evcc-io/evcc/util"
 	"github.com/evcc-io/evcc/util/config"
 	"github.com/stretchr/testify/assert"
@@ -500,4 +501,49 @@ func TestBatteryBoostTripReleasesPin(t *testing.T) {
 	cycle()
 	assert.Equal(t, actionStop, lp.optimizerAction)
 	assert.Zero(t, ctrl.soc, "no re-pin within the tripped slot")
+}
+
+// TestBatteryBoostAdvanceMovesPin verifies that when a boost reaches its slot's
+// reserve and the plan moves on to the next slot early, the pack's reserve pin is
+// rewritten to the next slot's target in the same cycle, so the pack keeps feeding
+// the car's (smaller) draw instead of holding at the old target while it spills to
+// the grid.
+func TestBatteryBoostAdvanceMovesPin(t *testing.T) {
+	boundary := time.Now().Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+	ctrl := &recordingBatteryController{}
+	lp := &Loadpoint{}
+	site := &Site{
+		log:           util.NewLogger("foo"),
+		batteryMeters: []config.Device[api.Meter]{config.NewStaticDevice(config.Named{Name: "home"}, api.Meter(ctrl))},
+		batteryMode:   api.BatteryNormal,
+		batterySchedules: map[string][]batterySlot{
+			batteryKey("home"): {
+				{until: boundary, action: "normal", soc: 55, startSoc: 70},
+				{until: boundary.Add(tariff.SlotDuration), action: "normal", soc: 50, startSoc: 55},
+			},
+		},
+		loadpoints: []*Loadpoint{lp},
+	}
+	site.setSuggestionPlans(map[string][]suggestionSlot{
+		loadpointKey(0): {
+			{until: boundary, suggestion: types.Suggestion{Action: actionCharge, Charge: 7000, Source: sourceBattery}},
+			{until: boundary.Add(tariff.SlotDuration), suggestion: types.Suggestion{Action: actionCharge, Charge: 3000, Source: sourceBattery}},
+		},
+	})
+
+	cycle := func() {
+		lp.optimizerAction, lp.optimizerChargePower, lp.optimizerChargeSource = site.loadpointOptimizerAction(0)
+		site.updateBatteryMode(false, api.Rate{})
+	}
+
+	site.battery.Soc = 70
+	cycle()
+	require.Equal(t, actionCharge, lp.optimizerAction)
+	assert.Equal(t, 55.0, ctrl.soc, "boosting pins the reserve at the slot target")
+
+	site.battery.Soc = 55
+	cycle()
+	require.Equal(t, actionCharge, lp.optimizerAction, "the car keeps charging")
+	assert.Equal(t, 3000.0, lp.optimizerChargePower, "at the next slot's power")
+	assert.Equal(t, 50.0, ctrl.soc, "the pin follows the plan to the next slot's target")
 }

@@ -336,11 +336,14 @@ func (site *Site) suggestionComputedAt() time.Time {
 // The actionable flag is evaluated on read against the device's current
 // action since that changes between optimizer runs.
 func (site *Site) suggestion(key, currentAction string) *types.Suggestion {
+	now := time.Now()
+
 	site.RLock()
 	plan := site.suggestions[key]
+	at := site.planTimeLocked(now)
 	site.RUnlock()
 
-	s, ok := currentSuggestion(plan, time.Now())
+	s, ok := currentSuggestion(plan, at)
 	if !ok {
 		return nil
 	}
@@ -358,10 +361,9 @@ func (site *Site) suggestion(key, currentAction string) *types.Suggestion {
 // mode). If controllable batteries disagree it returns Unknown, since the site
 // applies a single mode.
 func (site *Site) optimizerBatteryMode() api.BatteryMode {
-	now := time.Now()
-
 	site.RLock()
 	schedules := site.batterySchedules
+	now := site.planTimeLocked(time.Now())
 	site.RUnlock()
 
 	res := api.BatteryUnknown
@@ -412,21 +414,39 @@ func (site *Site) loadpointOptimizerAction(id int) (string, float64, string) {
 		return "", 0, ""
 	}
 
-	action := s.Action
-
-	// A battery-sourced boost drains the home battery into the car. Once the pack
-	// reaches the plan's reserve it stops discharging, so continuing to charge at
-	// the requested power would import from the grid at (peak) prices - the boost
-	// is only ever meant to consume the pack's surplus above the reserve. Stop the
-	// car there. The stopped car also releases the pack's reserve pin
-	// (optimizerReservePinned), so the pack goes on serving the house instead
-	// of holding at the target while the house imports.
-	if action == actionCharge && s.Source == sourceBattery && site.batteryBoostReserveReached(s.Charge, lp.GetChargePower()) {
-		action = actionStop
+	// A battery-sourced boost drains the home battery into the car down to the
+	// slot's planned reserve. Once the pack is there the boost has done this slot's
+	// work, so the plan's next slot takes over early (see batteryBoostReserveCheck):
+	// re-resolve the suggestion at the advanced plan time, and keep going while that
+	// too is a boost whose reserve is already reached. If the plan can't continue, or
+	// the boost's draw is spilling to the grid, the car stops. The stopped car also
+	// releases the pack's reserve pin (optimizerReservePinned), so the pack goes on
+	// serving the house instead of holding at the target while the house imports.
+	for s.Action == actionCharge && s.Source == sourceBattery {
+		switch site.batteryBoostReserveCheck(s.Charge, lp.GetChargePower()) {
+		case boostStopped:
+			return actionStop, s.Charge, s.Source
+		case boostAdvanced:
+			if next := site.suggestion(loadpointKey(id), loadpointCurrentAction(lp)); next != nil {
+				s = next
+				continue
+			}
+			return "", 0, ""
+		}
+		break
 	}
 
-	return action, s.Charge, s.Source
+	return s.Action, s.Charge, s.Source
 }
+
+// boostReserveState is the reserve guard's verdict on a running battery boost
+type boostReserveState int
+
+const (
+	boostRunning  boostReserveState = iota // the pack is still above the slot's reserve
+	boostAdvanced                          // the reserve is reached and the plan moved on to its next slot
+	boostStopped                           // the car must stop
+)
 
 // boostReserveLagCycles is how many control cycles of boost draw the reserve trip
 // looks ahead. The guard sees cycle-stale soc/grid readings (the action is computed
@@ -435,37 +455,41 @@ func (site *Site) loadpointOptimizerAction(id int) (string, float64, string) {
 // for ~this long. Two cycles ≈ the observed stale-read + charger-ramp latency.
 const boostReserveLagCycles = 2
 
-// batteryBoostReserveReached reports whether an active battery boost has driven
-// the home battery to its planned reserve, so the boost must stop charging the
-// car instead of importing from the grid to keep it going. requestedPower is the
-// boost's requested power, actualPower the car's measured charge power.
+// batteryBoostReserveCheck reports whether an active battery boost has driven the
+// home battery to its planned reserve. requestedPower is the boost's requested
+// power, actualPower the car's measured charge power.
 //
-// It trips when the (power-integrated) pack soc has reached the plan's target
-// reserve plus a reaction-lag margin (so the car stops before the pack crosses the
-// reserve, not a cycle after it has already spilled to the grid), or - as a real-
-// time backstop - when the boost's own draw is already spilling to the grid. It
-// latches for the current slot once tripped: at the reserve the pack won't recover
-// within the slot, so re-enabling the car would only oscillate it on and off around
-// the boundary (car off -> grid import clears -> car on -> pack still at reserve ...).
+// The reserve is reached when the (power-integrated) pack soc is at the plan's
+// target for the slot plus a reaction-lag margin, so the car reacts before the
+// pack crosses the reserve, not a cycle after it has already spilled to the grid.
+// Reaching it means the pack is ahead of the plan: the slot's planned draw is
+// done, and the next slot's plan is what the optimizer decided to do from here.
+// So the plan time advances to that slot (see planTimeLocked), and the car follows its
+// suggestion - a smaller draw, surplus charging, or a stop - instead of switching
+// off until the clock catches up, which would turn one planned ramp-down into an
+// off/on cycle. Without a next slot to move on to the car stops.
+//
+// As a real-time backstop the car also stops when the boost's own draw is already
+// spilling to the grid, i.e. the pack stopped discharging short of its target. That
+// stop latches for the slot: the pack won't recover within the slot, so re-enabling
+// the car would only oscillate it on and off around the boundary.
 //
 // Reads last-cycle gridPower/soc/chargePower (meters refresh later in sitePower);
 // a one-cycle reaction is acceptable and dampens the oscillation.
-func (site *Site) batteryBoostReserveReached(requestedPower, actualPower float64) bool {
-	slot := time.Now().Truncate(tariff.SlotDuration)
-	if slot.Equal(site.batteryBoostReserveSlot) {
-		return true // already tripped this slot
+func (site *Site) batteryBoostReserveCheck(requestedPower, actualPower float64) boostReserveState {
+	now := time.Now()
+	slot := now.Truncate(tariff.SlotDuration)
+	if slot.Equal(site.batteryBoostStopSlot) {
+		return boostStopped // already stopped this slot
 	}
 
-	tripped := false
-
-	// Stop the boost a lookahead-margin ABOVE the plan's reserve, not exactly at it.
-	// The soc/grid readings the guard sees are a cycle stale (the action is computed
+	// Trip a lookahead-margin ABOVE the plan's reserve, not exactly at it. The
+	// soc/grid readings the guard sees are a cycle stale (the action is computed
 	// before the meters refresh) and the charger takes ~a further cycle to ramp down,
 	// so waiting for soc <= target lets the pack cross the reserve mid-cycle and the
 	// car's draw spill to the grid at (peak) prices for ~a cycle. The margin is the SoC
 	// the boost pulls over that reaction lag - derived from the boost power, pack
-	// capacity and loop cadence, so it self-scales instead of being a fixed offset - so
-	// the pack coasts down to the reserve only after the car is already off.
+	// capacity and loop cadence, so it self-scales instead of being a fixed offset.
 	soc := site.battery.Soc
 	var margin float64
 	if capacity := site.battery.Capacity; capacity > 0 && requestedPower > 0 && site.interval > 0 {
@@ -476,10 +500,28 @@ func (site *Site) batteryBoostReserveReached(requestedPower, actualPower float64
 		if dev == nil {
 			continue
 		}
-		if target := site.optimizerBatteryTargetSoc(dev.Config().Name); target > 0 && soc <= target+margin {
-			tripped = true
-			break
+		name := dev.Config().Name
+		cur, ok := site.optimizerBatterySlot(name)
+		if !ok || cur.soc <= 0 || soc > cur.soc+margin {
+			continue
 		}
+
+		site.RLock()
+		plan := site.batterySchedules[batteryKey(name)]
+		site.RUnlock()
+		if _, ok := currentBatterySlot(plan, cur.until, site.batteryDeviceSoc(name)); !ok || !cur.until.After(now) {
+			site.log.DEBUG.Printf("optimizer: battery boost reached reserve (soc %.0f%%, target %.0f%%) - stopping car to avoid grid import", soc, cur.soc)
+			site.batteryBoostStopSlot = slot
+			site.requestReplan("battery boost reached reserve")
+			return boostStopped
+		}
+
+		site.log.DEBUG.Printf("optimizer: battery boost reached reserve (soc %.0f%%, target %.0f%%) - moving on to the plan's next slot", soc, cur.soc)
+		site.Lock()
+		site.batteryBoostAdvanceSlot = slot
+		site.batteryBoostAdvance = cur.until
+		site.Unlock()
+		return boostAdvanced
 	}
 
 	// real-time safety net: the car is drawing the boost power but a large share of
@@ -488,19 +530,16 @@ func (site *Site) batteryBoostReserveReached(requestedPower, actualPower float64
 	// from a hold state the boost is just leaving - can't false-trip and latch the
 	// car off before it even starts. Half the boost power keeps ordinary home-load
 	// import from tripping it (at the reserve grid import ~= the full boost power).
-	if !tripped && requestedPower > 0 && actualPower > requestedPower/2 && site.gridPower > requestedPower/2 {
-		tripped = true
-	}
-
-	if tripped {
-		// logged once per slot (set only on the first trip), not every cycle
-		site.log.DEBUG.Printf("optimizer: battery boost reached reserve (soc %.0f%%, grid %.0fW) - stopping car to avoid grid import", soc, site.gridPower)
-		site.batteryBoostReserveSlot = slot
+	if requestedPower > 0 && actualPower > requestedPower/2 && site.gridPower > requestedPower/2 {
+		site.log.DEBUG.Printf("optimizer: battery boost spilling to the grid (soc %.0f%%, grid %.0fW) - stopping car to avoid grid import", soc, site.gridPower)
+		site.batteryBoostStopSlot = slot
 
 		// the plan expected the boost to continue; re-plan from where it stopped
 		site.requestReplan("battery boost reached reserve")
+		return boostStopped
 	}
-	return tripped
+
+	return boostRunning
 }
 
 // replanner re-plans when execution deviates from the optimizer's plan
@@ -834,16 +873,34 @@ func (site *Site) batteryDeviceSoc(name string) float64 {
 // battery's current plan slot, or 0 when there is no plan. Control passes it to a
 // BatteryModeController so e.g. a grid discharge stops at the target.
 func (site *Site) optimizerBatteryTargetSoc(name string) float64 {
-	now := time.Now()
-
-	site.RLock()
-	plan := site.batterySchedules[batteryKey(name)]
-	site.RUnlock()
-
-	if s, ok := currentBatterySlot(plan, now, site.batteryDeviceSoc(name)); ok {
+	if s, ok := site.optimizerBatterySlot(name); ok {
 		return s.soc
 	}
 	return 0
+}
+
+// optimizerBatterySlot resolves the named battery's plan slot in effect at the
+// plan time (see planTimeLocked).
+func (site *Site) optimizerBatterySlot(name string) (batterySlot, bool) {
+	site.RLock()
+	plan := site.batterySchedules[batteryKey(name)]
+	at := site.planTimeLocked(time.Now())
+	site.RUnlock()
+
+	return currentBatterySlot(plan, at, site.batteryDeviceSoc(name))
+}
+
+// planTimeLocked is the time the optimizer's plans are resolved at: now, or, once
+// a battery boost has drawn its slot's share of the pack ahead of the clock, the
+// start of the following slot, so the car and the pack move on to what the plan
+// does next instead of idling until the boundary. The advance lives only within
+// the slot it was made in; the boundary run re-plans from fresh state anyway.
+// Callers hold the site lock.
+func (site *Site) planTimeLocked(now time.Time) time.Time {
+	if site.batteryBoostAdvance.After(now) && now.Truncate(tariff.SlotDuration).Equal(site.batteryBoostAdvanceSlot) {
+		return site.batteryBoostAdvance
+	}
+	return now
 }
 
 // setBatterySchedules replaces the per-battery mode plans used for front-running

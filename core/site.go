@@ -131,7 +131,9 @@ type Site struct {
 	batterySpikeSlot         time.Time                   // 15-min slot the export spike was last (re)written for
 	batteryBoostSlot         time.Time                   // 15-min slot the car-charge reserve pin was last written for (zero = not pinned)
 	gridOutage               bool                        // site is islanded from the grid (last known, kept across read errors)
-	batteryBoostReserveSlot  time.Time                   // 15-min slot a battery boost hit the pack's reserve (latches the car stop, zero = not tripped)
+	batteryBoostStopSlot     time.Time                   // 15-min slot a battery boost was stopped in (latches the car stop, zero = not tripped)
+	batteryBoostAdvanceSlot  time.Time                   // 15-min slot a battery boost consumed its planned share of the pack early in
+	batteryBoostAdvance      time.Time                   // plan time the boost moved on to (the next slot's start), valid within batteryBoostAdvanceSlot
 	interval                 time.Duration               // control-loop cadence (set in Run), for deriving reaction-lag margins
 	suggestionActions        map[string]string           // last notified actionable optimizer action by device key
 

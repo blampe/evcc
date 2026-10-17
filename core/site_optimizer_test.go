@@ -802,8 +802,9 @@ func TestBatteryBoostReserveGate(t *testing.T) {
 	assert.Equal(t, 9600.0, power)
 	assert.Equal(t, sourceBattery, source, "source stays battery so the reserve stays pinned")
 
-	// pack soc reached the reserve => stop, keeping the source pinned so the pack
-	// holds at the target instead of draining further
+	// pack soc reached the reserve and the plan has no next slot to move on to =>
+	// stop, keeping the source pinned so the pack holds at the target instead of
+	// draining further
 	site = newSite()
 	site.battery.Soc = 55
 	action, _, source = site.loadpointOptimizerAction(0)
@@ -864,6 +865,78 @@ func TestBatteryBoostReserveGate(t *testing.T) {
 	action, _, source = site.loadpointOptimizerAction(0)
 	assert.Equal(t, actionCharge, action, "grid-sourced charge isn't gated")
 	assert.Equal(t, sourceGrid, source)
+}
+
+// TestBatteryBoostReserveAdvancesPlan covers the handoff from a boost to the plan's
+// next slot: once the pack reaches the boost slot's reserve the car follows the next
+// slot's suggestion right away (a smaller battery draw, surplus charging, or a stop)
+// instead of switching off until the slot boundary, and the pack's target moves on
+// with it. The advance sticks for the slot and does not re-plan.
+func TestBatteryBoostReserveAdvancesPlan(t *testing.T) {
+	boundary := time.Now().Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+	newSite := func(next types.Suggestion) *Site {
+		s := &Site{
+			log:        util.NewLogger("foo"),
+			loadpoints: []*Loadpoint{NewLoadpoint(util.NewLogger("lp0"), nil)},
+			batteryMeters: []config.Device[api.Meter]{
+				config.NewStaticDevice(config.Named{Name: "home"}, api.Meter(&recordingBatteryController{})),
+			},
+			batterySchedules: map[string][]batterySlot{
+				batteryKey("home"): {
+					{until: boundary, action: "normal", soc: 55, startSoc: 70},
+					{until: boundary.Add(tariff.SlotDuration), action: "normal", soc: 50, startSoc: 55},
+				},
+			},
+		}
+		s.battery.Soc = 59
+		s.setSuggestionPlans(map[string][]suggestionSlot{
+			loadpointKey(0): {
+				{until: boundary, suggestion: types.Suggestion{Action: actionCharge, Charge: 9600, Source: sourceBattery}},
+				{until: boundary.Add(tariff.SlotDuration), suggestion: next},
+			},
+		})
+		return s
+	}
+
+	// above the reserve: the boost runs at its own power
+	site := newSite(types.Suggestion{Action: actionCharge, Charge: 3000, Source: sourceBattery})
+	action, power, _ := site.loadpointOptimizerAction(0)
+	require.Equal(t, actionCharge, action)
+	assert.Equal(t, 9600.0, power)
+	assert.Equal(t, 55.0, site.optimizerBatteryTargetSoc("home"))
+
+	// at the reserve: the next slot's smaller boost takes over, with its target
+	site.battery.Soc = 55
+	action, power, source := site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionCharge, action, "the car keeps charging")
+	assert.Equal(t, 3000.0, power, "at the next slot's power")
+	assert.Equal(t, sourceBattery, source)
+	assert.Equal(t, 50.0, site.optimizerBatteryTargetSoc("home"), "the pack's target moves on too")
+	assert.Empty(t, site.replanSlots, "following the plan early is not a deviation")
+
+	// the advance sticks for the slot even if the pack reads above the reserve again
+	site.battery.Soc = 56
+	_, power, _ = site.loadpointOptimizerAction(0)
+	assert.Equal(t, 3000.0, power, "stays on the next slot")
+
+	// the next slot's reserve reached as well, with nothing planned beyond: stop
+	site.battery.Soc = 50
+	action, _, _ = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionStop, action)
+
+	// a next slot on surplus is followed as is: it is not gated by the reserve
+	site = newSite(types.Suggestion{Action: actionCharge, Charge: 2000, Source: sourceSurplus})
+	site.battery.Soc = 55
+	action, power, source = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionCharge, action)
+	assert.Equal(t, 2000.0, power)
+	assert.Equal(t, sourceSurplus, source)
+
+	// a next slot that stops the car stops it
+	site = newSite(types.Suggestion{Action: actionStop})
+	site.battery.Soc = 55
+	action, _, _ = site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionStop, action)
 }
 
 // TestLoadpointChargeSource classifies a loadpoint charge as grid-sourced when

@@ -77,14 +77,16 @@ func (site *Site) updateBatteryMode(batteryGridChargeActive bool, rate api.Rate)
 	// while the optimizer has a car charging from the battery or the grid, normal
 	// mode pins the pack's reserve to the plan's per-slot target SoC (see
 	// applyBatteryMode) so it stops there instead of draining to MinSoc. Re-apply
-	// the (unchanged) normal mode when the charge starts or the slot advances so the
-	// pin tracks the plan, and once when it ends to restore the MinSoc reserve.
+	// the (unchanged) normal mode when the charge starts or the plan's slot advances
+	// (by the clock, or early once a boost reached its reserve) so the pin tracks the
+	// plan, and once when it ends to restore the MinSoc reserve.
 	boostActive := site.optimizerReservePinned()
 	site.RLock()
 	boostSlot := site.batteryBoostSlot
+	planSlot := site.planTimeLocked(time.Now()).Truncate(tariff.SlotDuration)
 	site.RUnlock()
 	if batteryMode == api.BatteryUnknown && site.batteryMode == api.BatteryNormal &&
-		((boostActive && !slot.Equal(boostSlot)) || (!boostActive && !boostSlot.IsZero())) {
+		((boostActive && !planSlot.Equal(boostSlot)) || (!boostActive && !boostSlot.IsZero())) {
 		batteryMode = site.batteryMode
 	}
 
@@ -97,7 +99,7 @@ func (site *Site) updateBatteryMode(batteryGridChargeActive bool, rate api.Rate)
 			// track the slot the boost reserve was pinned for (zero when not boosting)
 			newBoostSlot := time.Time{}
 			if boostActive {
-				newBoostSlot = slot
+				newBoostSlot = planSlot
 			}
 			site.Lock()
 			site.batteryBoostSlot = newBoostSlot
@@ -121,7 +123,7 @@ func (site *Site) updateBatteryMode(batteryGridChargeActive bool, rate api.Rate)
 // pin would strand the house on the grid when solar falls short of the forecast.
 //
 // Only while the car is actually told to charge. Once the reserve guard stops a
-// boost (batteryBoostReserveReached turns the action into "stop", source still
+// boost (batteryBoostReserveCheck turns the action into "stop", source still
 // "battery") the pin has nothing left to protect and only strands the house: with
 // the pack held at the slot's end-of-slot target, the house - and the car's draw
 // while the charger ramps down - comes from the grid for the rest of the slot
