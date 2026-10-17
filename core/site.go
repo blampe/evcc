@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -136,6 +137,7 @@ type Site struct {
 
 	optimizerMu      sync.Mutex                  // guards optimizer runs
 	optimizerUpdated time.Time                   // last optimizer run, guarded by optimizerMu
+	optimizerRerun   atomic.Bool                 // a forced run arrived while one was in progress
 	replanSlots      map[string]time.Time        // per deviation reason, the slot it last forced a re-plan in
 	forecasts        map[string]forecastEntry    // cached hybrid forecasts by collector ref, refit daily under optimizerMu
 	consumption      map[string]consumptionEntry // cached vehicle driving forecasts by loadpoint title, refit daily under optimizerMu

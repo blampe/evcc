@@ -1890,3 +1890,33 @@ func TestBatteryModePlanStartSoc(t *testing.T) {
 	assert.InDelta(t, 19, plan[1].startSoc, 1e-6, "later slots start where the previous one ended")
 	assert.InDelta(t, 17, plan[1].soc, 1e-6)
 }
+
+// TestOptimizerExclusive keeps a forced request that arrives during a run and runs
+// it once that run finishes, while an unforced one is dropped.
+func TestOptimizerExclusive(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		force bool
+		want  []bool
+	}{
+		{"forced during a run", true, []bool{false, true}},
+		{"unforced during a run", false, []bool{false}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			site := new(Site)
+			var runs []bool
+			var run func(bool)
+			run = func(force bool) {
+				runs = append(runs, force)
+				if len(runs) == 1 {
+					site.optimizerExclusive(tc.force, run)
+				}
+			}
+
+			site.optimizerExclusive(false, run)
+
+			assert.Equal(t, tc.want, runs)
+			assert.True(t, site.optimizerMu.TryLock(), "unlocked")
+		})
+	}
+}

@@ -853,18 +853,45 @@ func optimizerDue(last, now time.Time, minAge time.Duration) bool {
 // optimizerUpdateAsync runs the optimizer unless the last run is younger than
 // minAge and still in the current slot (see optimizerDue). Pass 0 to force a run,
 // e.g. when a changed setting should take effect without waiting for the next
-// slot. It is a no-op when the optimizer is not active or a run is already in
-// progress; the running update reflects the change on its next slot.
+// slot. It is a no-op when the optimizer is not active. A forced run requested
+// while one is in progress runs once that one finishes.
 func (site *Site) optimizerUpdateAsync(minAge time.Duration) {
 	if !sponsor.IsAuthorized() || !optimizerEnabled() {
 		return
 	}
 
-	if !site.optimizerMu.TryLock() {
-		return
-	}
-	defer site.optimizerMu.Unlock()
+	site.optimizerExclusive(minAge == 0, func(force bool) {
+		if force {
+			minAge = 0
+		}
+		site.optimizerRun(minAge)
+	})
+}
 
+// optimizerExclusive calls run under optimizerMu, skipping it while another run is
+// in progress. A forced request that finds one in progress is kept: that run may
+// have read its inputs before the change, so run is called again, forced, after it.
+func (site *Site) optimizerExclusive(force bool, run func(force bool)) {
+	for {
+		if !site.optimizerMu.TryLock() {
+			if force {
+				site.optimizerRerun.Store(true)
+			}
+			return
+		}
+		site.optimizerRerun.Store(false)
+		run(force)
+		site.optimizerMu.Unlock()
+
+		if !site.optimizerRerun.CompareAndSwap(true, false) {
+			return
+		}
+		force = true
+	}
+}
+
+// optimizerRun runs the optimizer unless minAge says it is not due. Called under optimizerMu.
+func (site *Site) optimizerRun(minAge time.Duration) {
 	if minAge == 0 {
 		// keep the gate open so a not-ready run is retried on the next cycle
 		site.optimizerUpdated = time.Time{}
