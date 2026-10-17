@@ -1,7 +1,7 @@
 # Optimizer goldens
 
 - `cases/` are `test_cases/*.json` of github.com/evcc-io/optimizer (branch
-  `blampe/optimizer-redesign`, e2b5f03).
+  `blampe/optimizer-redesign`, db20123).
 - `golden/<case>.json` is the response the Python service returned for the case's request, and
   `mps.sha256` the SHA-256 of every MPS file PuLP handed to CBC while solving it, in solve order.
 - `scenarios.sha256` holds the same hashes for the solves of the ported scenario tests

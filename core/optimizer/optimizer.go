@@ -698,11 +698,19 @@ func (o *Optimizer) setupTargetFunction() {
 		iadd(&preference, sum.neg().mul(prcStart))
 	}
 
+	// a priority is a claim on the site's own energy ahead of other consumers, not on
+	// the grid: netting the import out of the early-charge reward leaves grid-sourced
+	// charge nothing to gain from running early, and grid import as a whole is
+	// deferred at the same weight, so a cost tie between importing now and later
+	// resolves to later
 	for i := range o.batteries {
 		cp := float64(o.batteries[i].CPriority)
 		for t := range T {
 			iadd(&preference, affine(v.c[i][t]).mul(o.minImportPrice).mul(5e-5).mul(float64(T-t)).mul(cp))
 			iadd(&preference, affine(v.d[i][t]).mul(o.minImportPrice).mul(5e-5).mul(float64(T-t)).mul(cp))
+			if cp != 0 {
+				iadd(&preference, affine(v.n[t]).neg().mul(o.minImportPrice).mul(5e-5).mul(float64(T-t)).mul(cp))
+			}
 		}
 	}
 	o.preferenceObjective = preference
