@@ -672,9 +672,9 @@ func optimizerURI() string {
 }
 
 const (
-	// optimizerTimeLimit is the solver time limit of the hosted optimizer service
-	// (OPTIMIZER_TIME_LIMIT): the deadline of an in-process solve, whose stages share it
-	optimizerTimeLimit = 10 * time.Second
+	// optimizerTimeLimit is the deadline of an in-process solve, whose stages share it.
+	// The hosted service's 10s left a two-day horizon's preference stage unfinished.
+	optimizerTimeLimit = 30 * time.Second
 
 	// optimizerTimeout bounds a whole optimizer run, as the HTTP client's timeout did
 	optimizerTimeout = 90 * time.Second
