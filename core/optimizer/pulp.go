@@ -298,6 +298,7 @@ type lpProblem struct {
 	registered  map[*lpVar]bool
 	status      int
 	solStatus   int
+	statusText  string // the solver's status line of the last solve
 	lastUnused  int
 	dummy       *lpVar
 
@@ -603,6 +604,7 @@ func solveCBC(ctx context.Context, p *lpProblem, opts solverOptions) error {
 	}
 
 	p.status, p.solStatus = status, solStatus
+	p.statusText = res.StatusText
 	return nil
 }
 

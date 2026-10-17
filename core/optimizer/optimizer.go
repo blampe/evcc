@@ -156,6 +156,16 @@ type Settings struct {
 	ProbeSeconds *float64
 	// PreferenceBudget is the money the preference stage may spend
 	PreferenceBudget float64
+	// StageReport, if set, is called after each stage's solve
+	StageReport func(Stage)
+}
+
+// Stage describes one stage's solve for diagnostics
+type Stage struct {
+	Name   string // commitments, probe, cost or preferences
+	Status string // the solver's own status, e.g. "Stopped on time"
+	Took   time.Duration
+	Limit  time.Duration // zero without a limit
 }
 
 // DefaultSettings are the OptimizerSettings defaults
@@ -963,8 +973,23 @@ func (o *Optimizer) addBatteryConstraints() {
 }
 
 // solveStage is problem.solve(self._solver(tmpdir, timeLimit=..., gapAbs=...))
-func (o *Optimizer) solveStage(ctx context.Context, timeLimit, gapAbs *float64) error {
-	return o.problem.solveWith(ctx, solverOptions{timeLimit: timeLimit, gapAbs: gapAbs})
+func (o *Optimizer) solveStage(ctx context.Context, name string, timeLimit, gapAbs *float64) error {
+	o.problem.statusText = ""
+	start := time.Now()
+	err := o.problem.solveWith(ctx, solverOptions{timeLimit: timeLimit, gapAbs: gapAbs})
+
+	if report := o.settings.StageReport; report != nil && err == nil {
+		stage := Stage{Name: name, Status: o.problem.statusText, Took: time.Since(start)}
+		if stage.Status == "" {
+			stage.Status = lpStatus[o.problem.status]
+		}
+		if timeLimit != nil {
+			stage.Limit = time.Duration(*timeLimit * float64(time.Second))
+		}
+		report(stage)
+	}
+
+	return err
 }
 
 type snapshot map[*lpVar]*float64
@@ -1027,11 +1052,14 @@ func (o *Optimizer) solvePreferences(ctx context.Context, deadline *time.Time) e
 	}
 
 	o.problem.setObjective(o.preferenceObjective.mul(objectiveScale(o.preferenceObjective)))
-	if err := o.solveStage(ctx, rem, nil); err != nil {
+	if err := o.solveStage(ctx, "preferences", rem, nil); err != nil {
 		return err
 	}
 
 	o.preferenceStage = lpStatus[o.problem.status]
+	if o.problem.solStatus == lpSolutionIntegerFeasible {
+		o.preferenceStage = "Feasible" // stopped before proving it optimal
+	}
 	integral := o.problem.solStatus == lpSolutionOptimal || o.problem.solStatus == lpSolutionIntegerFeasible
 	improved := integral &&
 		mustValue(o.preferenceObjective) > undecided &&
@@ -1057,7 +1085,7 @@ func (o *Optimizer) solveCommitments(ctx context.Context, deadline *time.Time) e
 	}
 	scale := objectiveScale(o.commitmentObjective)
 	o.problem.setObjective(o.commitmentObjective.mul(scale))
-	if err := o.solveStage(ctx, rem, nil); err != nil {
+	if err := o.solveStage(ctx, "commitments", rem, nil); err != nil {
 		return err
 	}
 
@@ -1082,7 +1110,7 @@ func (o *Optimizer) probeThenSplit(ctx context.Context, deadline *time.Time) err
 	}
 	probing := probe == nil || *probe != 0
 	if probing {
-		if err := o.solveStage(ctx, probe, nil); err != nil {
+		if err := o.solveStage(ctx, "probe", probe, nil); err != nil {
 			return err
 		}
 	}
@@ -1111,7 +1139,7 @@ func (o *Optimizer) probeThenSplit(ctx context.Context, deadline *time.Time) err
 	if gapAbs != nil {
 		gap = fptr(float64(*gapAbs * scale))
 	}
-	if err := o.solveStage(ctx, rem, gap); err != nil {
+	if err := o.solveStage(ctx, "cost", rem, gap); err != nil {
 		return err
 	}
 

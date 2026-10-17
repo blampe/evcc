@@ -59,6 +59,11 @@ func WithoutProbe() Option {
 	return func(s *Settings) { s.ProbeSeconds = fptr(0) }
 }
 
+// WithStageReport calls report after each stage's solve
+func WithStageReport(report func(Stage)) Option {
+	return func(s *Settings) { s.StageReport = report }
+}
+
 // Optimize solves the request in process, the way the optimizer service answers
 // POST /optimize/charge-schedule. The request goes through the same JSON encoding it did on its
 // way to the service, so a zero value the client omits is a default here as well, and the

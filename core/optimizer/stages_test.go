@@ -157,7 +157,7 @@ func TestObjectiveSplitPreferenceStageDecidesTheTie(t *testing.T) {
 			undecidedOpt := buildFromCase(t, name, "")
 			undecidedOpt.CreateModel()
 			undecidedOpt.problem.setObjective(undecidedOpt.costObjective.mul(undecidedOpt.objectiveScale))
-			require.NoError(t, undecidedOpt.solveStage(context.Background(), nil, nil))
+			require.NoError(t, undecidedOpt.solveStage(context.Background(), "cost", nil, nil))
 			undecided := *value(undecidedOpt.preferenceObjective)
 
 			decided := buildFromCase(t, name, "")
@@ -292,4 +292,44 @@ func TestWithoutProbeGoesStraightToTheSplit(t *testing.T) {
 	WithoutProbe()(&o.settings)
 	require.Equal(t, "Optimal", solveOK(t, o).Status)
 	assert.Equal(t, "split", o.solvePath, "an easy request would settle in the probe")
+}
+
+func TestStageReportNamesEachSolve(t *testing.T) {
+	o := buildFromCase(t, splitCases[0], "")
+	WithoutProbe()(&o.settings)
+
+	var stages []Stage
+	WithStageReport(func(s Stage) { stages = append(stages, s) })(&o.settings)
+	solveOK(t, o)
+
+	names := make([]string, 0, len(stages))
+	for _, s := range stages {
+		names = append(names, s.Name)
+		assert.True(t, strings.HasPrefix(s.Status, "Optimal"), "%s: %s", s.Name, s.Status)
+		assert.Positive(t, s.Took, s.Name)
+	}
+	assert.Equal(t, []string{"cost", "preferences"}, names[len(names)-2:])
+}
+
+// TestPreferenceStageStoppedOnTimeIsNotOptimal reports a preference stage that
+// stopped on time with a solution as feasible, the way CBC means it.
+func TestPreferenceStageStoppedOnTimeIsNotOptimal(t *testing.T) {
+	o := buildFromCase(t, splitCases[0], "")
+	o.settings.ProbeSeconds = fptr(0)
+	o.CreateModel()
+
+	real := o.problem.solve
+	o.problem.solve = func(ctx context.Context, p *lpProblem, opts solverOptions) error {
+		if err := real(ctx, p, opts); err != nil {
+			return err
+		}
+		if o.costStageValue != nil { // the preference stage
+			p.solStatus = lpSolutionIntegerFeasible // "Stopped on time - objective value ..."
+		}
+		return nil
+	}
+	_, err := o.Solve(context.Background())
+	require.NoError(t, err)
+
+	assert.True(t, strings.HasPrefix(o.preferenceStage, "Feasible"), o.preferenceStage)
 }

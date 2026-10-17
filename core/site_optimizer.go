@@ -1210,7 +1210,9 @@ func (site *Site) optimize(req optimizer.OptimizationInput) (optimizer.Optimizat
 
 	ctx, cancel := context.WithTimeout(context.Background(), optimizerTimeLimit)
 	defer cancel()
-	return evopt.Optimize(ctx, req, evopt.WithoutProbe())
+	return evopt.Optimize(ctx, req, evopt.WithoutProbe(), evopt.WithStageReport(func(s evopt.Stage) {
+		site.log.DEBUG.Printf("optimizer: %s stage %s in %.1fs of %.1fs", s.Name, s.Status, s.Took.Seconds(), s.Limit.Seconds())
+	}))
 }
 
 // optimizeRemote posts the request to the optimizer service at uri
