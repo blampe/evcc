@@ -75,3 +75,31 @@ func TestRequireCriticalConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestEnsureAuthUnlessLoopback(t *testing.T) {
+	gate := ensureAuthUnlessLoopback(fakeAuth{mode: auth.Enabled, password: "secret"})
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+
+	for _, tc := range []struct {
+		name   string
+		remote string
+		header string
+		want   int
+	}{
+		{"ipv4 loopback", "127.0.0.1:5000", "", http.StatusOK},
+		{"ipv6 loopback", "[::1]:5000", "", http.StatusOK},
+		{"lan", "192.168.1.20:5000", "", http.StatusUnauthorized},
+		{"proxied", "127.0.0.1:5000", "192.168.1.20", http.StatusUnauthorized},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodGet, "/api/system/log", nil)
+			r.RemoteAddr = tc.remote
+			if tc.header != "" {
+				r.Header.Set("X-Forwarded-For", tc.header)
+			}
+			w := httptest.NewRecorder()
+			gate(ok).ServeHTTP(w, r)
+			assert.Equal(t, tc.want, w.Code)
+		})
+	}
+}

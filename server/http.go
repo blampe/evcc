@@ -415,12 +415,15 @@ func (s *HTTPd) RegisterSystemHandler(site *core.Site, pub publisher, cache *uti
 	}
 
 	{ // api/system
+		logs := api.PathPrefix("/system").Subrouter()
+		logs.Use(ensureAuthUnlessLoopback(auth))
+		logs.Methods("GET").Path("/log").HandlerFunc(logHandler)
+		logs.Methods("GET").Path("/log/areas").HandlerFunc(logAreasHandler)
+
 		api := api.PathPrefix("/system").Subrouter()
 		api.Use(ensureAuthHandler(auth))
 
 		routes := map[string]route{
-			"log":        {"GET", "/log", logHandler},
-			"logareas":   {"GET", "/log/areas", logAreasHandler},
 			"clearcache": {"DELETE", "/cache", clearCacheHandler},
 			"shutdown": {"POST", "/shutdown", func(w http.ResponseWriter, r *http.Request) {
 				shutdown()

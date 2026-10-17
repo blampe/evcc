@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -212,6 +213,33 @@ func ensureAuthHandler(authObject auth.Auth) mux.MiddlewareFunc {
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+// ensureAuthUnlessLoopback lets direct loopback requests through without auth. Proxied
+// requests carry forwarding headers and still need auth, since the proxy itself is local.
+func ensureAuthUnlessLoopback(authObject auth.Auth) mux.MiddlewareFunc {
+	return func(next http.Handler) http.Handler {
+		authed := ensureAuthHandler(authObject)(next)
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if isDirectLoopback(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
+			authed.ServeHTTP(w, r)
+		})
+	}
+}
+
+func isDirectLoopback(r *http.Request) bool {
+	if r.Header.Get("X-Forwarded-For") != "" || r.Header.Get("Forwarded") != "" || r.Header.Get("X-Real-Ip") != "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func apiKeyStatusHandler(authObject auth.Auth) http.HandlerFunc {
