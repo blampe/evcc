@@ -9,6 +9,11 @@ import (
 // chargingSolve plans a car that needs two minimum-power slots at a flat price,
 // so when it charges is a cost tie that only the start penalty can break.
 func chargingSolve(t *testing.T, charging bool) (Result, *Optimizer) {
+	o := chargingOptimizer(t, charging)
+	return solveOK(t, o), o
+}
+
+func chargingOptimizer(t *testing.T, charging bool) *Optimizer {
 	const T = 8
 	car := BatteryConfig{
 		ChargeFromGrid: true,
@@ -17,10 +22,19 @@ func chargingSolve(t *testing.T, charging bool) (Result, *Optimizer) {
 		SGoal:    cat(repeat(0, T-1), []float64{20000 + 2*460*0.9}),
 		Charging: charging,
 	}
-	o := newOptimizer(t, strat("none", "none"), GridConfig{},
+	return newOptimizer(t, strat("none", "none"), GridConfig{},
 		[]BatteryConfig{car},
 		TimeSeriesData{Dt: repeat(900, T), Gt: repeat(0, T), Ft: repeat(0, T), PN: repeat(0.0003, T), PE: repeat(0.00005, T)}, 0.9, 0.9)
-	return solveOK(t, o), o
+}
+
+// TestChargingSolvesInStages writes each stage's MPS on its own: a running session
+// must leave the first start variable in some row, or CBC refuses its bound.
+func TestChargingSolvesInStages(t *testing.T) {
+	o := chargingOptimizer(t, true)
+	WithoutProbe()(&o.settings)
+	solveOK(t, o)
+	assert.Equal(t, "split", o.solvePath)
+	assert.Zero(t, mustValue(affine(o.v.zStart[0][0])), "charging on is no start")
 }
 
 func TestChargingContinuesTheRunningSession(t *testing.T) {

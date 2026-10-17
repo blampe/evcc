@@ -504,13 +504,14 @@ func (o *Optimizer) setupVariables() {
 		}
 		v.zStart[i] = perSlot(nt, func(t int) *lpVar { return newVar(fmt.Sprintf("z_start_%d_%d", i, t), zero, fptr(1)) })
 		for t := range nt {
-			// charging in the first slot continues a running session, it is no start
-			if t == 0 && o.batteries[i].Charging {
-				continue
-			}
 			rhs := affine(zc[t])
-			if t > 0 {
+			switch {
+			case t > 0:
 				rhs.addVar(zc[t-1], -1)
+			case o.batteries[i].Charging:
+				// charging in the first slot continues a running session, it is no
+				// start: the slot before the horizon counts as charging (z_c[-1] = 1)
+				rhs.addConst(1, -1)
 			}
 			o.problem.add(ge(affine(v.zStart[i][t]), rhs), "")
 		}
