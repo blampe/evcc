@@ -71,7 +71,6 @@ const (
 	costBoundTolerance   = 1e-4
 	integralityTolerance = 1e-5
 	probeShare           = 0.2
-	preferenceTimeShare  = 0.25
 )
 
 // peakSideVariables is PEAK_SIDE_VARIABLES
@@ -1007,12 +1006,12 @@ func (o *Optimizer) solvePreferences(ctx context.Context, deadline *time.Time) e
 
 	var rem *float64
 	if deadline != nil {
+		// all that is left: cut short, the stage leaves the tie-breaks undecided
 		r := remaining(deadline)
 		if r <= 0 {
 			o.preferenceStage = "no time"
 			return nil
 		}
-		r = pyMin(r, float64(*o.timeLimit*preferenceTimeShare))
 		rem = &r
 	}
 

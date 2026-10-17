@@ -258,3 +258,31 @@ func TestFractionalSolutionOnTheIntegersPasses(t *testing.T) {
 		assert.True(t, o.isIntegral(), "%v", value)
 	}
 }
+
+// TestPreferenceStageGetsTheRemainingTime hands the preference stage everything the
+// earlier stages left of the deadline, not a fixed share of it.
+func TestPreferenceStageGetsTheRemainingTime(t *testing.T) {
+	const limit = 10 * time.Second
+
+	o := buildFromCase(t, splitCases[0], "")
+	o.settings.ProbeSeconds = fptr(0)
+	o.CreateModel()
+
+	var limits []float64
+	real := o.problem.solve
+	o.problem.solve = func(ctx context.Context, p *lpProblem, opts solverOptions) error {
+		if opts.timeLimit != nil {
+			limits = append(limits, *opts.timeLimit)
+		}
+		return real(ctx, p, opts)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	_, err := o.Solve(ctx)
+	require.NoError(t, err)
+
+	require.NotEmpty(t, limits)
+	assert.Equal(t, "Optimal", o.preferenceStage)
+	assert.Greater(t, limits[len(limits)-1], 0.5*limit.Seconds(), "the preference stage's limit")
+}
