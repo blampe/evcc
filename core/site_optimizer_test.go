@@ -1782,6 +1782,44 @@ func TestLoadpointOptimizerActionFollowsPlan(t *testing.T) {
 	assert.Empty(t, action, "an exhausted plan falls back to no optimizer action")
 }
 
+// TestKeepCurrentSlot: a failed run leaves the last plan in charge until its slot
+// ends, for the loadpoints and the battery schedules alike.
+func TestKeepCurrentSlot(t *testing.T) {
+	site := &Site{loadpoints: []*Loadpoint{NewLoadpoint(util.NewLogger("lp0"), nil)}}
+
+	now := time.Now()
+	slot := now.Truncate(tariff.SlotDuration).Add(tariff.SlotDuration)
+	site.setSuggestionPlans(map[string][]suggestionSlot{
+		loadpointKey(0): {
+			{until: slot.Add(-tariff.SlotDuration), suggestion: types.Suggestion{Action: actionStop}},
+			{until: slot, suggestion: types.Suggestion{Action: actionCharge, Charge: 9600, Source: sourceGrid}},
+			{until: slot.Add(tariff.SlotDuration), suggestion: types.Suggestion{Action: actionStop}},
+		},
+		"fixed": {{suggestion: types.Suggestion{Action: actionCharge}}},
+	})
+	site.setBatterySchedules(map[string][]batterySlot{
+		batteryKey("pw"): {
+			{until: slot, action: "hold", soc: 17},
+			{until: slot.Add(tariff.SlotDuration), action: "normal"},
+		},
+	})
+
+	site.keepCurrentSlot(now)
+
+	action, _, _ := site.loadpointOptimizerAction(0)
+	assert.Equal(t, actionCharge, action, "the current slot still applies")
+	assert.Equal(t, "hold", currentBatteryAction(site.batterySchedules[batteryKey("pw")], now, 0))
+
+	later := slot.Add(time.Second)
+	_, ok := currentSuggestion(site.suggestions[loadpointKey(0)], later)
+	assert.False(t, ok, "nothing beyond the current slot")
+	assert.Empty(t, currentBatteryAction(site.batterySchedules[batteryKey("pw")], later, 0))
+
+	s, ok := currentSuggestion(site.suggestions["fixed"], later)
+	require.True(t, ok, "a fixed suggestion never expires")
+	assert.Equal(t, actionCharge, s.Action)
+}
+
 func TestOptimizerDue(t *testing.T) {
 	slot := time.Now().Truncate(tariff.SlotDuration)
 

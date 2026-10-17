@@ -589,19 +589,28 @@ func (site *Site) publishSuggestions() {
 	}
 }
 
-// clearSuggestions removes all suggestions and the battery forecast when the
-// optimizer result is stale
-func (site *Site) clearSuggestions() {
-	site.setSuggestions(nil)
-	site.battery.Forecast = nil
-
-	site.publishBattery()
-	site.publishSuggestions()
-
+// keepCurrentSlot cuts every plan after the slot in effect at now, so a failed run
+// leaves the last plan governing until that slot ends and nothing beyond it. Fixed
+// suggestions (no end time) are kept as they are.
+func (site *Site) keepCurrentSlot(now time.Time) {
 	site.Lock()
-	site.suggestionActions = nil
-	site.batterySchedules = nil
-	site.Unlock()
+	defer site.Unlock()
+
+	for key, plan := range site.suggestions {
+		site.suggestions[key] = throughCurrent(plan, now, func(s suggestionSlot) time.Time { return s.until })
+	}
+	for key, plan := range site.batterySchedules {
+		site.batterySchedules[key] = throughCurrent(plan, now, func(s batterySlot) time.Time { return s.until })
+	}
+}
+
+// throughCurrent returns the plan up to and including the slot in effect at now
+func throughCurrent[S any](plan []S, now time.Time, until func(S) time.Time) []S {
+	i := slices.IndexFunc(plan, func(s S) bool { return until(s).IsZero() || until(s).After(now) })
+	if i < 0 {
+		return nil
+	}
+	return plan[:i+1]
 }
 
 // pendingSuggestions collects the stored suggestions with their actionable flag
@@ -918,8 +927,9 @@ func (site *Site) optimizerRun(minAge time.Duration) {
 		if err != nil {
 			site.log.ERROR.Println("optimizer:", err)
 
-			// stale advice must not linger
-			site.clearSuggestions()
+			// the last plan governs until its slot ends, then nothing: a plan a slot
+			// old beats none, which would drop a running charge back to plain PV mode
+			site.keepCurrentSlot(time.Now())
 		}
 	}()
 
