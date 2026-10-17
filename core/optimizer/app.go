@@ -52,6 +52,13 @@ func WithSettings(settings Settings) Option {
 	return func(s *Settings) { *s = settings }
 }
 
+// WithoutProbe skips the joint solve that tries to settle cost and preferences
+// at once, leaving the whole deadline to the separate stages. On a long horizon
+// the probe stops on time, spending its share for nothing.
+func WithoutProbe() Option {
+	return func(s *Settings) { s.ProbeSeconds = fptr(0) }
+}
+
 // Optimize solves the request in process, the way the optimizer service answers
 // POST /optimize/charge-schedule. The request goes through the same JSON encoding it did on its
 // way to the service, so a zero value the client omits is a default here as well, and the

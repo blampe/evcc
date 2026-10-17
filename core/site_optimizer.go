@@ -1210,7 +1210,7 @@ func (site *Site) optimize(req optimizer.OptimizationInput) (optimizer.Optimizat
 
 	ctx, cancel := context.WithTimeout(context.Background(), optimizerTimeLimit)
 	defer cancel()
-	return evopt.Optimize(ctx, req)
+	return evopt.Optimize(ctx, req, evopt.WithoutProbe())
 }
 
 // optimizeRemote posts the request to the optimizer service at uri

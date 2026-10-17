@@ -286,3 +286,10 @@ func TestPreferenceStageGetsTheRemainingTime(t *testing.T) {
 	assert.Equal(t, "Optimal", o.preferenceStage)
 	assert.Greater(t, limits[len(limits)-1], 0.5*limit.Seconds(), "the preference stage's limit")
 }
+
+func TestWithoutProbeGoesStraightToTheSplit(t *testing.T) {
+	o := buildFromCase(t, splitCases[0], "")
+	WithoutProbe()(&o.settings)
+	require.Equal(t, "Optimal", solveOK(t, o).Status)
+	assert.Equal(t, "split", o.solvePath, "an easy request would settle in the probe")
+}
