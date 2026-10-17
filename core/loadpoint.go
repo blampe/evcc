@@ -138,6 +138,7 @@ type Loadpoint struct {
 	integratedPower       float64   // W, last sample
 	integratedAt          time.Time // last sample
 	startupSocPolled      bool      // Soc polled once at startup, even while disconnected
+	connectSocRead        bool      // a soc has been read since the vehicle connected
 	vehicleDetect         time.Time // Vehicle connected timestamp
 	chargerSwitched       time.Time // Charger enabled/disabled timestamp
 	optimizerAction       string    // current optimizer suggestion (charge|stop|""), set by the site each cycle
@@ -571,6 +572,7 @@ func (lp *Loadpoint) evVehicleConnectHandler() {
 
 	// soc update reset
 	lp.socUpdated = time.Time{}
+	lp.connectSocRead = false
 
 	// set default or start detection
 	if !lp.chargerHasFeature(api.IntegratedDevice) {
@@ -2170,11 +2172,20 @@ func (lp *Loadpoint) publishSocAndRange() {
 	}
 
 	if socR != nil {
+		prev := lp.vehicleSoc
 		if socEstimator == nil {
 			lp.vehicleSoc = *socR
 		} else {
 			lp.vehicleSoc = socEstimator.Soc(socR, lp.socEstimatorEnergy())
 			lp.log.DEBUG.Printf("vehicle soc (estimator): %.0f%%", lp.vehicleSoc)
+		}
+
+		// the connect-triggered plan ran on the previous session's soc
+		if !lp.connectSocRead {
+			lp.connectSocRead = true
+			if lp.vehicleSoc != prev {
+				lp.triggerOptimizer()
+			}
 		}
 	}
 	lp.publish(keys.VehicleSoc, lp.vehicleSoc)

@@ -622,3 +622,43 @@ func TestReconnectVehicle(t *testing.T) {
 		})
 	}
 }
+
+// TestConnectSocReplans re-plans once the first soc after connecting differs from
+// the previous session's, which the connect-triggered plan ran on.
+func TestConnectSocReplans(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	vehicle := api.NewMockVehicle(ctrl)
+	expectVehiclePublish(vehicle)
+
+	site := new(mockSite)
+	lp := &Loadpoint{
+		log:         util.NewLogger("foo"),
+		bus:         evbus.New(),
+		clock:       clock.NewMock(),
+		charger:     api.NewMockCharger(ctrl),
+		vehicle:     vehicle,
+		site:        site,
+		chargeMeter: &Null{},
+		chargeRater: &Null{},
+		chargeTimer: &Null{},
+		status:      api.StatusB,
+		vehicleSoc:  31,
+	}
+	x, y, z := createChannels(t)
+	attachChannels(lp, x, y, z)
+
+	vehicle.EXPECT().Soc().Return(29.0, nil)
+	lp.publishSocAndRange()
+	assert.Equal(t, 1, site.optimized, "first soc after connect differs")
+
+	lp.socUpdated = time.Time{} // poll due
+	vehicle.EXPECT().Soc().Return(28.0, nil)
+	lp.publishSocAndRange()
+	assert.Equal(t, 1, site.optimized, "later polls leave it to the slot cadence")
+
+	lp.connectSocRead, lp.socUpdated = false, time.Time{} // reconnected
+	vehicle.EXPECT().Soc().Return(28.0, nil)
+	lp.publishSocAndRange()
+	assert.Equal(t, 1, site.optimized, "unchanged soc keeps the plan")
+}
