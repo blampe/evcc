@@ -38,10 +38,12 @@ const (
 )
 
 // optimizerStrategyServeHomeFirst is the "serve home first" secondary goal. It is not an
-// optimizer charging strategy but evcc's own: the optimizer gets no charging strategy
-// ("none") and every home battery asks for the serve_home_first tie break instead - of
-// schedules that cost the same, the pack feeds the house and the grid the car (see
-// batteryRequest).
+// optimizer charging strategy but evcc's own: every home battery asks for the
+// serve_home_first commitment (see batteryRequest), which decides where the pack's
+// energy goes - the house before the car or the grid. The optimizer itself gets "fill
+// battery first" (charge_before_export), whose tie breaks decide when: of schedules
+// that cost the same, surplus reaches the car as soon as it is surplus instead of at
+// an arbitrary later slot. A tie break never outranks the commitment.
 const optimizerStrategyServeHomeFirst = "serve_home_first"
 
 // optimizerChargingStrategies are the valid secondary goals (the UI's "secondary goal"
@@ -1762,24 +1764,26 @@ func clearDemandWhenFull(demand []float32, headroom float32) []float32 {
 // evChargePriority returns the optimizer charge priority for the EV. Under
 // charge_before_export it is the maximum (2) so the optimizer's (T-t)-weighted
 // early-charge reward (optimizer.py:304) biases the EV to charge from solar
-// sooner rather than deferring across the multi-day horizon — PA (stored-energy
+// sooner rather than deferring across the multi-day horizon. PA (stored-energy
 // value) is realized only at horizon end, so charging is otherwise
 // timing-neutral. It is a soft nudge: the reward is far below the grid price, so
 // it never forces grid charging, only tips otherwise-cost-neutral surplus
 // charging earlier.
 func (site *Site) evChargePriority() int {
-	if site.optimizerChargeFirst() {
+	if site.optimizerRequestChargingStrategy() == optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport {
 		return 2
 	}
 	return 0
 }
 
 // optimizerRequestChargingStrategy maps the selected secondary goal onto the optimizer's
-// charging strategy: serve home first is evcc's own goal, carried by the batteries'
-// serve_home_first flag, so the optimizer itself gets none.
+// charging strategy. Serve home first is evcc's own goal, carried by the batteries'
+// serve_home_first commitment; the optimizer gets fill battery first underneath it so
+// the surplus the commitment leaves goes to the car right away rather than at an
+// arbitrary cost-tied slot (see optimizerStrategyServeHomeFirst).
 func (site *Site) optimizerRequestChargingStrategy() optimizer.OptimizerStrategyChargingStrategy {
 	if site.optimizerServeHomeFirst() {
-		return optimizer.OptimizerStrategyChargingStrategyNone
+		return optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport
 	}
 	return optimizer.OptimizerStrategyChargingStrategy(site.GetOptimizerChargingStrategy())
 }
@@ -1787,12 +1791,6 @@ func (site *Site) optimizerRequestChargingStrategy() optimizer.OptimizerStrategy
 // optimizerServeHomeFirst reports whether the serve home first secondary goal is selected.
 func (site *Site) optimizerServeHomeFirst() bool {
 	return site.GetOptimizerChargingStrategy() == optimizerStrategyServeHomeFirst
-}
-
-// optimizerChargeFirst reports whether the charge-before-export ("battery first")
-// strategy is active.
-func (site *Site) optimizerChargeFirst() bool {
-	return site.GetOptimizerChargingStrategy() == string(optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport)
 }
 
 func (site *Site) batteryRequest(dev config.Device[api.Meter], b types.Measurement, grid api.Rates, minLen int, firstSlotDuration time.Duration) (optimizer.BatteryConfig, batteryDetail) {

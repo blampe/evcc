@@ -418,10 +418,11 @@ func TestBatteryRequestServeHomeFirst(t *testing.T) {
 }
 
 // TestOptimizerRequestChargingStrategy: serve home first is evcc's own secondary goal, not
-// an optimizer charging strategy, so the optimizer gets none; every other goal passes
-// through unchanged.
+// an optimizer charging strategy. The optimizer gets fill battery first underneath it, so
+// the surplus the home-first commitment leaves reaches the car right away; every other
+// goal passes through unchanged.
 func TestOptimizerRequestChargingStrategy(t *testing.T) {
-	assert.Equal(t, optimizer.OptimizerStrategyChargingStrategyNone,
+	assert.Equal(t, optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport,
 		(&Site{optimizerChargingStrategy: optimizerStrategyServeHomeFirst}).optimizerRequestChargingStrategy())
 
 	for _, strategy := range []optimizer.OptimizerStrategyChargingStrategy{
@@ -432,8 +433,9 @@ func TestOptimizerRequestChargingStrategy(t *testing.T) {
 		assert.Equal(t, strategy, (&Site{optimizerChargingStrategy: string(strategy)}).optimizerRequestChargingStrategy())
 	}
 
-	// serve home first gives the car no early-charge priority to fight the tie break with
-	assert.Equal(t, 0, (&Site{optimizerChargingStrategy: optimizerStrategyServeHomeFirst}).evChargePriority())
+	// serve home first keeps the car's early-charge priority: the commitment decides where
+	// the pack's energy goes, the priority only decides when the surplus moves
+	assert.Equal(t, 2, (&Site{optimizerChargingStrategy: optimizerStrategyServeHomeFirst}).evChargePriority())
 
 	// and it is a valid, selectable goal
 	site := &Site{log: util.NewLogger("foo")}
@@ -688,14 +690,6 @@ func TestEvChargePriority(t *testing.T) {
 	assert.Equal(t, 0, (&Site{optimizerChargingStrategy: string(optimizer.OptimizerStrategyChargingStrategyAttenuateGridPeaks)}).evChargePriority())
 }
 
-// TestOptimizerChargeFirst verifies the battery-first predicate that gates the EV's
-// early-solar charge-priority bias (evChargePriority).
-func TestOptimizerChargeFirst(t *testing.T) {
-	assert.True(t, (&Site{}).optimizerChargeFirst()) // default is charge_before_export
-	assert.True(t, (&Site{optimizerChargingStrategy: string(optimizer.OptimizerStrategyChargingStrategyChargeBeforeExport)}).optimizerChargeFirst())
-	assert.False(t, (&Site{optimizerChargingStrategy: string(optimizer.OptimizerStrategyChargingStrategyNone)}).optimizerChargeFirst())
-}
-
 // TestLoadpointOptimizerAction verifies both optimizer loadpoint actions reach the
 // loadpoint under charge_before_export (the default) — "stop" is no longer suppressed.
 func TestLoadpointOptimizerAction(t *testing.T) {
@@ -703,7 +697,7 @@ func TestLoadpointOptimizerAction(t *testing.T) {
 		NewLoadpoint(util.NewLogger("lp0"), nil),
 		NewLoadpoint(util.NewLogger("lp1"), nil),
 	}}
-	require.True(t, site.optimizerChargeFirst()) // default strategy
+	require.Equal(t, 2, site.evChargePriority()) // default strategy is charge_before_export
 
 	site.setSuggestions(map[string]types.Suggestion{
 		loadpointKey(0): {Action: actionStop},
