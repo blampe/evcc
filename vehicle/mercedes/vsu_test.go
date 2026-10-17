@@ -398,11 +398,21 @@ func TestSessionClosesWhenIdle(t *testing.T) {
 	assert.Equal(t, int64(4242), vsu.GetOdo().GetValue())
 }
 
-func TestSessionWithoutUpdateFails(t *testing.T) {
+func TestSessionWithoutUpdateKeepsStateCurrent(t *testing.T) {
 	shortSession(t, 100*time.Millisecond, 5*time.Second)
+	const vin = "WDB1234567890"
 	uri, _ := sessionServer(t, nil, 0)
 
-	assert.Error(t, testWebsocket(uri).session(t.Context()), "a session without a status update must be retried")
+	ws := testWebsocket(uri)
+	stale := time.Now().Add(-time.Hour)
+	ws.states[vin] = &wsState{vsu: &pb.VehicleStatusUpdate{Odo: &pb.Int64DistanceAttribute{Value: 4242}}, updated: stale}
+
+	require.NoError(t, ws.session(t.Context()), "a quiet session is not a failure to retry")
+
+	vsu, updated, ok := ws.Status(vin)
+	require.True(t, ok)
+	assert.Equal(t, int64(4242), vsu.GetOdo().GetValue(), "the cached snapshot stays")
+	assert.True(t, updated.After(stale), "a quiet session means nothing changed, so the snapshot is current")
 }
 
 func TestSessionMaxDuration(t *testing.T) {

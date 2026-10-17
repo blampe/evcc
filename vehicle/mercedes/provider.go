@@ -34,8 +34,8 @@ func NewProvider(api *API, ws *Websocket, vin string, cache time.Duration) *Prov
 }
 
 // vsuStatus reads the latest VehicleStatusUpdate from the websocket cache and
-// maps it. Every successful session delivers a full update, so the snapshot is
-// treated as stale once several poll intervals pass without one.
+// maps it. Every clean session leaves the snapshot current (a quiet one means
+// nothing changed), so it is stale once several poll intervals pass without one.
 func vsuStatus(ws *Websocket, vin string) (StatusResponse, error) {
 	vsu, updated, ok := ws.Status(vin)
 	if !ok {

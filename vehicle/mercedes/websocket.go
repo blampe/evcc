@@ -67,9 +67,11 @@ type wsState struct {
 
 // Websocket polls the VSU push endpoint per Mercedes account and caches the
 // latest VehicleStatusUpdate per VIN. Instead of holding the socket open, it
-// opens a short session every poll interval: the backend sends a full update on
-// connect, so a brief session yields a complete snapshot while keeping the
-// account's daily websocket open time far below Mercedes' throttling limit.
+// opens a short session every poll interval. Pushes are sequence-numbered and
+// acknowledged per session id: a new session id gets a full update on connect,
+// a known one gets what changed since its last acknowledgement and nothing
+// when nothing did. A brief session therefore keeps the snapshot current while
+// keeping the account's daily websocket open time far below Mercedes' limit.
 type Websocket struct {
 	mu        sync.RWMutex
 	log       *util.Logger
@@ -247,8 +249,9 @@ func rateLimitCooldown(consecutive int, retryAfter time.Duration) time.Duration 
 }
 
 // session dials the websocket, reads until it has been quiet for wsLinger or
-// wsMaxSession has elapsed, and then closes it with a normal close frame. It
-// returns nil only if at least one vehicle status update was received.
+// wsMaxSession has elapsed, and then closes it with a normal close frame. A
+// session that ends cleanly without an update leaves the cache current: the
+// backend had nothing new for this session id.
 func (ws *Websocket) session(ctx context.Context) error {
 	tok, err := ws.identity.Token()
 	if err != nil {
@@ -300,14 +303,14 @@ func (ws *Websocket) session(ctx context.Context) error {
 	for {
 		typ, data, err := conn.Read(ctx)
 		if err != nil {
-			switch {
-			case !closing.Load():
+			if !closing.Load() {
 				return err
-			case !updated:
-				return errors.New("no vehicle status update received")
-			default:
-				return nil
 			}
+			if !updated {
+				ws.log.TRACE.Println("websocket: no update, vehicle state unchanged")
+				ws.refresh()
+			}
+			return nil
 		}
 		idle.Reset(wsLinger)
 
@@ -398,6 +401,18 @@ func (ws *Websocket) writeMessage(ctx context.Context, msg *pb.ClientMessage) er
 	writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	return conn.Write(writeCtx, websocket.MessageBinary, out)
+}
+
+// refresh marks every cached snapshot as current after a session that carried
+// no update: the backend would have pushed any change since the last
+// acknowledged one, so none happened.
+func (ws *Websocket) refresh() {
+	ws.mu.Lock()
+	defer ws.mu.Unlock()
+
+	for _, s := range ws.states {
+		s.updated = time.Now()
+	}
 }
 
 // applyVSU merges each vehicle's update into the cache. full_update replaces the
